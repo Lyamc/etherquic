@@ -1,0 +1,37 @@
+//! QUIC over a pure-Rust Ethernet datagram backend.
+//!
+//! Quinn stays unaware of Ethernet. Path addresses are opaque `SocketAddr` values
+//! minted from MAC + service id. The [`Fabric`] is an in-memory L2 segment so the
+//! demo needs no `AF_PACKET`, no `libc` in this crate, and no `cc` / `ring`.
+//!
+//! Crypto uses [Lyamc/quinn](https://github.com/Lyamc/quinn) `rustls-pure` with
+//! the vendored `rustls-rustcrypto` provider (same path as Lyamc/moq-rs).
+
+#![feature(portable_simd)]
+#![deny(unsafe_code)]
+
+pub mod addr;
+pub mod endpoint;
+pub mod fabric;
+pub mod frame;
+pub mod l2_endpoint;
+#[cfg(windows)]
+pub mod ndis_link;
+pub mod pcap_link;
+mod simd_copy;
+pub mod socket;
+pub mod tls;
+pub mod udp_endpoint;
+
+/// 6-byte Ethernet MAC address.
+pub type Mac = [u8; 6];
+
+pub use addr::{peer_to_socket_addr, socket_addr_to_peer};
+pub use endpoint::{client_endpoint, server_endpoint, EndpointError};
+pub use fabric::Fabric;
+pub use frame::{max_quic_datagram, Frame, DEFAULT_ETHER_TYPE};
+pub use socket::EtherSocket;
+pub use l2_endpoint::{l2_client_endpoint, l2_server_endpoint, L2Net};
+pub use pcap_link::{parse_mac, ETHERTYPE_QUIC};
+pub use tls::{install_pure_crypto, ALPN_ETHERQUIC};
+pub use udp_endpoint::{udp_client_endpoint, udp_server_endpoint};

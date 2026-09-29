@@ -1,0 +1,65 @@
+[package]
+name = "etherquic"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "QUIC over a pure-Rust Ethernet datagram backend (Quinn + rustls-rustcrypto)"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[dependencies]
+bytes = "1"
+pcap = "2.2"
+quinn = { path = "vendor/quinn/quinn", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-pure",
+    "bloom",
+] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+rustls-rustcrypto = { path = "vendor/rustls-rustcrypto" }
+thiserror = "2"
+tokio = { version = "1.28", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "io-util",
+] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "env-filter",
+    "fmt",
+    "ansi",
+] }
+
+[[bin]]
+name = "etherquic-demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "etherquic-video-recv"
+path = "src/bin/video_recv.rs"
+
+[[bin]]
+name = "etherquic-video-send"
+path = "src/bin/video_send.rs"
+
+[profile.release]
+debug = true
+
+[[example]]
+name = "l2_ping"
+path = "examples/l2_ping.rs"
