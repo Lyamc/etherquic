@@ -48,19 +48,19 @@ fn u16_from(bytes: &[u8]) -> Option<(u16, &[u8])> {
     Some((u16::from_be_bytes(head.try_into().ok()?), rest))
 }
 
-/// Pure encode: 20-byte header, then the datagram body via `std::simd`.
+/// Pure encode: header fields then payload, no mutation of `frame`.
 pub fn encode_frame(frame: &Frame) -> Vec<u8> {
-    let payload_len = u16::try_from(frame.payload.len()).unwrap_or(u16::MAX) as usize;
-    let payload = &frame.payload[..payload_len];
-    let mut out = vec![0u8; ADAPTER_OVERHEAD + payload_len];
-    out[0..6].copy_from_slice(&frame.dst);
-    out[6..12].copy_from_slice(&frame.src);
-    out[12..14].copy_from_slice(&frame.ether_type.to_be_bytes());
-    out[14..16].copy_from_slice(&frame.dst_service.to_be_bytes());
-    out[16..18].copy_from_slice(&frame.src_service.to_be_bytes());
-    out[18..20].copy_from_slice(&(payload_len as u16).to_be_bytes());
-    crate::simd_copy::copy_bytes(&mut out[ADAPTER_OVERHEAD..], payload);
-    out
+    let len = u16::try_from(frame.payload.len()).unwrap_or(u16::MAX);
+    frame
+        .dst
+        .into_iter()
+        .chain(frame.src)
+        .chain(frame.ether_type.to_be_bytes())
+        .chain(frame.dst_service.to_be_bytes())
+        .chain(frame.src_service.to_be_bytes())
+        .chain(len.to_be_bytes())
+        .chain(frame.payload.iter().copied().take(len as usize))
+        .collect()
 }
 
 /// Pure decode. Ethernet padding past `payload_len` is ignored.
@@ -78,15 +78,13 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, FrameError> {
             remaining: rest.len(),
         });
     }
-    let mut payload = vec![0u8; payload_len];
-    crate::simd_copy::copy_bytes(&mut payload, &rest[..payload_len]);
     Ok(Frame {
         dst,
         src,
         ether_type,
         dst_service,
         src_service,
-        payload,
+        payload: rest[..payload_len].to_vec(),
     })
 }
 
@@ -162,21 +160,5 @@ mod tests {
     #[test]
     fn mtu_math() {
         assert_eq!(max_quic_datagram(1500), 1494);
-    }
-
-    #[test]
-    fn round_trip_covers_simd_lane_boundaries() {
-        for len in [0, 1, 63, 64, 65, 127, 128, 1494] {
-            let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
-            let frame = Frame {
-                dst: [0x02, 0, 0, 0, 0, 2],
-                src: [0x02, 0, 0, 0, 0, 1],
-                ether_type: DEFAULT_ETHER_TYPE,
-                dst_service: 9,
-                src_service: 8,
-                payload,
-            };
-            assert_eq!(Frame::decode(&frame.encode()).unwrap(), frame);
-        }
     }
 }

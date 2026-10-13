@@ -1,0 +1,36 @@
+[package]
+name = "etherquic-ui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Host and player console for an etherquic play session"
+autobins = false
+
+[features]
+default = ["ui"]
+ui = ["dep:gpui"]
+
+[dependencies]
+etherquic = { path = ".." }
+tokio = { version = "1.28", features = ["rt", "macros", "sync", "time"] }
+gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+name = "etherquic-ui"
+path = "src/main.rs"
+required-features = ["ui"]
+
+# The published gpui_http_client 0.2.2 has no install_tls_provider. The Lyamc
+# GPUI fork calls it from Application::new. Use the sibling crate that installs
+# Graviola instead of ring.
+[patch.crates-io]
+gpui_http_client = { path = "../../../interfaces/gpui_http_client" }

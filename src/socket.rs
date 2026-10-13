@@ -104,7 +104,7 @@ impl AsyncUdpSocket for EtherSocket {
             }
             let src_addr = peer_to_socket_addr(frame.src, frame.src_service);
             let len = frame.payload.len().min(bufs[count].len());
-            crate::simd_copy::copy_bytes(&mut bufs[count][..len], &frame.payload[..len]);
+            bufs[count][..len].copy_from_slice(&frame.payload[..len]);
             meta[count] = recv_meta(src_addr, len, self.local_addr.ip());
             count += 1;
         }
@@ -119,7 +119,7 @@ impl AsyncUdpSocket for EtherSocket {
             if frame.dst_service == self.service_id {
                 let src_addr = peer_to_socket_addr(frame.src, frame.src_service);
                 let len = frame.payload.len().min(bufs[0].len());
-                crate::simd_copy::copy_bytes(&mut bufs[0][..len], &frame.payload[..len]);
+                bufs[0][..len].copy_from_slice(&frame.payload[..len]);
                 meta[0] = recv_meta(src_addr, len, self.local_addr.ip());
                 return Poll::Ready(Ok(1));
             }

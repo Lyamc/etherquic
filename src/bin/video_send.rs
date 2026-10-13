@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use etherquic::{
-    install_pure_crypto, l2_client_endpoint, parse_mac, peer_to_socket_addr, L2Net, ETHERTYPE_QUIC,
+    install_pure_crypto, l2_client_endpoint, parse_mac, peer_to_socket_addr, priority, L2Net,
+    ETHERTYPE_QUIC,
 };
 use tokio::io::AsyncReadExt;
 
@@ -70,6 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("connected, sending {} ...", file_path.display());
 
     let mut send = conn.open_uni().await?;
+    send.set_priority(priority::VIDEO)?;
+    eprintln!("stream priority video ({})", priority::VIDEO);
     let mut file = tokio::fs::File::open(&file_path).await?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;

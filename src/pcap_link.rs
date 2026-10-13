@@ -73,11 +73,7 @@ impl Link {
     /// Next matching frame, or `Ok(None)` on timeout.
     pub fn recv(&mut self) -> Result<Option<Vec<u8>>> {
         match self.cap.next_packet() {
-            Ok(pkt) => {
-                let mut owned = vec![0u8; pkt.data.len()];
-                crate::simd_copy::copy_bytes(&mut owned, pkt.data);
-                Ok(Some(owned))
-            }
+            Ok(pkt) => Ok(Some(pkt.data.to_vec())),
             Err(pcap::Error::TimeoutExpired) => Ok(None),
             Err(e) => Err(map_pcap(e)),
         }

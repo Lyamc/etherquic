@@ -1,0 +1,11 @@
+[package]
+name = "etherquic-container"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "LOC (Low Overhead Media Container) objects for etherquic"
+
+[dependencies]
+thiserror = "2"

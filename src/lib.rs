@@ -7,7 +7,6 @@
 //! Crypto uses [Lyamc/quinn](https://github.com/Lyamc/quinn) `rustls-pure` with
 //! the vendored `rustls-rustcrypto` provider (same path as Lyamc/moq-rs).
 
-#![feature(portable_simd)]
 #![deny(unsafe_code)]
 
 pub mod addr;
@@ -18,7 +17,7 @@ pub mod l2_endpoint;
 #[cfg(windows)]
 pub mod ndis_link;
 pub mod pcap_link;
-mod simd_copy;
+pub mod priority;
 pub mod socket;
 pub mod tls;
 pub mod udp_endpoint;
@@ -33,5 +32,6 @@ pub use frame::{max_quic_datagram, Frame, DEFAULT_ETHER_TYPE};
 pub use socket::EtherSocket;
 pub use l2_endpoint::{l2_client_endpoint, l2_server_endpoint, L2Net};
 pub use pcap_link::{parse_mac, ETHERTYPE_QUIC};
+pub use priority::{AUDIO as PRIORITY_AUDIO, INPUT as PRIORITY_INPUT, VIDEO as PRIORITY_VIDEO};
 pub use tls::{install_pure_crypto, ALPN_ETHERQUIC};
 pub use udp_endpoint::{udp_client_endpoint, udp_server_endpoint};
