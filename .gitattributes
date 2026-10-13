@@ -1,1 +1,3 @@
 windows/membrane_ndis.sys binary
+windows/membrane_ndis.cat binary
+windows/MembraneTest.cer binary

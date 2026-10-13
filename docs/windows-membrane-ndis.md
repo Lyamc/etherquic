@@ -14,6 +14,8 @@ The driver is an NDIS lightweight filter:
 | Installed image | `%SystemRoot%\System32\drivers\membrane_ndis.sys` |
 | Device | `\\.\MembraneNdis` |
 | INF | `windows/ndis_driver.inf` |
+| Catalog | `windows/membrane_ndis.cat` |
+| Certificate | `windows/MembraneTest.cer` (public test cert) |
 | Start | demand (3). The service does not load at boot. |
 
 Run the installer from an elevated local console. The filter attaches to the
@@ -32,8 +34,9 @@ That script is safe to run again.
 
 - The filter is already bound: it sets the service to demand start, starts it,
   and checks that `\\.\MembraneNdis` opens.
-- The filter is not bound: it turns on test signing if needed, signs the
-  package, binds `membrane_ndis_filter`, starts the service, and opens the device.
+- The filter is not bound: it turns on test signing if needed, trusts the
+  shipped certificate, binds `membrane_ndis_filter`, starts the service, and
+  opens the device. The Windows Driver Kit is not used.
 - Test signing was off: it enables test signing and
   `VulnerableDriverBlocklistEnable=0`, then exits `3010`. Reboot, and run the
   same command again. The driver cannot load on the boot where those flags
@@ -66,18 +69,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\install-membrane-n
 - 64-bit Windows 10 or 11, elevated.
 - Secure Boot off. Test-signed drivers do not load while it is on.
 - Memory integrity (HVCI) off. The script warns when it is on.
-- Windows SDK `signtool.exe` (x64) and WDK `Inf2Cat.exe`. `pnputil /add-driver`
-  does not bind an NDIS filter. `netcfg` does, and it rejects a catalog that
-  was not produced by Inf2Cat.
-- The driver image and INF shipped next to the script. `NetCfgInstanceId` is
-  `{a1b2c3d4-e5f6-7890-abcd-ef1234567890}`. `StartType` in that file is `3`.
-  The script rewrites a staged copy to `3` if another INF still says boot start.
+- The signed package shipped next to the script. `pnputil /add-driver` does
+  not bind an NDIS filter. `netcfg` does.
+- `NetCfgInstanceId` is `{a1b2c3d4-e5f6-7890-abcd-ef1234567890}`. `StartType`
+  in the INF is `3`.
 
-The image is [`windows/membrane_ndis.sys`](../windows/membrane_ndis.sys) in this
-repo (20,848 bytes, SHA-256
-`d3884252d69a4994c978a0ba747035a3de45abee6669c4269c193610cf8343b8`). It is a
-native-subsystem PE (subsystem 1, not a DLL). Another computer clones this
-repo and runs the script. The script does not build the driver.
+The package in this repo is:
+
+| File | Role |
+| --- | --- |
+| [`windows/membrane_ndis.sys`](../windows/membrane_ndis.sys) | Signed driver, 20,848 bytes, SHA-256 `d3884252d69a4994c978a0ba747035a3de45abee6669c4269c193610cf8343b8`. Native PE subsystem 1. |
+| [`windows/ndis_driver.inf`](../windows/ndis_driver.inf) | INF covered by the catalog. |
+| [`windows/membrane_ndis.cat`](../windows/membrane_ndis.cat) | Catalog produced by Inf2Cat for that sys and INF, then signed. |
+| [`windows/MembraneTest.cer`](../windows/MembraneTest.cer) | Public test certificate `CN=MembraneTest`, thumbprint `F0279DCD81DA66DD01CC28404B1F2339BE1CA353`, expires 2027-09-25. No private key. |
+
+Another computer clones this repo and runs the script. The script copies those
+files into `%ProgramData%\Membrane\ndis-package`, imports the public
+certificate into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`, and
+binds the filter. It does not build a catalog and it does not need the WDK
+or `signtool`. The WDK is only involved when `-SysPath` points at a different
+image, because that image needs a new catalog.
 
 Image search order:
 
@@ -89,18 +100,11 @@ Image search order:
 6. `C:\Build\networking\ndis-stage\membrane_ndis.sys` (build PC only)
 7. `C:\Build\networking\membrane\ndis\install_staging\membrane_ndis.sys` (build PC only)
 
-An INF beside the `.sys` or in `-PackageDir` wins over the copy in this repo.
-The script copies the image into `%ProgramData%\Membrane\ndis-package`, signs
-that copy, and leaves the file in the repo alone.
-
-On a machine that does not already have `CN=MembraneTest` in
-`Cert:\LocalMachine\My` with a private key, the script creates a three-year
-code-signing certificate and copies the public certificate into
-`LocalMachine\Root` and `LocalMachine\TrustedPublisher`. The build PC already
-has that certificate (`F0279DCD81DA66DD01CC28404B1F2339BE1CA353`, expires
-2027-09-25). A `.sys` signed on one PC loads on another only after that other
-PC trusts the signing certificate. Running the script on the target re-signs
-with the target's own test certificate.
+An INF beside a different `.sys`, or in `-PackageDir`, is used only when the
+image hash is not the shipped one. That path rewrites `StartType` to `3`,
+runs Inf2Cat, and signs with a `CN=MembraneTest` certificate created in
+`Cert:\LocalMachine\My` when that store has no matching private key. The
+shipped package leaves the repo files unchanged and does not create a key.
 
 Rebuilding the driver is separate from installing it. The source tree on the
 build PC is `C:\Build\networking\membrane-ndis`. A machine that only needs the
@@ -161,36 +165,25 @@ New-ItemProperty -LiteralPath HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config -
 Reboot. `bcdedit /enum {current}` then shows `testsigning Yes` and
 `nointegritychecks Yes`.
 
-3. Create the test certificate once. Skip this when `CN=MembraneTest` is
-   already in `Cert:\LocalMachine\My` and has a private key.
+3. Trust the public certificate shipped in the repo. This does not need a
+   private key.
 
 ```powershell
-$cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=MembraneTest' `
-    -CertStoreLocation Cert:\LocalMachine\My -HashAlgorithm SHA256 -KeyLength 2048 `
-    -NotAfter (Get-Date).AddYears(3)
-$blob = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-foreach ($name in 'Root', 'TrustedPublisher') {
-    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, 'LocalMachine')
-    $store.Open('ReadWrite')
-    $store.Add((New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList (, $blob)))
-    $store.Close()
-}
+certutil -addstore -f Root .\windows\MembraneTest.cer
+certutil -addstore -f TrustedPublisher .\windows\MembraneTest.cer
 ```
 
-4. Copy `windows/membrane_ndis.sys` and `windows/ndis_driver.inf` into one directory.
-   Confirm the INF says `StartType = 3`. Build the catalog and sign both files.
-   `Inf2Cat.exe` is under the WDK (on the build PC,
-   `%USERPROFILE%\.nuget\packages\microsoft.windows.wdk.x64\*\c\bin\*\x86\Inf2Cat.exe`).
-   `signtool.exe` is under
-   `C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\`.
+4. Copy the signed package into one directory. Leave the bytes unchanged.
+   The catalog covers `windows/membrane_ndis.sys` and `windows/ndis_driver.inf`.
 
 ```powershell
 $stage = "$env:ProgramData\Membrane\ndis-package"
-Inf2Cat.exe /driver:$stage /os:10_X64
-signtool.exe sign /sm /s My /n CN=MembraneTest /fd SHA256 `
-    "$stage\membrane_ndis.sys" "$stage\membrane_ndis.cat"
-signtool.exe verify /pa "$stage\membrane_ndis.sys"
+New-Item -ItemType Directory -Force -Path $stage | Out-Null
+Copy-Item .\windows\membrane_ndis.sys, .\windows\ndis_driver.inf, .\windows\membrane_ndis.cat $stage
 ```
+
+A different `.sys` is not covered by that catalog. Building a new one needs
+`Inf2Cat.exe` from the WDK and `signtool.exe` from the Windows SDK.
 
 5. Bind the filter, force demand start, and start it:
 

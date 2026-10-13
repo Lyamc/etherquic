@@ -9,6 +9,10 @@
     \\.\MembraneNdis. The service stays demand-start. Test signing is turned
     on when it is off, which takes a reboot before the driver can load.
 
+    The driver image, catalog, and public test certificate shipped next to
+    this script install without the Windows Driver Kit. Inf2Cat is used only
+    when -SysPath points at a different image.
+
     Run this from an elevated PowerShell on the machine itself. Binding the
     filter attaches it to the machine's adapters.
 
@@ -54,6 +58,12 @@ $StageRoot = Join-Path $env:ProgramData 'Membrane\ndis-package'
 $NetCfg = Join-Path $env:SystemRoot 'System32\netcfg.exe'
 $BcdEdit = Join-Path $env:SystemRoot 'System32\bcdedit.exe'
 $Script:BundledInf = Join-Path $PSScriptRoot 'ndis_driver.inf'
+$Script:BundledCat = Join-Path $PSScriptRoot 'membrane_ndis.cat'
+$Script:BundledCer = Join-Path $PSScriptRoot 'MembraneTest.cer'
+# Authenticode hash of the signed image shipped in this repo. A match means
+# the catalog beside this script already covers the file.
+$Script:ShippedSysHash = 'D3884252D69A4994C978A0BA747035A3DE45ABEE6669C4269C193610CF8343B8'
+$Script:ShippedCertThumbprint = 'F0279DCD81DA66DD01CC28404B1F2339BE1CA353'
 
 function Write-Step {
     param([string]$Message)
@@ -295,6 +305,60 @@ function Get-MembraneCert {
     return $cert
 }
 
+function Test-ShippedSys {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    return ($hash -eq $Script:ShippedSysHash)
+}
+
+function Import-ShippedCert {
+    if (-not (Test-Path -LiteralPath $Script:BundledCer)) {
+        throw "MembraneTest.cer was not found next to this script."
+    }
+    $cer = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($Script:BundledCer)
+    if ($cer.Thumbprint -ne $Script:ShippedCertThumbprint) {
+        throw "Shipped certificate thumbprint is $($cer.Thumbprint)."
+    }
+    foreach ($storeName in @('Root', 'TrustedPublisher')) {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, 'LocalMachine')
+        $missing = $true
+        try {
+            $store.Open('ReadOnly')
+            $missing = @($store.Certificates | Where-Object { $_.Thumbprint -eq $cer.Thumbprint }).Count -eq 0
+        } finally {
+            $store.Close()
+        }
+        if ($missing) {
+            & certutil.exe -addstore -f $storeName $Script:BundledCer | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "certutil -addstore $storeName failed with exit $LASTEXITCODE"
+            }
+            Write-Step "Trusted CN=MembraneTest in LocalMachine\$storeName"
+        }
+    }
+}
+
+function Publish-ShippedPackage {
+    param([string]$SourceSys)
+    foreach ($needed in @($Script:BundledInf, $Script:BundledCat, $Script:BundledCer)) {
+        if (-not (Test-Path -LiteralPath $needed)) {
+            throw "$needed was not found. The shipped driver package is incomplete."
+        }
+    }
+    New-Item -ItemType Directory -Force -Path $StageRoot | Out-Null
+    $destSys = Join-Path $StageRoot 'membrane_ndis.sys'
+    $destInf = Join-Path $StageRoot 'ndis_driver.inf'
+    $destCat = Join-Path $StageRoot 'membrane_ndis.cat'
+    # The catalog hashes these exact bytes. Do not rewrite the INF.
+    [System.IO.File]::Copy($SourceSys, $destSys, $true)
+    [System.IO.File]::Copy($Script:BundledInf, $destInf, $true)
+    [System.IO.File]::Copy($Script:BundledCat, $destCat, $true)
+    return @{ Sys = $destSys; Inf = $destInf; Cat = $destCat }
+}
+
 function Publish-Package {
     param(
         [string]$SourceSys,
@@ -484,7 +548,10 @@ if (Test-MemoryIntegrityOn) {
 }
 
 if ($Preflight) {
-    if (-not $bound -or $Reinstall) {
+    if (Test-ShippedSys -Path $sys) {
+        Write-Step 'catalog: shipped windows\membrane_ndis.cat'
+        Write-Step 'WDK: not used'
+    } elseif (-not $bound -or $Reinstall) {
         $inf2 = Find-Inf2Cat
         $sign = Find-KitExe -FileName 'signtool.exe' -Arch 'x64'
         Write-Step "Inf2Cat: $inf2"
@@ -557,31 +624,35 @@ Looked beside the script and in:
 "@
 }
 
-$sourceInf = Find-SourceInf -Sys $sys
-if (-not $sourceInf) {
-    throw "ndis_driver.inf was not found next to $sys or next to this script."
-}
-Assert-NativeDriver -Path $sys
-
-$inf2Cat = Find-Inf2Cat
-$signTool = Find-KitExe -FileName 'signtool.exe' -Arch 'x64'
-if (-not $inf2Cat) {
-    throw 'Inf2Cat.exe was not found. Install the Windows Driver Kit, or the microsoft.windows.wdk.x64 NuGet package.'
-}
-if (-not $signTool) {
-    throw 'signtool.exe was not found. Install the Windows SDK signing tools.'
-}
-
 if ($bound -and $Reinstall) {
     Write-Step 'Reinstall: unbinding the current filter.'
     Disable-Membrane
 }
 
-$cert = Get-MembraneCert
-Write-Step "Signing certificate $($cert.Thumbprint)"
-$package = Publish-Package -SourceSys $sys -SourceInf $sourceInf
-Write-Step "Staged $($package.Sys)"
-Protect-CatalogAndSign -Package $package -Cert $cert -Inf2Cat $inf2Cat -SignTool $signTool
+if (Test-ShippedSys -Path $sys) {
+    Import-ShippedCert
+    $package = Publish-ShippedPackage -SourceSys $sys
+    Write-Step "Staged $($package.Sys) with the shipped catalog"
+} else {
+    $sourceInf = Find-SourceInf -Sys $sys
+    if (-not $sourceInf) {
+        throw "ndis_driver.inf was not found next to $sys or next to this script."
+    }
+    Assert-NativeDriver -Path $sys
+    $inf2Cat = Find-Inf2Cat
+    $signTool = Find-KitExe -FileName 'signtool.exe' -Arch 'x64'
+    if (-not $inf2Cat) {
+        throw 'This image is not the shipped membrane_ndis.sys, and Inf2Cat.exe was not found. The shipped package does not need the WDK. A different image needs the Windows Driver Kit or the microsoft.windows.wdk.x64 NuGet package.'
+    }
+    if (-not $signTool) {
+        throw 'signtool.exe was not found. A different driver image needs the Windows SDK signing tools.'
+    }
+    $cert = Get-MembraneCert
+    Write-Step "Signing certificate $($cert.Thumbprint)"
+    $package = Publish-Package -SourceSys $sys -SourceInf $sourceInf
+    Write-Step "Staged $($package.Sys)"
+    Protect-CatalogAndSign -Package $package -Cert $cert -Inf2Cat $inf2Cat -SignTool $signTool
+}
 Install-Filter -Package $package
 Set-DemandStart
 
