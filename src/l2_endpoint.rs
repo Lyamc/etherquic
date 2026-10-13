@@ -294,13 +294,9 @@ impl PacketIo {
 
     fn recv_batch(&mut self, max: usize) -> Result<Vec<Vec<u8>>, String> {
         let mut out = Vec::new();
-        let limit = match self {
-            // A pcap read blocks until the capture timeout. One frame per
-            // turn keeps the send queue moving.
-            PacketIo::Pcap(_) => 1,
-            #[cfg(windows)]
-            PacketIo::Ndis(_) => max.max(1),
-        };
+        // pcap reads are non-blocking (see open_nic), so an empty capture
+        // returns immediately and the send queue is serviced every turn.
+        let limit = max.max(1);
         for _ in 0..limit {
             match self.recv_one()? {
                 Some(frame) => out.push(frame),

@@ -81,15 +81,21 @@ impl Link {
 }
 
 fn open_nic(nic: Nic, ethertype: u16) -> Result<Link> {
+    // Immediate mode delivers a frame as soon as it arrives. Non-blocking reads
+    // return TimeoutExpired when the socket is empty. A blocking read on Linux
+    // can sit forever when the BPF filter matches nothing, which stalls the
+    // send queue behind it.
     let mut cap = pcap::Capture::from_device(nic.name.as_str())
         .map_err(map_pcap)?
         .promisc(true)
         .snaplen(2048)
         .timeout(10)
+        .immediate_mode(true)
         .open()
         .map_err(map_pcap)?;
     let filter = format!("ether proto 0x{ethertype:04x}");
     cap.filter(&filter, true).map_err(map_pcap)?;
+    let cap = cap.setnonblock().map_err(map_pcap)?;
     Ok(Link {
         cap,
         nic,

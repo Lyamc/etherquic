@@ -8,7 +8,7 @@ Experimental **QUIC over Ethernet**, with Quinn kept unaware of L2.
 |-------|--------|
 | QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) (`rustls-pure`) |
 | TLS crypto | vendored `rustls-rustcrypto` (same provider as Lyamc/moq-rs) |
-| L2 I/O, primary | Rust NDIS filter `membrane_ndis` on Windows (`src/ndis_link.rs`, device `\\.\MembraneNdis`) |
+| L2 I/O, primary | Rust NDIS filter `membrane_ndis` on Windows (`src/ndis_link.rs`, device `\\.\MembraneNdis`). [Install](docs/windows-membrane-ndis.md) |
 | L2 I/O, backup | **libpcap / Npcap** (`src/pcap_link.rs`) when that device is not open |
 | In-memory fabric | `Fabric` for same-process tests |
 
@@ -24,8 +24,9 @@ path. This crate itself is `#![forbid(unsafe_code)]`.
 
 ```bash
 # Linux (needs CAP_NET_RAW): setcap then send
-sudo setcap cap_net_raw,cap_net_admin=ep ./target/release/etherquic-video-send
-./target/release/etherquic-video-send \
+cargo build --release --manifest-path video/Cargo.toml
+sudo setcap cap_net_raw,cap_net_admin=ep ./video/target/release/etherquic-video-send
+./video/target/release/etherquic-video-send \
   --nic enp4s0 --local-mac d8:5e:d3:88:5e:0e \
   --peer-mac a8:a1:59:e3:e2:69 --file video.mp4
 
@@ -33,6 +34,8 @@ sudo setcap cap_net_raw,cap_net_admin=ep ./target/release/etherquic-video-send
 etherquic-video-recv --local-mac a8:a1:59:e3:e2:69 --out received.mp4
 mpv received.mp4
 ```
+
+Install the Windows filter with [`docs/windows-membrane-ndis.md`](docs/windows-membrane-ndis.md). The one-shot script is [`windows/install-membrane-ndis.ps1`](windows/install-membrane-ndis.ps1).
 
 ## NDIS vs Npcap
 
@@ -60,6 +63,8 @@ window can get.
 ```bash
 cargo test
 cargo run --bin etherquic-demo
+cargo run --manifest-path video/Cargo.toml --bin etherquic-video-send -- --file video.mp4 ...
+cargo run --manifest-path video/Cargo.toml --bin etherquic-video-recv -- --out received.mp4
 cargo run --manifest-path audio/Cargo.toml --bin etherquic-audio-send -- --file clip.opus ...
 cargo run --manifest-path audio/Cargo.toml --bin etherquic-audio-recv -- --out received.opus
 cargo run --manifest-path input/Cargo.toml --bin etherquic-input-send -- --file events.txt ...
@@ -75,7 +80,7 @@ cargo run --manifest-path ui/Cargo.toml --bin etherquic-ui
 - [`input`](input/README.md) — keyboard, mouse, and gamepad events (`etherquic-input-send` / `etherquic-input-recv`)
 - [`container`](container/README.md) — LOC objects ([draft-ietf-moq-loc](https://github.com/moq-wg/loc))
 - [`audio`](audio/README.md) — Opus packets wrapped in those objects (`etherquic-audio-send` / `etherquic-audio-recv`)
-- `etherquic-video-send` / `etherquic-video-recv` — copy a video file on one QUIC stream
+- [`video`](video/README.md) — a file copied on one QUIC stream (`etherquic-video-send` / `etherquic-video-recv`)
 
 On a shared connection Quinn sends a higher stream priority first: input (20), then audio (10), then video (0).
 

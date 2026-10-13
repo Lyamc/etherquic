@@ -15,8 +15,11 @@ const SERVICE_ID: u16 = 4433;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     install_pure_crypto();
 
-    let cert = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("certs/cert.pem");
-    let key = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("certs/key.pem");
+    let cert_dir = std::env::var("ETHERQUIC_CERTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("certs"));
+    let cert = cert_dir.join("cert.pem");
+    let key = cert_dir.join("key.pem");
 
     let fabric = Fabric::new(1500);
     let server = server_endpoint(fabric.clone(), SERVER_MAC, SERVICE_ID, &cert, &key)?;

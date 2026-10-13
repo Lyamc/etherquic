@@ -1,0 +1,63 @@
+[Version]
+Signature   = "$Windows NT$"
+Class       = NetService
+ClassGuid   = {4D36E974-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderString%
+DriverVer   = 03/05/2026,0.6.2
+CatalogFile = membrane_ndis.cat
+PnpLockDown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%membrane_ndis_Desc% = Install, membrane_ndis_filter
+
+[Install]
+NetCfgInstanceId = "{a1b2c3d4-e5f6-7890-abcd-ef1234567890}"
+Characteristics  = 0x40000
+CopyFiles        = Install.CopyFiles
+AddReg           = Install.AddReg
+
+[Install.AddReg]
+HKR, Ndi,            Service,          , membrane_ndis
+HKR, Ndi,            CoServices,       0x00010000, membrane_ndis
+HKR, Ndi,            HelpText,         , %membrane_ndis_HelpText%
+HKR, Ndi,            FilterClass,      , compression
+HKR, Ndi,            FilterType,       0x00010001, 2
+HKR, Ndi,            FilterRunType,    0x00010001, 2
+HKR, Ndi\Interfaces, UpperRange,       , noupper
+HKR, Ndi\Interfaces, LowerRange,       , "nolower, ndis5"
+HKR, Ndi\Interfaces, FilterMediaTypes, , "ethernet, wan, wlan, ppip, ndis5"
+
+[Install.CopyFiles]
+membrane_ndis.sys,,,2
+
+[SourceDisksNames]
+1 = %DiskDescription%,"",,
+
+[SourceDisksFiles]
+membrane_ndis.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12
+Install.CopyFiles = 12
+
+[Install.Services]
+AddService = membrane_ndis,, Install.svc
+
+[Install.svc]
+DisplayName     = %membrane_ndis_Desc%
+ServiceType     = 1
+StartType       = 3
+ErrorControl    = 1
+ServiceBinary   = %12%\membrane_ndis.sys
+LoadOrderGroup  = NDIS
+Description     = %membrane_ndis_Desc%
+
+[Strings]
+ProviderString         = "Membrane"
+ManufacturerName       = "Membrane"
+membrane_ndis_Desc     = "Membrane NDIS Filter Driver"
+membrane_ndis_HelpText = "Packet capture and injection filter for Membrane"
+DiskDescription        = "Membrane NDIS Installation Disk"

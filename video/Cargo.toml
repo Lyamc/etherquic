@@ -1,0 +1,29 @@
+[package]
+name = "etherquic-video"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Copy a file over etherquic on one QUIC stream"
+autobins = false
+
+[dependencies]
+etherquic = { path = ".." }
+tokio = { version = "1.28", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "io-util",
+] }
+
+[[bin]]
+name = "etherquic-video-send"
+path = "src/bin/send.rs"
+
+[[bin]]
+name = "etherquic-video-recv"
+path = "src/bin/recv.rs"

@@ -49,14 +49,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 name = "etherquic-demo"
 path = "src/bin/demo.rs"
 
-[[bin]]
-name = "etherquic-video-recv"
-path = "src/bin/video_recv.rs"
-
-[[bin]]
-name = "etherquic-video-send"
-path = "src/bin/video_send.rs"
-
 [profile.release]
 debug = true
 

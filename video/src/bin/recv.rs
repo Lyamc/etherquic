@@ -12,7 +12,7 @@ use etherquic::{
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     install_pure_crypto();
 
-    let mut args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = env::args().skip(1).collect();
     let mut nic: Option<String> = None;
     let mut local_mac = [0x02, 0, 0, 0, 0, 0x01];
     let mut service_id = 4433u16;
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cert_dir = PathBuf::from(env::var("ETHERQUIC_CERTS").unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("certs")
+            .join("../certs")
             .display()
             .to_string()
     }));

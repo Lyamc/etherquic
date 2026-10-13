@@ -14,7 +14,7 @@ use tokio::io::AsyncReadExt;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     install_pure_crypto();
 
-    let mut args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = env::args().skip(1).collect();
     let mut nic: Option<String> = None;
     let mut local_mac = [0x02, 0, 0, 0, 0, 0x02];
     let mut peer_mac = None::<[u8; 6]>;
