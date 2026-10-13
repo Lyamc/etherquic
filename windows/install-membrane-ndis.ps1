@@ -547,7 +547,8 @@ if ($bound -and -not $Reinstall) {
 
 if (-not $sys) {
     throw @"
-membrane_ndis.sys was not found. Copy it next to this script, or pass -SysPath / -PackageDir.
+membrane_ndis.sys was not found. This repo ships it next to this script (windows\membrane_ndis.sys).
+Pass -SysPath or -PackageDir to use a different image.
 Looked beside the script and in:
   C:\td\kdrv2\membrane_ndis.sys
   C:\Build\networking\membrane-ndis\install_staging\membrane_ndis.sys

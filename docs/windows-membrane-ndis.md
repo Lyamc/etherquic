@@ -10,7 +10,8 @@ The driver is an NDIS lightweight filter:
 | --- | --- |
 | Component | `membrane_ndis_filter` |
 | Service | `membrane_ndis` |
-| Image | `%SystemRoot%\System32\drivers\membrane_ndis.sys` |
+| Image in this repo | `windows/membrane_ndis.sys` |
+| Installed image | `%SystemRoot%\System32\drivers\membrane_ndis.sys` |
 | Device | `\\.\MembraneNdis` |
 | INF | `windows/ndis_driver.inf` |
 | Start | demand (3). The service does not load at boot. |
@@ -65,27 +66,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\install-membrane-n
 - 64-bit Windows 10 or 11, elevated.
 - Secure Boot off. Test-signed drivers do not load while it is on.
 - Memory integrity (HVCI) off. The script warns when it is on.
-- A native-subsystem `membrane_ndis.sys` (PE subsystem 1, not a renamed DLL).
 - Windows SDK `signtool.exe` (x64) and WDK `Inf2Cat.exe`. `pnputil /add-driver`
   does not bind an NDIS filter. `netcfg` does, and it rejects a catalog that
   was not produced by Inf2Cat.
-- The INF shipped next to the script. `NetCfgInstanceId` is
+- The driver image and INF shipped next to the script. `NetCfgInstanceId` is
   `{a1b2c3d4-e5f6-7890-abcd-ef1234567890}`. `StartType` in that file is `3`.
   The script rewrites a staged copy to `3` if another INF still says boot start.
+
+The image is [`windows/membrane_ndis.sys`](../windows/membrane_ndis.sys) in this
+repo (20,848 bytes, SHA-256
+`d3884252d69a4994c978a0ba747035a3de45abee6669c4269c193610cf8343b8`). It is a
+native-subsystem PE (subsystem 1, not a DLL). Another computer clones this
+repo and runs the script. The script does not build the driver.
 
 Image search order:
 
 1. `-SysPath`
 2. `-PackageDir\membrane_ndis.sys`
-3. `membrane_ndis.sys` next to the script
-4. `C:\td\kdrv2\membrane_ndis.sys` (the image installed on the build PC; same size and timestamp as the driver in `System32\drivers`)
-5. `C:\Build\networking\membrane-ndis\install_staging\membrane_ndis.sys`
-6. `C:\Build\networking\ndis-stage\membrane_ndis.sys`
-7. `C:\Build\networking\membrane\ndis\install_staging\membrane_ndis.sys`
+3. `windows\membrane_ndis.sys` next to the script (the copy in this repo)
+4. `C:\td\kdrv2\membrane_ndis.sys` (build PC only)
+5. `C:\Build\networking\membrane-ndis\install_staging\membrane_ndis.sys` (build PC only)
+6. `C:\Build\networking\ndis-stage\membrane_ndis.sys` (build PC only)
+7. `C:\Build\networking\membrane\ndis\install_staging\membrane_ndis.sys` (build PC only)
 
 An INF beside the `.sys` or in `-PackageDir` wins over the copy in this repo.
-The script stages into `%ProgramData%\Membrane\ndis-package`, signs that copy,
-and leaves the source tree alone.
+The script copies the image into `%ProgramData%\Membrane\ndis-package`, signs
+that copy, and leaves the file in the repo alone.
 
 On a machine that does not already have `CN=MembraneTest` in
 `Cert:\LocalMachine\My` with a private key, the script creates a three-year
@@ -96,8 +102,9 @@ has that certificate (`F0279DCD81DA66DD01CC28404B1F2339BE1CA353`, expires
 PC trusts the signing certificate. Running the script on the target re-signs
 with the target's own test certificate.
 
-This document does not build the driver. The driver tree on the build PC is
-`C:\Build\networking\membrane-ndis`.
+Rebuilding the driver is separate from installing it. The source tree on the
+build PC is `C:\Build\networking\membrane-ndis`. A machine that only needs the
+filter uses the `.sys` in this repo.
 
 ## Check
 
@@ -170,7 +177,7 @@ foreach ($name in 'Root', 'TrustedPublisher') {
 }
 ```
 
-4. Stage `membrane_ndis.sys` and `windows/ndis_driver.inf` in one directory.
+4. Copy `windows/membrane_ndis.sys` and `windows/ndis_driver.inf` into one directory.
    Confirm the INF says `StartType = 3`. Build the catalog and sign both files.
    `Inf2Cat.exe` is under the WDK (on the build PC,
    `%USERPROFILE%\.nuget\packages\microsoft.windows.wdk.x64\*\c\bin\*\x86\Inf2Cat.exe`).

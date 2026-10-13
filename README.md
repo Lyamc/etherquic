@@ -51,7 +51,7 @@ etherquic-video-recv --local-mac a8:a1:59:e3:e2:69 --out received.mp4
 mpv received.mp4
 ```
 
-Install the Windows filter with [`docs/windows-membrane-ndis.md`](docs/windows-membrane-ndis.md). The one-shot script is [`windows/install-membrane-ndis.ps1`](windows/install-membrane-ndis.ps1).
+Install the Windows filter with [`docs/windows-membrane-ndis.md`](docs/windows-membrane-ndis.md). The driver image is [`windows/membrane_ndis.sys`](windows/membrane_ndis.sys). The one-shot script is [`windows/install-membrane-ndis.ps1`](windows/install-membrane-ndis.ps1).
 
 ## NDIS vs Npcap
 
