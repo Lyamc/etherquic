@@ -1,0 +1,6 @@
+[submodule "vendor/quinn"]
+	path = vendor/quinn
+	url = ../quinn.git
+[submodule "vendor/rustls-rustcrypto"]
+	path = vendor/rustls-rustcrypto
+	url = ../rustls-rustcrypto.git

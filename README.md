@@ -6,8 +6,8 @@ Experimental **QUIC over Ethernet**, with Quinn kept unaware of L2.
 
 | Piece | Source |
 |-------|--------|
-| QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) (`rustls-pure`) |
-| TLS crypto | vendored `rustls-rustcrypto` (same provider as Lyamc/moq-rs) |
+| QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule (`rustls-pure`) |
+| TLS crypto | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule (same provider as Lyamc/moq-rs) |
 | L2 I/O, primary | Rust NDIS filter `membrane_ndis` on Windows (`src/ndis_link.rs`, device `\\.\MembraneNdis`). [Install](docs/windows-membrane-ndis.md) |
 | L2 I/O, backup | **libpcap / Npcap** (`src/pcap_link.rs`) when that device is not open |
 | In-memory fabric | `Fabric` for same-process tests |
@@ -19,6 +19,22 @@ does not corrupt short QUIC ACKs.
 Datagram bodies are copied with `copy_from_slice` / `to_vec`. The crate builds on
 stable Rust (`rust-version` 1.85). No `ring`, no `aws-lc`, and no `cc` on the crypto
 path. This crate itself is `#![forbid(unsafe_code)]`.
+
+## Get the source
+
+Quinn and the TLS provider are submodules. A clone without them does not build.
+
+```bash
+git clone --recurse-submodules git@github.com:Lyamc/etherquic.git
+```
+
+If the repo is already cloned:
+
+```bash
+git submodule update --init
+```
+
+The URLs are relative to this repo (`../quinn.git`, `../rustls-rustcrypto.git`), so an HTTPS clone of etherquic fetches the submodules over HTTPS too. `vendor/quinn` is pinned to `a201190` (Lyamc/quinn, `rustls-pure`). `vendor/rustls-rustcrypto` is pinned to `9cba6e9`, which is RustCrypto `v0.0.2-alpha` plus QUIC AES-128-GCM packet protection. Nix builds copy this checkout, so initialize the submodules before `nix-build`.
 
 ## Video over L2
 
@@ -92,8 +108,8 @@ On a shared connection Quinn sends a higher stream priority first: input (20), t
 - `src/addr.rs` — MAC ↔ IPv6 link-local `SocketAddr`
 - `src/tls.rs` / `src/endpoint.rs` — pure TLS + endpoint helpers
 - `certs/` — demo server certificate (skip-verify on the client)
-- `vendor/quinn` — Lyamc/quinn with `rustls-pure`
-- `vendor/rustls-rustcrypto` — pure CryptoProvider (+ QUIC AES-128-GCM)
+- `vendor/quinn` — submodule, [Lyamc/quinn](https://github.com/Lyamc/quinn) with `rustls-pure`
+- `vendor/rustls-rustcrypto` — submodule, [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) (pure CryptoProvider, QUIC AES-128-GCM)
 
 ## Will it work if QUIC is unaware it sits on Ethernet?
 
