@@ -60,13 +60,7 @@ async fn handshake_and_bidi_echo() {
     let n = recv.read(&mut out).await.expect("read echo").expect("echo");
     assert_eq!(&out[..n], payload);
 
-    assert!(
-        fabric
-            .stats
-            .sent
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-    );
+    assert!(fabric.stats.sent.load(std::sync::atomic::Ordering::Relaxed) > 0);
     assert_eq!(
         fabric
             .stats

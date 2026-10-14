@@ -10,6 +10,9 @@
 #![deny(unsafe_code)]
 
 pub mod addr;
+pub mod backend;
+pub mod capture;
+pub mod discover;
 pub mod endpoint;
 pub mod fabric;
 pub mod frame;
@@ -26,12 +29,27 @@ pub mod udp_endpoint;
 pub type Mac = [u8; 6];
 
 pub use addr::{peer_to_socket_addr, socket_addr_to_peer};
+pub use backend::{
+    default_backend_order, gpu_compute_present, nvidia_present, offer_from, offer_media,
+    pick_backend, probe_backends, pyrowave_library_present, pyrowave_ready, selected_backend,
+    widen_process_path, BackendProbe, MediaBackend,
+};
+pub use capture::{
+    capture_active, capture_dir, capture_from_env, capture_start, capture_stop, note_app,
+    note_ether, CaptureError, CaptureInfo, DIR_RECV, DIR_SEND,
+};
 pub use endpoint::{client_endpoint, server_endpoint, EndpointError};
 pub use fabric::Fabric;
 pub use frame::{max_quic_datagram, Frame, DEFAULT_ETHER_TYPE};
-pub use socket::EtherSocket;
 pub use l2_endpoint::{l2_client_endpoint, l2_server_endpoint, L2Net};
 pub use pcap_link::{parse_mac, ETHERTYPE_QUIC};
-pub use priority::{AUDIO as PRIORITY_AUDIO, INPUT as PRIORITY_INPUT, VIDEO as PRIORITY_VIDEO};
+pub use priority::{
+    AUDIO as PRIORITY_AUDIO, INPUT as PRIORITY_INPUT, TRACE as PRIORITY_TRACE,
+    VIDEO as PRIORITY_VIDEO,
+};
+pub use socket::EtherSocket;
 pub use tls::{install_pure_crypto, ALPN_ETHERQUIC};
-pub use udp_endpoint::{udp_client_endpoint, udp_server_endpoint};
+pub use udp_endpoint::{
+    udp_accept, udp_client_endpoint, udp_client_endpoint_on, udp_listeners, udp_server_endpoint,
+    UdpListeners,
+};

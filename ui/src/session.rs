@@ -1,5 +1,7 @@
 //! Who is hosting, and the peer address the player types.
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+
 use etherquic::{PRIORITY_AUDIO, PRIORITY_INPUT, PRIORITY_VIDEO};
 
 /// This PC while it is the host. A second process on the same machine uses [`CLIENT_MAC`].
@@ -65,6 +67,51 @@ pub fn lanes() -> [Lane; 3] {
 
 pub fn format_mac(mac: [u8; 6]) -> String {
     HexMac::from_bytes(mac).display()
+}
+
+/// How Connect reaches the selected host. L2 is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layer {
+    L2,
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+}
+
+/// What Connect should dial. A link-local IPv6 address needs the NIC's scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialTarget {
+    L2,
+    Udp(SocketAddr),
+    /// `fe80::` with no interface index.
+    NeedsNic,
+}
+
+/// Keep `choice` when that address is still on the host. Otherwise use L2.
+pub fn active_layer(choice: Layer, v4: &[Ipv4Addr], v6: &[Ipv6Addr]) -> Layer {
+    match choice {
+        Layer::V4(ip) if v4.contains(&ip) => choice,
+        Layer::V6(ip) if v6.contains(&ip) => choice,
+        _ => Layer::L2,
+    }
+}
+
+/// `port` `0` uses the play service. `scope` is the IPv6 interface index.
+pub fn dial_target(layer: Layer, port: u16, scope: u32) -> DialTarget {
+    let port = if port == 0 { PLAY_SERVICE_ID } else { port };
+    match layer {
+        Layer::L2 => DialTarget::L2,
+        Layer::V4(ip) => DialTarget::Udp(SocketAddr::from((ip, port))),
+        Layer::V6(ip) => {
+            if ip.is_unicast_link_local() && scope == 0 {
+                return DialTarget::NeedsNic;
+            }
+            let mut addr = SocketAddrV6::new(ip, port, 0, 0);
+            if ip.is_unicast_link_local() {
+                addr.set_scope_id(scope);
+            }
+            DialTarget::Udp(SocketAddr::V6(addr))
+        }
+    }
 }
 
 /// Up to 12 hex digits. Colons are display-only.
@@ -164,6 +211,29 @@ mod tests {
         assert_eq!(lanes[0].priority, 20);
         assert_eq!(lanes[1].priority, 10);
         assert_eq!(lanes[2].priority, 0);
+    }
+
+    #[test]
+    fn an_address_that_left_the_host_falls_back_to_l2() {
+        let v4 = [Ipv4Addr::new(192, 168, 0, 58)];
+        let v6 = ["fe80::1".parse::<Ipv6Addr>().unwrap()];
+        let picked = Layer::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(active_layer(picked, &v4, &v6), Layer::L2);
+        assert_eq!(active_layer(Layer::V4(v4[0]), &v4, &v6), Layer::V4(v4[0]));
+        assert_eq!(
+            dial_target(Layer::V4(v4[0]), 0, 0),
+            DialTarget::Udp(SocketAddr::from((v4[0], PLAY_SERVICE_ID)))
+        );
+        assert_eq!(dial_target(Layer::V6(v6[0]), 4433, 0), DialTarget::NeedsNic);
+        match dial_target(Layer::V6(v6[0]), 4433, 2) {
+            DialTarget::Udp(SocketAddr::V6(addr)) => assert_eq!(addr.scope_id(), 2),
+            other => panic!("expected scoped ipv6, got {other:?}"),
+        }
+        let global = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
+        match dial_target(Layer::V6(global), 4433, 2) {
+            DialTarget::Udp(SocketAddr::V6(addr)) => assert_eq!(addr.scope_id(), 0),
+            other => panic!("expected global ipv6, got {other:?}"),
+        }
     }
 
     #[test]

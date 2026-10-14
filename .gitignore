@@ -4,3 +4,7 @@ target/
 .idea/
 .vscode/
 *.swp
+
+# APK sideload signing key. Required beside the packaging crate, not in git.
+packaging/android/debug.pk8
+packaging/android/debug.crt

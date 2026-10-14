@@ -1,0 +1,84 @@
+[package]
+name = "etherquic-play"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "One host and one player: desktop, audio, and input over etherquic"
+autobins = false
+
+[dependencies]
+etherquic = { path = ".." }
+etherquic-container = { path = "../container" }
+etherquic-input = { path = "../input" }
+jpeg-encoder = "0.6"
+quinn = { path = "../vendor/quinn/quinn", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-pure",
+] }
+thiserror = "2"
+tokio = { version = "1.28", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-util",
+    "signal",
+] }
+zune-core = "0.4"
+zune-jpeg = "0.4"
+
+[features]
+default = ["desktop"]
+desktop = [
+    "dep:cpal",
+    "dep:enigo",
+    "dep:gilrs",
+    "dep:softbuffer",
+    "dep:winit",
+    "dep:xcap",
+]
+
+[dependencies.cpal]
+version = "0.15"
+optional = true
+
+[dependencies.enigo]
+version = "0.3"
+optional = true
+default-features = false
+features = ["wayland"]
+
+[dependencies.gilrs]
+version = "0.11"
+optional = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
+reis = "0.4"
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[target.'cfg(windows)'.dependencies]
+vigem-client = "0.1"
+
+[dependencies.softbuffer]
+path = "../vendor/softbuffer"
+optional = true
+
+[dependencies.winit]
+version = "0.30"
+optional = true
+
+[dependencies.xcap]
+version = "0.6"
+optional = true
+
+[[bin]]
+name = "etherquic-play"
+path = "src/main.rs"
+required-features = ["desktop"]

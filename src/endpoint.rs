@@ -42,10 +42,10 @@ pub fn server_endpoint(
     transport.mtu_discovery_config(None);
 
     let rustls_server = tls::load_server_config(cert_pem, key_pem)?;
-    let mut server_config =
-        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(rustls_server).map_err(
-            |e| EndpointError::Other(format!("QuicServerConfig: {e}")),
-        )?));
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(rustls_server)
+            .map_err(|e| EndpointError::Other(format!("QuicServerConfig: {e}")))?,
+    ));
     server_config.transport_config(Arc::new(transport));
 
     let mut endpoint_config = EndpointConfig::default();
@@ -76,10 +76,10 @@ pub fn client_endpoint(
     transport.mtu_discovery_config(None);
 
     let rustls_client = tls::load_client_config(true)?;
-    let mut client_config =
-        ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_client).map_err(
-            |e| EndpointError::Other(format!("QuicClientConfig: {e}")),
-        )?));
+    let mut client_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(rustls_client)
+            .map_err(|e| EndpointError::Other(format!("QuicClientConfig: {e}")))?,
+    ));
     client_config.transport_config(Arc::new(transport));
 
     let mut endpoint_config = EndpointConfig::default();

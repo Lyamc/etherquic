@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 560" width="980" height="560" role="img" aria-labelledby="title desc">
+  <title id="title">QUIC packet inside the datagram</title>
+  <desc id="desc">Long header used for Initial and Handshake, and short header used for application data. The payload is AEAD sealed.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #1c1917; }
+    .h { font-size: 22px; font-weight: 700; }
+    .f { font-size: 13px; font-weight: 700; }
+    .n { font-size: 12px; fill: #44403c; }
+    .box { stroke: #1c1917; stroke-width: 1.4; }
+  </style>
+  <rect width="980" height="560" fill="#f7f5f0"/>
+  <text class="h" x="32" y="40">QUIC packet</text>
+  <text class="n" x="32" y="64">One datagram can hold several packets back to back during the handshake. After that, data uses the short header.</text>
+
+  <text class="f" x="32" y="108">Long header. Initial and Handshake. First byte has the high bit set.</text>
+  <g transform="translate(32,122)">
+    <rect class="box" x="0" y="0" width="70" height="70" fill="#b7dfd0"/>
+    <rect class="box" x="70" y="0" width="90" height="70" fill="#d7efe4"/>
+    <rect class="box" x="160" y="0" width="130" height="70" fill="#d7efe4"/>
+    <rect class="box" x="290" y="0" width="130" height="70" fill="#d7efe4"/>
+    <rect class="box" x="420" y="0" width="110" height="70" fill="#c5e6da"/>
+    <rect class="box" x="530" y="0" width="80" height="70" fill="#c5e6da"/>
+    <rect class="box" x="610" y="0" width="70" height="70" fill="#f6e6d0"/>
+    <rect class="box" x="680" y="0" width="180" height="70" fill="#efe4f6"/>
+    <rect class="box" x="860" y="0" width="72" height="70" fill="#e7d5f2"/>
+    <text class="f" x="35" y="30" text-anchor="middle">type</text>
+    <text class="n" x="35" y="50" text-anchor="middle">1</text>
+    <text class="f" x="115" y="30" text-anchor="middle">version</text>
+    <text class="n" x="115" y="50" text-anchor="middle">4</text>
+    <text class="f" x="225" y="30" text-anchor="middle">dest CID</text>
+    <text class="n" x="225" y="50" text-anchor="middle">len + id</text>
+    <text class="f" x="355" y="30" text-anchor="middle">src CID</text>
+    <text class="n" x="355" y="50" text-anchor="middle">len + id</text>
+    <text class="f" x="475" y="28" text-anchor="middle">token</text>
+    <text class="n" x="475" y="48" text-anchor="middle">Initial only</text>
+    <text class="f" x="570" y="30" text-anchor="middle">length</text>
+    <text class="n" x="570" y="50" text-anchor="middle">2</text>
+    <text class="f" x="645" y="30" text-anchor="middle">pkt no</text>
+    <text class="n" x="645" y="50" text-anchor="middle">1–4</text>
+    <text class="f" x="770" y="30" text-anchor="middle">frames</text>
+    <text class="n" x="770" y="50" text-anchor="middle">encrypted</text>
+    <text class="f" x="896" y="30" text-anchor="middle">tag</text>
+    <text class="n" x="896" y="50" text-anchor="middle">16</text>
+  </g>
+  <text class="n" x="32" y="214">Type low bits and the packet number are header-protected. The sample comes from the ciphertext.</text>
+
+  <text class="f" x="32" y="262">Short header. 1-RTT application data. First byte has the high bit clear.</text>
+  <g transform="translate(32,276)">
+    <rect class="box" x="0" y="0" width="90" height="70" fill="#b7dfd0"/>
+    <rect class="box" x="90" y="0" width="180" height="70" fill="#d7efe4"/>
+    <rect class="box" x="270" y="0" width="90" height="70" fill="#f6e6d0"/>
+    <rect class="box" x="360" y="0" width="400" height="70" fill="#efe4f6"/>
+    <rect class="box" x="760" y="0" width="90" height="70" fill="#e7d5f2"/>
+    <text class="f" x="45" y="28" text-anchor="middle">flags</text>
+    <text class="n" x="45" y="48" text-anchor="middle">spin, key</text>
+    <text class="f" x="180" y="30" text-anchor="middle">dest connection id</text>
+    <text class="n" x="180" y="50" text-anchor="middle">no length byte</text>
+    <text class="f" x="315" y="30" text-anchor="middle">pkt no</text>
+    <text class="n" x="315" y="50" text-anchor="middle">1–4</text>
+    <text class="f" x="560" y="30" text-anchor="middle">frames, AEAD sealed</text>
+    <text class="n" x="560" y="50" text-anchor="middle">AES-128-GCM</text>
+    <text class="f" x="805" y="30" text-anchor="middle">tag</text>
+    <text class="n" x="805" y="50" text-anchor="middle">16</text>
+  </g>
+  <text class="n" x="32" y="372">The packet number on the wire is truncated. The receiver reconstructs it from the largest number it has seen.</text>
+
+  <text class="h" x="32" y="424" style="font-size:18px">What each space carries</text>
+  <g transform="translate(32,444)">
+    <rect class="box" x="0" y="0" width="290" height="78" rx="8" fill="#d7efe4"/>
+    <text class="f" x="16" y="28">Initial</text>
+    <text class="n" x="16" y="50">CRYPTO frames. The TLS ClientHello</text>
+    <text class="n" x="16" y="66">and ServerHello live here.</text>
+    <rect class="box" x="310" y="0" width="290" height="78" rx="8" fill="#d7efe4"/>
+    <text class="f" x="326" y="28">Handshake</text>
+    <text class="n" x="326" y="50">Rest of the TLS handshake,</text>
+    <text class="n" x="326" y="66">still in CRYPTO frames.</text>
+    <rect class="box" x="620" y="0" width="290" height="78" rx="8" fill="#efe4f6"/>
+    <text class="f" x="636" y="28">1-RTT</text>
+    <text class="n" x="636" y="50">STREAM, ACK, PING, and close.</text>
+    <text class="n" x="636" y="66">Picture, audio, and input.</text>
+  </g>
+</svg>

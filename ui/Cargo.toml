@@ -5,17 +5,23 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Host and player console for an etherquic play session"
+description = "etherquic window. The ui feature is the GPUI front end."
 autobins = false
 
 [features]
 default = ["ui"]
-ui = ["dep:gpui"]
+ui = ["dep:gpui", "dep:etherquic-play", "etherquic-play/desktop"]
 
 [dependencies]
 etherquic = { path = ".." }
+etherquic-play = { path = "../play", default-features = false, optional = true }
+qrcode = { version = "0.14", default-features = false }
 tokio = { version = "1.28", features = ["rt", "macros", "sync", "time"] }
 gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true }
+
+# The Windows backend is built in. Linux needs a window system, and this machine is Wayland.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true, features = ["wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
@@ -25,7 +31,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [[bin]]
-name = "etherquic-ui"
+name = "etherquic"
 path = "src/main.rs"
 required-features = ["ui"]
 
@@ -34,3 +40,6 @@ required-features = ["ui"]
 # Graviola instead of ring.
 [patch.crates-io]
 gpui_http_client = { path = "../../../interfaces/gpui_http_client" }
+# xattr 0.2.3 reads libc::ENOATTR, which this libc no longer defines.
+# On Linux that value is ENODATA.
+xattr = { path = "../vendor/xattr" }

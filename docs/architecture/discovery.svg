@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 500" width="980" height="500" role="img" aria-labelledby="title desc">
+  <title id="title">Discovery frames</title>
+  <desc id="desc">Discovery uses the same Ethernet header and EtherType, service 4440, and an EQDS payload that is not a QUIC packet.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #1c1917; }
+    .h { font-size: 22px; font-weight: 700; }
+    .f { font-size: 14px; font-weight: 700; }
+    .n { font-size: 12px; fill: #44403c; }
+    .box { stroke: #1c1917; stroke-width: 1.4; }
+  </style>
+  <rect width="980" height="500" fill="#f7f5f0"/>
+  <text class="h" x="32" y="40">Discovery, service 4440</text>
+  <text class="n" x="32" y="64">Same EtherType as QUIC. A different service, so the QUIC socket never reads these frames.</text>
+
+  <g transform="translate(48,100)">
+    <rect class="box" x="0" y="40" width="200" height="64" rx="8" fill="#dbe7f5"/>
+    <text class="f" x="100" y="68" text-anchor="middle">Player</text>
+    <text class="n" x="100" y="88" text-anchor="middle">broadcast announce</text>
+    <rect class="box" x="640" y="40" width="200" height="64" rx="8" fill="#e7efd4"/>
+    <text class="f" x="740" y="68" text-anchor="middle">Host</text>
+    <text class="n" x="740" y="88" text-anchor="middle">unicast offer</text>
+    <path d="M200 62 H620" stroke="#1c1917" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text class="n" x="410" y="52" text-anchor="middle">dst MAC ff:ff:ff:ff:ff:ff, kind 1</text>
+    <path d="M640 92 H220" stroke="#1c1917" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text class="n" x="430" y="128" text-anchor="middle">same probe id, kind 2, host MAC and addresses</text>
+  </g>
+
+  <text class="f" x="32" y="250">EQDS header, 10 bytes, big-endian</text>
+  <g transform="translate(32,266)">
+    <rect class="box" x="0" y="0" width="120" height="56" fill="#e7efd4"/>
+    <rect class="box" x="120" y="0" width="80" height="56" fill="#d7efe4"/>
+    <rect class="box" x="200" y="0" width="80" height="56" fill="#f6e6d0"/>
+    <rect class="box" x="280" y="0" width="120" height="56" fill="#dbe7f5"/>
+    <rect class="box" x="400" y="0" width="500" height="56" fill="#f8e4e4"/>
+    <text class="f" x="60" y="34" text-anchor="middle">EQDS</text>
+    <text class="f" x="160" y="24" text-anchor="middle">version</text>
+    <text class="n" x="160" y="42" text-anchor="middle">1 byte</text>
+    <text class="f" x="240" y="24" text-anchor="middle">kind</text>
+    <text class="n" x="240" y="42" text-anchor="middle">1 byte</text>
+    <text class="f" x="340" y="24" text-anchor="middle">probe id</text>
+    <text class="n" x="340" y="42" text-anchor="middle">u32</text>
+    <text class="f" x="650" y="24" text-anchor="middle">offer body, empty on an announce</text>
+    <text class="n" x="650" y="44" text-anchor="middle">MAC, services, name, IPv4, IPv6</text>
+  </g>
+
+  <text class="n" x="32" y="360">Version 2 adds codec rows and one L2 driver byte. Version 1 stops after the addresses.</text>
+  <text class="n" x="32" y="384">A codec row is an id and a flags byte: encode 0x01, decode 0x02, cpu 0x04, gpu 0x08,</text>
+  <text class="n" x="32" y="408">ffmpeg 0x10, gstreamer 0x20, libopus 0x40. Video ids are Pyrowave 1, MJPEG 2, H.264 3,</text>
+  <text class="n" x="32" y="432">H.265 4, AV1 5. Audio ids are PCM 1 and Opus 2.</text>
+  <text class="n" x="32" y="468">The desktop picture on the play connection stays JPEG, and desktop audio stays PCM.</text>
+  <text class="n" x="32" y="490">The offer says what the host can run. It does not change the bytes inside EVID and EAUD.</text>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#1c1917"/>
+    </marker>
+  </defs>
+</svg>

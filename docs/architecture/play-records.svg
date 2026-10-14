@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 620" width="980" height="620" role="img" aria-labelledby="title desc">
+  <title id="title">Desktop streams and records</title>
+  <desc id="desc">Four unidirectional QUIC streams on service 4433. Each starts with a four byte kind and then little-endian length-prefixed records.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #1c1917; }
+    .h { font-size: 22px; font-weight: 700; }
+    .f { font-size: 14px; font-weight: 700; }
+    .n { font-size: 12px; fill: #44403c; }
+    .box { stroke: #1c1917; stroke-width: 1.4; }
+  </style>
+  <rect width="980" height="620" fill="#f7f5f0"/>
+  <text class="h" x="32" y="40">Desktop session on service 4433</text>
+  <text class="n" x="32" y="64">One QUIC connection. Each side sends its own streams. A higher priority goes out first.</text>
+
+  <g transform="translate(32,88)">
+    <rect class="box" x="0" y="0" width="220" height="88" rx="8" fill="#f6e6d0"/>
+    <text class="f" x="16" y="28">EACK priority 30</text>
+    <text class="n" x="16" y="50">host to player</text>
+    <text class="n" x="16" y="68">only while tracing input</text>
+    <rect class="box" x="236" y="0" width="220" height="88" rx="8" fill="#f8e4e4"/>
+    <text class="f" x="252" y="28">EINP priority 20</text>
+    <text class="n" x="252" y="50">player to host</text>
+    <text class="n" x="252" y="68">keys, pointer, gamepad</text>
+    <rect class="box" x="472" y="0" width="220" height="88" rx="8" fill="#efe4f6"/>
+    <text class="f" x="488" y="28">EAUD priority 10</text>
+    <text class="n" x="488" y="50">host to player</text>
+    <text class="n" x="488" y="68">PCM from loopback</text>
+    <rect class="box" x="708" y="0" width="220" height="88" rx="8" fill="#dbe7f5"/>
+    <text class="f" x="724" y="28">EVID priority 0</text>
+    <text class="n" x="724" y="50">host to player</text>
+    <text class="n" x="724" y="68">JPEG pictures</text>
+  </g>
+
+  <text class="f" x="32" y="216">Every media stream has the same record shape</text>
+  <g transform="translate(32,232)">
+    <rect class="box" x="0" y="0" width="160" height="64" fill="#e7d5f2"/>
+    <rect class="box" x="160" y="0" width="140" height="64" fill="#f6e6d0"/>
+    <rect class="box" x="300" y="0" width="360" height="64" fill="#f8e4e4"/>
+    <rect class="box" x="660" y="0" width="140" height="64" fill="#f6e6d0"/>
+    <rect class="box" x="800" y="0" width="116" height="64" fill="#f8e4e4"/>
+    <text class="f" x="80" y="28" text-anchor="middle">kind</text>
+    <text class="n" x="80" y="48" text-anchor="middle">4 bytes, once</text>
+    <text class="f" x="230" y="28" text-anchor="middle">length</text>
+    <text class="n" x="230" y="48" text-anchor="middle">u32 little-endian</text>
+    <text class="f" x="480" y="28" text-anchor="middle">payload</text>
+    <text class="n" x="480" y="48" text-anchor="middle">length bytes</text>
+    <text class="f" x="730" y="28" text-anchor="middle">length</text>
+    <text class="n" x="730" y="48" text-anchor="middle">next record</text>
+    <text class="f" x="858" y="36" text-anchor="middle">...</text>
+  </g>
+  <text class="n" x="32" y="322">A record larger than 12 MiB is rejected. End of stream before the next length is a clean finish.</text>
+
+  <text class="f" x="32" y="364">EVID payload</text>
+  <text class="n" x="160" y="364">JPEG bytes. A picture starts with FF D8. The desktop encoder uses quality 40.</text>
+  <text class="f" x="32" y="396">EAUD payload</text>
+  <g transform="translate(160,374)">
+    <rect class="box" x="0" y="0" width="120" height="40" fill="#efe4f6"/>
+    <rect class="box" x="120" y="0" width="110" height="40" fill="#e7d5f2"/>
+    <rect class="box" x="230" y="0" width="280" height="40" fill="#f8e4e4"/>
+    <text class="n" x="60" y="26" text-anchor="middle">rate u32le</text>
+    <text class="n" x="175" y="26" text-anchor="middle">channels u16le</text>
+    <text class="n" x="370" y="26" text-anchor="middle">interleaved i16le samples</text>
+  </g>
+
+  <text class="f" x="32" y="456">EINP payload</text>
+  <text class="n" x="160" y="456">One EQIN document. Magic EQIN, version 1, then events.</text>
+  <g transform="translate(160,472)">
+    <rect class="box" x="0" y="0" width="80" height="40" fill="#f8e4e4"/>
+    <rect class="box" x="80" y="0" width="70" height="40" fill="#f6e6d0"/>
+    <rect class="box" x="150" y="0" width="90" height="40" fill="#f3d7b0"/>
+    <rect class="box" x="240" y="0" width="110" height="40" fill="#efe4f6"/>
+    <rect class="box" x="350" y="0" width="70" height="40" fill="#e7d5f2"/>
+    <rect class="box" x="420" y="0" width="200" height="40" fill="#dbe7f5"/>
+    <text class="n" x="40" y="26" text-anchor="middle">EQIN</text>
+    <text class="n" x="115" y="26" text-anchor="middle">ver 1</text>
+    <text class="n" x="195" y="26" text-anchor="middle">len u16le</text>
+    <text class="n" x="295" y="26" text-anchor="middle">time u64le</text>
+    <text class="n" x="385" y="26" text-anchor="middle">kind</text>
+    <text class="n" x="520" y="26" text-anchor="middle">key, pointer, pad</text>
+  </g>
+  <text class="n" x="32" y="548">The length counts the timestamp, the kind, and the body. Keys are never folded together.</text>
+  <text class="n" x="32" y="572">A later pointer replaces an earlier one that has not been written yet.</text>
+  <text class="n" x="32" y="600">EACK payload is 15 bytes: stamp u64le, kind, code u32le, result, detail.</text>
+</svg>

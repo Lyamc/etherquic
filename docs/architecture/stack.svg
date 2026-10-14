@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 640" width="960" height="640" role="img" aria-labelledby="title desc">
+  <title id="title">etherquic stack</title>
+  <desc id="desc">Desktop bytes become a QUIC stream record, then QUIC frames, then one datagram, then either an Ethernet frame or a UDP datagram.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #1c1917; }
+    .h { font-size: 22px; font-weight: 700; }
+    .b { font-size: 16px; font-weight: 650; }
+    .s { font-size: 13px; fill: #44403c; }
+    .box { stroke: #1c1917; stroke-width: 1.5; }
+  </style>
+  <rect width="960" height="640" fill="#f7f5f0"/>
+  <text class="h" x="40" y="42">From a desktop byte to a frame</text>
+  <text class="s" x="40" y="68">Quinn never sees a MAC. The L2 socket adds one on the way out.</text>
+
+  <rect class="box" x="250" y="96" width="460" height="64" rx="10" fill="#f8e4e4"/>
+  <text class="b" x="480" y="122" text-anchor="middle">Application bytes</text>
+  <text class="s" x="480" y="144" text-anchor="middle">JPEG picture, PCM audio, or an EQIN input document</text>
+
+  <path d="M480 160 V188" stroke="#1c1917" stroke-width="1.6" marker-end="url(#arr)"/>
+  <rect class="box" x="210" y="192" width="540" height="64" rx="10" fill="#efe4f6"/>
+  <text class="b" x="480" y="218" text-anchor="middle">One QUIC stream</text>
+  <text class="s" x="480" y="240" text-anchor="middle">4-byte kind, then length-prefixed records. Reliable and ordered.</text>
+
+  <path d="M480 256 V284" stroke="#1c1917" stroke-width="1.6" marker-end="url(#arr)"/>
+  <rect class="box" x="180" y="288" width="600" height="64" rx="10" fill="#e7d5f2"/>
+  <text class="b" x="480" y="314" text-anchor="middle">QUIC frames</text>
+  <text class="s" x="480" y="336" text-anchor="middle">STREAM carries the record. ACK, PING, and CRYPTO share the packet.</text>
+
+  <path d="M480 352 V380" stroke="#1c1917" stroke-width="1.6" marker-end="url(#arr)"/>
+  <rect class="box" x="180" y="384" width="600" height="64" rx="10" fill="#d7efe4"/>
+  <text class="b" x="480" y="410" text-anchor="middle">One QUIC datagram</text>
+  <text class="s" x="480" y="432" text-anchor="middle">Packet header, protected packet number, AEAD ciphertext and tag.</text>
+
+  <path d="M360 448 V478" stroke="#1c1917" stroke-width="1.6" marker-end="url(#arr)"/>
+  <path d="M600 448 V478" stroke="#1c1917" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <rect class="box" x="40" y="482" width="400" height="112" rx="10" fill="#dbe7f5"/>
+  <text class="b" x="240" y="512" text-anchor="middle">Ethernet</text>
+  <text class="s" x="240" y="536" text-anchor="middle">EtherType 0x88B6, service ports, payload length</text>
+  <text class="s" x="240" y="558" text-anchor="middle">membrane, Npcap, or libpcap on IFACE</text>
+  <text class="s" x="240" y="578" text-anchor="middle">Play, audio, input, and discovery share the type</text>
+
+  <rect class="box" x="520" y="482" width="400" height="112" rx="10" fill="#e7efd4"/>
+  <text class="b" x="720" y="512" text-anchor="middle">UDP</text>
+  <text class="s" x="720" y="536" text-anchor="middle">Same QUIC datagram, no service header</text>
+  <text class="s" x="720" y="558" text-anchor="middle">Used when the player dials an IP address</text>
+  <text class="s" x="720" y="578" text-anchor="middle">Port is the play service, 4433</text>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#1c1917"/>
+    </marker>
+  </defs>
+</svg>

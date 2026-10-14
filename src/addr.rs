@@ -65,14 +65,7 @@ fn link_local_to_mac(ip: Ipv6Addr) -> Option<Mac> {
     if eui[3] != 0xff || eui[4] != 0xfe {
         return None;
     }
-    Some([
-        eui[0] ^ 0x02,
-        eui[1],
-        eui[2],
-        eui[5],
-        eui[6],
-        eui[7],
-    ])
+    Some([eui[0] ^ 0x02, eui[1], eui[2], eui[5], eui[6], eui[7]])
 }
 
 #[cfg(test)]

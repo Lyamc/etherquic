@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <!--
+    Per-user application package for EtherQuic Play.
+    UpgradeCode is the product identity and stays fixed across versions.
+    Product Id="*" gives each built package its own ProductCode so a higher
+    ProductVersion is an in-place major upgrade, not a second install.
+    This is not the Membrane NDIS driver package.
+  -->
+  <Product
+      Id="*"
+      Name="EtherQuic Play"
+      Language="1033"
+      Version="$(var.ProductVersion)"
+      Manufacturer="EtherQuic"
+      UpgradeCode="C4E8B1A2-7D3F-4E15-9A60-1F2B3C4D5E6F">
+
+    <Package
+        Description="EtherQuic Play"
+        Manufacturer="EtherQuic"
+        InstallerVersion="500"
+        Compressed="yes"
+        InstallScope="perUser" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="PlayFeature" Title="EtherQuic Play" Level="1">
+      <ComponentGroupRef Id="PlayComponents" />
+    </Feature>
+  </Product>
+
+  <Fragment>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLFOLDER" Name="EtherQuic Play" />
+      </Directory>
+    </Directory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="PlayComponents" Directory="INSTALLFOLDER">
+      <Component Id="PlayComponent" Guid="B7E2C4A1-6F08-4D55-9C33-2A1E0F8D7B64" Win64="yes">
+        <RegistryKey Root="HKCU" Key="Software\EtherQuic\Play">
+          <RegistryValue Name="Version" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+        </RegistryKey>
+        <File Id="VersionStamp" Source="$(var.VersionStamp)" Name="installed-version.txt" />
+        <File Id="PlayExe" Source="$(var.PlayExe)" Name="etherquic-play.exe" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 520" width="980" height="520" role="img" aria-labelledby="title desc">
+  <title id="title">QUIC frames inside the decrypted payload</title>
+  <desc id="desc">A decrypted QUIC payload is a sequence of frames. STREAM frames carry the application records.</desc>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #1c1917; }
+    .h { font-size: 22px; font-weight: 700; }
+    .f { font-size: 14px; font-weight: 700; }
+    .n { font-size: 12px; fill: #44403c; }
+    .box { stroke: #1c1917; stroke-width: 1.4; }
+  </style>
+  <rect width="980" height="520" fill="#f7f5f0"/>
+  <text class="h" x="32" y="40">Inside the decrypted payload</text>
+  <text class="n" x="32" y="64">Frames are concatenated. The type is a QUIC varint. Values under 64 are one byte.</text>
+
+  <g transform="translate(32,92)">
+    <rect class="box" x="0" y="0" width="200" height="86" fill="#efe4f6"/>
+    <rect class="box" x="200" y="0" width="250" height="86" fill="#f8e4e4"/>
+    <rect class="box" x="450" y="0" width="220" height="86" fill="#e7d5f2"/>
+    <rect class="box" x="670" y="0" width="250" height="86" fill="#d7efe4"/>
+    <text class="f" x="16" y="28">STREAM</text>
+    <text class="n" x="16" y="50">type 0x08–0x0f</text>
+    <text class="n" x="16" y="68">stream id, offset, data</text>
+    <text class="f" x="216" y="28">application bytes</text>
+    <text class="n" x="216" y="50">a slice of EVID, EAUD,</text>
+    <text class="n" x="216" y="68">EINP, or EACK</text>
+    <text class="f" x="466" y="28">ACK</text>
+    <text class="n" x="466" y="50">type 0x02</text>
+    <text class="n" x="466" y="68">which packets arrived</text>
+    <text class="f" x="686" y="28">more frames</text>
+    <text class="n" x="686" y="50">PING, PADDING, or</text>
+    <text class="n" x="686" y="68">another STREAM</text>
+  </g>
+
+  <text class="n" x="32" y="210">STREAM bits in the type: 0x04 include offset, 0x02 include length, 0x01 FIN. Offset 0 and a known</text>
+  <text class="n" x="32" y="230">remaining length can omit those fields. The stream bytes themselves have no QUIC header.</text>
+
+  <text class="h" x="32" y="278" style="font-size:18px">Frames this session actually sends</text>
+  <g transform="translate(32,298)">
+    <rect class="box" x="0" y="0" width="300" height="72" rx="8" fill="#f8e4e4"/>
+    <text class="f" x="16" y="28">STREAM 0x08–0x0f</text>
+    <text class="n" x="16" y="52">picture, audio, input, confirmations</text>
+    <rect class="box" x="316" y="0" width="300" height="72" rx="8" fill="#d7efe4"/>
+    <text class="f" x="332" y="28">ACK 0x02</text>
+    <text class="n" x="332" y="52">resets the idle timer on receipt</text>
+    <rect class="box" x="632" y="0" width="300" height="72" rx="8" fill="#f6e6d0"/>
+    <text class="f" x="648" y="28">PING 0x01</text>
+    <text class="n" x="648" y="52">keep-alive when the desktop is quiet</text>
+    <rect class="box" x="0" y="88" width="300" height="72" rx="8" fill="#dbe7f5"/>
+    <text class="f" x="16" y="116">CRYPTO 0x06</text>
+    <text class="n" x="16" y="140">handshake only, TLS messages</text>
+    <rect class="box" x="316" y="88" width="300" height="72" rx="8" fill="#e7e5e4"/>
+    <text class="f" x="332" y="116">PADDING 0x00</text>
+    <text class="n" x="332" y="140">fills a datagram to a minimum size</text>
+    <rect class="box" x="632" y="88" width="300" height="72" rx="8" fill="#f8e4e4"/>
+    <text class="f" x="648" y="116">CLOSE 0x1c / 0x1d</text>
+    <text class="n" x="648" y="140">transport close, or the application close</text>
+  </g>
+</svg>

@@ -8,11 +8,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+#[cfg(not(feature = "ui"))]
 use std::time::Duration;
 
-use etherquic::{
-    l2_client_endpoint, l2_server_endpoint, peer_to_socket_addr, L2Net, ETHERTYPE_QUIC,
-};
+use std::net::SocketAddr;
+
+#[cfg(not(feature = "ui"))]
+use etherquic::{l2_client_endpoint, l2_server_endpoint, peer_to_socket_addr};
+use etherquic::{L2Net, ETHERTYPE_QUIC};
 
 use crate::session::{taskbar_for, Role, CLIENT_MAC, HOST_MAC, PLAY_SERVICE_ID};
 
@@ -90,7 +93,12 @@ impl Link {
         self.role = Role::Idle;
     }
 
-    pub fn host(&mut self, nic: Option<String>) -> Result<(), String> {
+    pub fn host(
+        &mut self,
+        nic: Option<String>,
+        backend: etherquic::MediaBackend,
+        fps: u32,
+    ) -> Result<(), String> {
         self.reap();
         if self.thread.is_some() {
             return Err("stop the current session first".into());
@@ -98,15 +106,28 @@ impl Link {
         let (cert, key) = cert_paths()?;
         let label = nic.clone().unwrap_or_else(|| "default adapter".into());
         let net = L2Net::open(nic.as_deref(), MTU, ETHERTYPE_QUIC).map_err(|e| e.to_string())?;
-        self.arm(Role::Host, format!("Starting host on {label}…"));
+        self.arm(Role::Host, format!("Sharing this desktop on {label}…"));
         let stop = Arc::clone(&self.stop_flag);
         let up = Arc::clone(&self.up);
         let peers = Arc::clone(&self.peers);
         let status = Arc::clone(&self.status);
+        let nic_for_discovery = nic.clone();
         match std::thread::Builder::new()
-            .name("etherquic-ui-host".into())
-            .spawn(move || host_thread(net, cert, key, stop, up, peers, status))
-        {
+            .name("etherquic-host".into())
+            .spawn(move || {
+                host_thread(
+                    net,
+                    cert,
+                    key,
+                    nic_for_discovery,
+                    backend,
+                    fps,
+                    stop,
+                    up,
+                    peers,
+                    status,
+                )
+            }) {
             Ok(handle) => {
                 self.thread = Some(handle);
                 Ok(())
@@ -119,22 +140,43 @@ impl Link {
         }
     }
 
-    pub fn connect(&mut self, nic: Option<String>, peer: [u8; 6]) -> Result<(), String> {
+    pub fn connect(
+        &mut self,
+        nic: Option<String>,
+        peer: [u8; 6],
+        trace_input: bool,
+        host_l2: u8,
+        udp: Option<SocketAddr>,
+    ) -> Result<(), String> {
         self.reap();
         if self.thread.is_some() {
             return Err("stop the current session first".into());
         }
-        let label = nic.clone().unwrap_or_else(|| "default adapter".into());
-        let net = L2Net::open(nic.as_deref(), MTU, ETHERTYPE_QUIC).map_err(|e| e.to_string())?;
-        self.arm(
-            Role::Client,
-            format!("Connecting via {label} to {}…", crate::format_mac(peer)),
-        );
+        let (net, opening) = if let Some(addr) = udp {
+            (None, format!("Opening the view to {addr}…"))
+        } else {
+            let label = nic.clone().unwrap_or_else(|| "default adapter".into());
+            let net = L2Net::open(nic.as_deref(), MTU, ETHERTYPE_QUIC).map_err(|e| e.to_string())?;
+            let driver = etherquic::discover::l2_backend_label(host_l2);
+            let driver = if driver.is_empty() {
+                String::new()
+            } else {
+                format!(" Host L2: {driver}.")
+            };
+            (
+                Some(net),
+                format!(
+                    "Opening the view to {} via {label}…{driver}",
+                    crate::format_mac(peer)
+                ),
+            )
+        };
+        self.arm(Role::Client, opening);
         let stop = Arc::clone(&self.stop_flag);
         let status = Arc::clone(&self.status);
         match std::thread::Builder::new()
-            .name("etherquic-ui-client".into())
-            .spawn(move || client_thread(net, peer, stop, status))
+            .name("etherquic-connect".into())
+            .spawn(move || client_thread(net, peer, udp, trace_input, stop, status))
         {
             Ok(handle) => {
                 self.thread = Some(handle);
@@ -178,26 +220,106 @@ impl Drop for Link {
     }
 }
 
+fn announced_media(
+    backend: etherquic::MediaBackend,
+) -> (
+    Option<Vec<etherquic::discover::AnnouncedCodec>>,
+    Option<Vec<etherquic::discover::AnnouncedCodec>>,
+) {
+    #[cfg(feature = "ui")]
+    {
+        let (video, audio) = etherquic::offer_media(backend);
+        (Some(video), Some(audio))
+    }
+    #[cfg(not(feature = "ui"))]
+    {
+        let _ = backend;
+        (None, None)
+    }
+}
+
 fn host_thread(
     net: Arc<L2Net>,
     cert: PathBuf,
     key: PathBuf,
+    nic: Option<String>,
+    backend: etherquic::MediaBackend,
+    fps: u32,
     stop: Arc<AtomicBool>,
     up: Arc<AtomicBool>,
     peers: Arc<AtomicUsize>,
     status: Arc<Mutex<String>>,
 ) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let discovery_stop = Arc::new(AtomicBool::new(false));
+    let discovery_flag = Arc::clone(&discovery_stop);
+    let l2_backend = net.l2_backend();
+    let discovery = std::thread::Builder::new()
+        .name("etherquic-announce".into())
+        .spawn(move || {
+            let (video, audio) = announced_media(backend);
+            let card = etherquic::discover::HostCard {
+                name: crate::share::machine_name(),
+                l2_mac: HOST_MAC,
+                l2_service: PLAY_SERVICE_ID,
+                l3_port: PLAY_SERVICE_ID,
+                video,
+                audio,
+                l2_backend,
+            };
+            if let Err(err) = etherquic::discover::serve(nic.as_deref(), &card, &discovery_flag) {
+                eprintln!("discovery: {err}");
+            }
+        })
+        .ok();
+    #[cfg(feature = "ui")]
     {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            write_status(&status, format!("Host failed: {e}"));
-            return;
+        let slot = Arc::clone(&status);
+        let report: etherquic_play::Status = Arc::new(move |text: &str| write_status(&slot, text));
+        let session = etherquic_play::HostSession {
+            local_mac: HOST_MAC,
+            service_id: PLAY_SERVICE_ID,
+            max_width: etherquic_play::DEFAULT_MAX_WIDTH,
+            fps: fps.max(1),
+            cert,
+            key,
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            etherquic_play::host_desktop(
+                net,
+                session,
+                Arc::clone(&stop),
+                Arc::clone(&up),
+                Arc::clone(&peers),
+                report,
+            )
+        }));
+        if let Err(err) = session_error(outcome) {
+            write_status(&status, format!("Host failed: {err}"));
         }
-    };
-    runtime.block_on(async move {
+        discovery_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = discovery {
+            let _ = handle.join();
+        }
+        return;
+    }
+    #[cfg(not(feature = "ui"))]
+    {
+        let _ = fps;
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                write_status(&status, format!("Host failed: {e}"));
+                discovery_stop.store(true, Ordering::SeqCst);
+                if let Some(handle) = discovery {
+                    let _ = handle.join();
+                }
+                return;
+            }
+        };
+        runtime.block_on(async move {
         let endpoint = match l2_server_endpoint(net, HOST_MAC, PLAY_SERVICE_ID, &cert, &key) {
             Ok(endpoint) => endpoint,
             Err(e) => {
@@ -258,12 +380,108 @@ fn host_thread(
         up.store(false, Ordering::SeqCst);
         endpoint.close(0u32.into(), b"stop");
         let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
-    });
+        });
+        discovery_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = discovery {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn client_thread(
-    net: Arc<L2Net>,
+    net: Option<Arc<L2Net>>,
     peer: [u8; 6],
+    udp: Option<SocketAddr>,
+    trace_input: bool,
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+) {
+    #[cfg(feature = "ui")]
+    {
+        open_view(net, peer, udp, trace_input, stop, status);
+    }
+    #[cfg(not(feature = "ui"))]
+    {
+        let _ = trace_input;
+        client_quic(net, peer, udp, stop, status);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn open_view(
+    net: Option<Arc<L2Net>>,
+    peer: [u8; 6],
+    udp: Option<SocketAddr>,
+    trace_input: bool,
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+) {
+    let slot = Arc::clone(&status);
+    let last = Arc::new(Mutex::new(String::new()));
+    let last_slot = Arc::clone(&last);
+    let report: etherquic_play::Status = Arc::new(move |text: &str| {
+        write_status(&slot, text);
+        match last_slot.lock() {
+            Ok(mut guard) => *guard = text.to_string(),
+            Err(poisoned) => *poisoned.into_inner() = text.to_string(),
+        }
+    });
+    let session = etherquic_play::ConnectSession {
+        local_mac: CLIENT_MAC,
+        peer_mac: peer,
+        service_id: PLAY_SERVICE_ID,
+        trace_input,
+        udp,
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        etherquic_play::connect_view(net, session, Arc::clone(&stop), report)
+    }));
+    if let Err(err) = session_error(outcome) {
+        write_status(&status, format!("Connect failed: {err}"));
+        return;
+    }
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
+    let text = match last.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if !status_stands(&text) {
+        write_status(&status, "The view closed.");
+    }
+}
+
+/// A failure, a timeout, or the host closing the session should stay on screen.
+#[cfg(feature = "ui")]
+fn status_stands(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("fail")
+        || text.contains("timed")
+        || text.contains("closed")
+        || text.contains("ended")
+        || text.contains("dropped")
+}
+
+#[cfg(feature = "ui")]
+fn session_error(
+    outcome: Result<
+        Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        Box<dyn std::any::Any + Send>,
+    >,
+) -> Result<(), String> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("the desktop session closed unexpectedly".into()),
+    }
+}
+
+#[cfg(not(feature = "ui"))]
+fn client_quic(
+    net: Option<Arc<L2Net>>,
+    peer: [u8; 6],
+    udp: Option<SocketAddr>,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 ) {
@@ -278,14 +496,34 @@ fn client_thread(
         }
     };
     runtime.block_on(async move {
-        let endpoint = match l2_client_endpoint(net, CLIENT_MAC, PLAY_SERVICE_ID) {
-            Ok(endpoint) => endpoint,
-            Err(e) => {
-                write_status(&status, format!("Connect failed: {e}"));
+        let dial = udp.unwrap_or_else(|| peer_to_socket_addr(peer, PLAY_SERVICE_ID));
+        let endpoint = if udp.is_some() {
+            let bind = if dial.is_ipv4() {
+                SocketAddr::from(([0, 0, 0, 0], 0))
+            } else {
+                SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            };
+            match etherquic::udp_client_endpoint_on(bind) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    write_status(&status, format!("Connect failed: {e}"));
+                    return;
+                }
+            }
+        } else {
+            let Some(net) = net else {
+                write_status(&status, "Connect failed: no adapter");
                 return;
+            };
+            match l2_client_endpoint(net, CLIENT_MAC, PLAY_SERVICE_ID) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    write_status(&status, format!("Connect failed: {e}"));
+                    return;
+                }
             }
         };
-        let addr = peer_to_socket_addr(peer, PLAY_SERVICE_ID);
+        let addr = dial;
         match endpoint.connect(addr, "localhost") {
             Ok(connecting) => {
                 let connected = tokio::select! {
@@ -305,8 +543,11 @@ fn client_thread(
                             ),
                         );
                         tokio::select! {
-                            _ = conn.closed() => {
-                                write_status(&status, "The host closed the session.");
+                            reason = conn.closed() => {
+                                write_status(
+                                    &status,
+                                    etherquic_play::session_end_status(&reason.to_string()),
+                                );
                             }
                             _ = until_stop(&stop) => {}
                         }
@@ -325,11 +566,13 @@ fn client_thread(
     });
 }
 
+#[cfg(not(feature = "ui"))]
 enum Dial<T> {
     Stopped,
     Finished(T),
 }
 
+#[cfg(not(feature = "ui"))]
 async fn until_stop(stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -357,6 +600,7 @@ fn cert_paths() -> Result<(PathBuf, PathBuf), String> {
 
 fn write_status(slot: &Mutex<String>, text: impl Into<String>) {
     let text = text.into();
+    eprintln!("{text}");
     match slot.lock() {
         Ok(mut guard) => *guard = text,
         Err(poisoned) => *poisoned.into_inner() = text,
@@ -373,6 +617,14 @@ fn read_status(slot: &Mutex<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn a_dropped_connection_keeps_its_status() {
+        assert!(status_stands("The connection dropped."));
+        assert!(status_stands("The host closed the session."));
+        assert!(!status_stands("Viewing aa:bb."));
+    }
 
     #[test]
     fn idle_link_has_no_taskbar() {

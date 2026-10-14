@@ -12,8 +12,8 @@ use std::time::Duration;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
-    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, ServerConfig, TokioRuntime,
-    TransportConfig, UdpSender,
+    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, IdleTimeout, ServerConfig,
+    TokioRuntime, TransportConfig, UdpSender, VarInt,
 };
 
 use crate::addr::socket_addr_to_peer;
@@ -30,6 +30,7 @@ pub struct L2Net {
     pub fabric: Arc<Fabric>,
     out: std::sync::mpsc::Sender<Vec<u8>>,
     ethertype: u16,
+    l2_backend: u8,
 }
 
 impl L2Net {
@@ -37,6 +38,7 @@ impl L2Net {
         let fabric = Fabric::with_ether_type(mtu, ethertype);
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let mut io = open_packet_io(nic, ethertype)?;
+        let l2_backend = io.l2_backend();
         eprintln!(
             "etherquic L2: backend={} ethertype=0x{ethertype:04x} mtu={mtu}",
             io.name()
@@ -73,6 +75,10 @@ impl L2Net {
                 };
                 for raw in batch {
                     if let Ok(frame) = Frame::decode_filtered(&raw, ethertype) {
+                        // Announcements share this EtherType. They are not QUIC datagrams.
+                        if crate::discover::is_discovery(&frame) {
+                            continue;
+                        }
                         fabric_rx.inject(frame);
                     }
                 }
@@ -83,11 +89,18 @@ impl L2Net {
             fabric,
             out: tx,
             ethertype,
+            l2_backend,
         }))
     }
 
     pub fn ethertype(&self) -> u16 {
         self.ethertype
+    }
+
+    /// [`crate::discover::L2_LIBPCAP`], [`crate::discover::L2_NPCAP`], or
+    /// [`crate::discover::L2_MEMBRANE`]. This is the driver the session opened.
+    pub fn l2_backend(&self) -> u8 {
+        self.l2_backend
     }
 }
 
@@ -110,10 +123,10 @@ pub fn l2_server_endpoint(
     let max = net.fabric.max_quic_datagram() as u16;
 
     let rustls_server = tls::load_server_config(cert_pem, key_pem)?;
-    let mut server_config =
-        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(rustls_server).map_err(
-            |e| EndpointError::Other(format!("QuicServerConfig: {e}")),
-        )?));
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(rustls_server)
+            .map_err(|e| EndpointError::Other(format!("QuicServerConfig: {e}")))?,
+    ));
     server_config.transport_config(Arc::new(transport_for_mtu(max)));
 
     let mut endpoint_config = EndpointConfig::default();
@@ -138,11 +151,17 @@ pub fn l2_client_endpoint(
     let max = net.fabric.max_quic_datagram() as u16;
 
     let rustls_client = tls::load_client_config(true)?;
-    let mut client_config =
-        ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_client).map_err(
-            |e| EndpointError::Other(format!("QuicClientConfig: {e}")),
-        )?));
-    client_config.transport_config(Arc::new(transport_for_mtu(max)));
+    let mut client_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(rustls_client)
+            .map_err(|e| EndpointError::Other(format!("QuicClientConfig: {e}")))?,
+    ));
+    let mut transport = transport_for_mtu(max);
+    // Six seconds with no packet ends the session, so a stopped service or a
+    // dead cable closes the view. The ping is shorter than that, so a quiet
+    // desktop still stays up. The host offers 30s; QUIC uses the smaller one.
+    transport.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(6_000))));
+    transport.keep_alive_interval(Some(Duration::from_secs(2)));
+    client_config.transport_config(Arc::new(transport));
 
     let mut endpoint_config = EndpointConfig::default();
     endpoint_config.max_udp_payload_size(max)?;
@@ -241,9 +260,8 @@ impl UdpSender for L2Sender {
 
 impl L2Sender {
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
-        let (dst_mac, dst_service) = socket_addr_to_peer(transmit.destination).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "not an etherquic peer")
-        })?;
+        let (dst_mac, dst_service) = socket_addr_to_peer(transmit.destination)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not an etherquic peer"))?;
         if transmit.contents.len() > self.max_datagram {
             return Err(io::Error::from_raw_os_error(90));
         }
@@ -279,17 +297,23 @@ impl PacketIo {
         }
     }
 
+    fn l2_backend(&self) -> u8 {
+        match self {
+            #[cfg(windows)]
+            PacketIo::Pcap(_) => crate::discover::L2_NPCAP,
+            #[cfg(not(windows))]
+            PacketIo::Pcap(_) => crate::discover::L2_LIBPCAP,
+            #[cfg(windows)]
+            PacketIo::Ndis(_) => crate::discover::L2_MEMBRANE,
+        }
+    }
+
     fn send(&mut self, frame: &[u8]) -> Result<(), String> {
         match self {
             PacketIo::Pcap(link) => link.send(frame).map_err(|e| e.to_string()),
             #[cfg(windows)]
             PacketIo::Ndis(link) => link.send(frame).map_err(|e| e.to_string()),
         }
-    }
-
-    fn recv(&mut self) -> Result<Option<Vec<u8>>, String> {
-        self.recv_batch(1)
-            .map(|mut batch| batch.pop())
     }
 
     fn recv_batch(&mut self, max: usize) -> Result<Vec<Vec<u8>>, String> {
@@ -335,4 +359,3 @@ fn open_packet_io(nic: Option<&str>, ethertype: u16) -> Result<PacketIo, Endpoin
     let link = pcap_link::open(nic, ethertype).map_err(|e| EndpointError::Other(e.to_string()))?;
     Ok(PacketIo::Pcap(link))
 }
-

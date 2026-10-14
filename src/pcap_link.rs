@@ -3,6 +3,8 @@
 //! EtherType defaults to `0x88B6` so we do not collide with a live borderless
 //! daemon on `0x88B5`.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use thiserror::Error;
 
 use crate::Mac;
@@ -28,6 +30,112 @@ pub type Result<T> = std::result::Result<T, LinkError>;
 pub struct Nic {
     pub name: String,
     pub description: String,
+}
+
+/// Adapter chosen for an announcement: hardware MAC when sysfs has it, plus its addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceInfo {
+    pub name: String,
+    pub mac: Option<Mac>,
+    pub ipv4: Vec<Ipv4Addr>,
+    pub ipv6: Vec<Ipv6Addr>,
+}
+
+/// The named adapter, or the first real one that has a global IPv4 address.
+pub fn interface_info(want: Option<&str>) -> Result<InterfaceInfo> {
+    let devs = pcap::Device::list().map_err(map_pcap)?;
+    let dev = choose_device(devs, want)?;
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for address in &dev.addresses {
+        match address.addr {
+            IpAddr::V4(ip) if usable_v4(ip) => ipv4.push(ip),
+            IpAddr::V6(ip) if usable_v6(ip) => ipv6.push(ip),
+            _ => {}
+        }
+    }
+    ipv4.sort_by_key(|ip| u8::from(ip.is_link_local()));
+    ipv6.sort_by_key(|ip| u8::from(ip.is_unicast_link_local()));
+    ipv4.truncate(4);
+    ipv6.truncate(4);
+    Ok(InterfaceInfo {
+        mac: read_hw_mac(&dev.name),
+        name: dev.name,
+        ipv4,
+        ipv6,
+    })
+}
+
+fn choose_device(devs: Vec<pcap::Device>, want: Option<&str>) -> Result<pcap::Device> {
+    if let Some(want) = want {
+        return devs
+            .into_iter()
+            .find(|dev| {
+                dev.name == want
+                    || dev.name.contains(want)
+                    || dev.desc.as_deref().unwrap_or("").contains(want)
+            })
+            .ok_or_else(|| LinkError::NoDevice(want.into()));
+    }
+    let mut usable: Vec<_> = devs
+        .into_iter()
+        .filter(|dev| cable_nic(&dev.name))
+        .collect();
+    if usable.is_empty() {
+        return Err(LinkError::NoAdapter);
+    }
+    usable.sort_by_key(|dev| {
+        let global_v4 = dev.addresses.iter().any(|address| {
+            matches!(address.addr, IpAddr::V4(ip) if usable_v4(ip) && !ip.is_link_local())
+        });
+        u8::from(!global_v4)
+    });
+    usable.into_iter().next().ok_or(LinkError::NoAdapter)
+}
+
+fn cable_nic(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const SKIP: &[&str] = &[
+        "any",
+        "lo",
+        "nflog",
+        "nfqueue",
+        "dbus",
+        "bluetooth",
+        "docker",
+        "veth",
+        "virbr",
+        "tun",
+        "tap",
+        "tailscale",
+        "nordlynx",
+        "br-",
+        "wg",
+    ];
+    !SKIP
+        .iter()
+        .any(|skip| lower == *skip || lower.contains(skip))
+}
+
+fn usable_v4(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast()
+}
+
+fn usable_v6(ip: Ipv6Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+}
+
+fn read_hw_mac(name: &str) -> Option<Mac> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let text = std::fs::read_to_string(format!("/sys/class/net/{name}/address")).ok()?;
+        parse_mac(text.trim())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 pub fn list_nics() -> Result<Vec<Nic>> {
@@ -67,13 +175,19 @@ pub struct Link {
 
 impl Link {
     pub fn send(&mut self, frame: &[u8]) -> Result<()> {
-        self.cap.sendpacket(frame).map_err(map_pcap)
+        self.cap.sendpacket(frame).map_err(map_pcap)?;
+        crate::capture::note_ether(crate::capture::DIR_SEND, frame);
+        Ok(())
     }
 
     /// Next matching frame, or `Ok(None)` on timeout.
     pub fn recv(&mut self) -> Result<Option<Vec<u8>>> {
         match self.cap.next_packet() {
-            Ok(pkt) => Ok(Some(pkt.data.to_vec())),
+            Ok(pkt) => {
+                let data = pkt.data.to_vec();
+                crate::capture::note_ether(crate::capture::DIR_RECV, &data);
+                Ok(Some(data))
+            }
             Err(pcap::Error::TimeoutExpired) => Ok(None),
             Err(e) => Err(map_pcap(e)),
         }

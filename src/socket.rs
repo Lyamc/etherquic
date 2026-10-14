@@ -183,12 +183,13 @@ impl UdpSender for EtherSender {
 
 impl EtherSender {
     fn try_send_inner(&self, transmit: &Transmit<'_>) -> io::Result<()> {
-        let (dst_mac, dst_service) = socket_addr_to_peer(transmit.destination).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "destination is not an etherquic peer address",
-            )
-        })?;
+        let (dst_mac, dst_service) =
+            socket_addr_to_peer(transmit.destination).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination is not an etherquic peer address",
+                )
+            })?;
 
         // GSO is unsupported; reject multi-segment transmits.
         if let Some(seg) = transmit.segment_size {

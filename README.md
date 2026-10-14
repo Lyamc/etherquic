@@ -1,116 +1,88 @@
 # etherquic
 
-Experimental **QUIC over Ethernet**, with Quinn kept unaware of L2.
+QUIC over Ethernet. Quinn sees datagrams, an opaque peer, and a max payload. It does not see MAC addresses.
 
 ## Stack
 
-| Piece | Source |
-|-------|--------|
-| QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule (`rustls-pure`) |
-| TLS crypto | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule (same provider as Lyamc/moq-rs) |
-| L2 I/O, primary | Rust NDIS filter `membrane_ndis` on Windows (`src/ndis_link.rs`, device `\\.\MembraneNdis`). [Install](docs/windows-membrane-ndis.md) |
-| L2 I/O, backup | **libpcap / Npcap** (`src/pcap_link.rs`) when that device is not open |
-| In-memory fabric | `Fabric` for same-process tests |
+| Piece | Where |
+| --- | --- |
+| QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule, `rustls-pure`, pin `a201190` |
+| TLS | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule, pin `9cba6e9` (AES-128-GCM for QUIC) |
+| L2, first choice | NDIS filter `membrane_ndis`, device `\\.\MembraneNdis`. [Install](docs/windows-membrane-ndis.md) |
+| L2, fallback | libpcap / Npcap (`src/pcap_link.rs`) when that device is not open |
+| Tests | in-memory `Fabric` |
 
-EtherType **`0x88B6`** (borderless/membrane stay on `0x88B5` / `0x8888`). Frames carry
-`dst_service`, `src_service`, and **`payload_len`** so Ethernet minimum-size padding
-does not corrupt short QUIC ACKs.
+EtherType `0x88B6`. A frame carries destination service, source service, and payload length, so Ethernet padding does not swallow a short QUIC ACK. Rust 1.85. The crypto path has no `ring`, `aws-lc`, or `cc`. This crate is `#![forbid(unsafe_code)]`.
 
-Datagram bodies are copied with `copy_from_slice` / `to_vec`. The crate builds on
-stable Rust (`rust-version` 1.85). No `ring`, no `aws-lc`, and no `cc` on the crypto
-path. This crate itself is `#![forbid(unsafe_code)]`.
+## Clone
 
-## Get the source
-
-Quinn and the TLS provider are submodules. A clone without them does not build.
+The QUIC and TLS trees are submodules. Relative URLs (`../quinn.git`, `../rustls-rustcrypto.git`) follow the clone's protocol. Initialize them before `nix-build`.
 
 ```bash
 git clone --recurse-submodules git@github.com:Lyamc/etherquic.git
-```
-
-If the repo is already cloned:
-
-```bash
 git submodule update --init
 ```
 
-The URLs are relative to this repo (`../quinn.git`, `../rustls-rustcrypto.git`), so an HTTPS clone of etherquic fetches the submodules over HTTPS too. `vendor/quinn` is pinned to `a201190` (Lyamc/quinn, `rustls-pure`). `vendor/rustls-rustcrypto` is pinned to `9cba6e9`, which is RustCrypto `v0.0.2-alpha` plus QUIC AES-128-GCM packet protection. Nix builds copy this checkout, so initialize the submodules before `nix-build`.
-
-## Video over L2
+## Send a file
 
 ```bash
-# Linux (needs CAP_NET_RAW): setcap then send
 cargo build --release --manifest-path video/Cargo.toml
 sudo setcap cap_net_raw,cap_net_admin=ep ./video/target/release/etherquic-video-send
 ./video/target/release/etherquic-video-send \
-  --nic enp4s0 --local-mac d8:5e:d3:88:5e:0e \
-  --peer-mac a8:a1:59:e3:e2:69 --file video.mp4
-
-# Windows: receive. NDIS (\.\MembraneNdis) is tried first; Npcap is the fallback.
-etherquic-video-recv --local-mac a8:a1:59:e3:e2:69 --out received.mp4
-mpv received.mp4
+  --nic IFACE --local-mac SENDER_MAC --peer-mac PEER_MAC --file video.mp4
 ```
 
-Install the Windows filter with [`docs/windows-membrane-ndis.md`](docs/windows-membrane-ndis.md). The signed package is [`windows/membrane_ndis.sys`](windows/membrane_ndis.sys), [`windows/membrane_ndis.cat`](windows/membrane_ndis.cat), and [`windows/MembraneTest.cer`](windows/MembraneTest.cer). The one-shot script is [`windows/install-membrane-ndis.ps1`](windows/install-membrane-ndis.ps1). It does not need the WDK.
+On Windows the receiver tries NDIS, then Npcap:
 
-## NDIS vs Npcap
+```text
+etherquic-video-recv --local-mac PEER_MAC --out received.mp4
+```
 
-Same transfer, Linux sender on `enp4s0`, HYTE receiver. NDIS is `membrane_ndis`.
-Npcap is the fallback after that driver is stopped, on the Killer adapter.
-Ping between the hosts was 5–16 ms and this machine's Ethernet link was 1 Gbps,
-so the frames crossed the mesh between the Ethernet ports rather than a direct
-2.5-gigabit switch.
+Linux send needs `CAP_NET_RAW` and `CAP_NET_ADMIN`. On Windows, point `RUSTFLAGS` at the Npcap import library:
+
+```powershell
+$env:RUSTFLAGS = '-L native=PATH\TO\npcap\lib'
+```
+
+## NDIS and Npcap
+
+Same copy, 1 Gbps link, 5–16 ms ping. NDIS is `membrane_ndis`. Npcap is what runs after that driver is stopped.
 
 | Workload | NDIS | Npcap |
 | --- | ---: | ---: |
-| 115-byte note, median of 5, after the QUIC connection was up | 0.05 s | 0.09 s |
-| 2 MB file, median of 3 | 0.42 s (4.8 MiB/s) | 21.6 s (0.09 MiB/s) |
-| 18 MB video | 2.46 s (7.0 MiB/s) | still running at the 180 s limit |
+| 115-byte note, median of 5, after connect | 0.05 s | 0.09 s |
+| 2 MB, median of 3 | 0.42 s (4.8 MiB/s) | 21.6 s (0.09 MiB/s) |
+| 18 MB video | 2.46 s (7.0 MiB/s) | still running at 180 s |
 
-The Windows receiver used about 0.016 s of CPU and 11–12 MB for the 2 MB file on
-NDIS, versus about 0.36 s of CPU and 13 MB on Npcap. Shortening the I/O thread's
-idle wait from 5 ms to 1 ms later raised the NDIS rates to 6.3–7.7 MiB/s (2 MB)
-and 9.2 MiB/s (video). The byte copy is not what separates the two backends. One
-system call per frame still dominates, and the mesh RTT caps how full the QUIC
-window can get.
+For the 2 MB file the receiver used about 0.016 s of CPU on NDIS and about 0.36 s on Npcap. A 1 ms idle wait later moved NDIS to 6.3–7.7 MiB/s (2 MB) and 9.2 MiB/s (video). One system call per frame is the gap. Round-trip time caps how full the QUIC window gets.
 
-## Quick start
+## Commands
 
 ```bash
 cargo test
 cargo run --bin etherquic-demo
-cargo run --manifest-path video/Cargo.toml --bin etherquic-video-send -- --file video.mp4 ...
-cargo run --manifest-path video/Cargo.toml --bin etherquic-video-recv -- --out received.mp4
-cargo run --manifest-path audio/Cargo.toml --bin etherquic-audio-send -- --file clip.opus ...
-cargo run --manifest-path audio/Cargo.toml --bin etherquic-audio-recv -- --out received.opus
-cargo run --manifest-path input/Cargo.toml --bin etherquic-input-send -- --file events.txt ...
-cargo run --manifest-path input/Cargo.toml --bin etherquic-input-recv -- --out received.eqin
-cargo run --manifest-path ui/Cargo.toml --bin etherquic-ui
+cargo run --manifest-path ui/Cargo.toml --bin etherquic
+cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- host --nic IFACE
+cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- connect --nic IFACE --peer-mac 02:00:00:00:00:01
 ```
 
-`etherquic-ui` is the host / player console. Linking any L2 binary needs Npcap on the library path (`$env:RUSTFLAGS = '-L native=C:\Build\networking\borderless\third_party\npcap\lib'`). See [`ui/README.md`](ui/README.md).
+`etherquic` is the window: `host` and `connect`. The `ui` feature is the GPUI front end. Host and Connect run the live desktop from `etherquic-play`: the picture, the audio, and keyboard, mouse, and gamepad.
 
-## Media
+## Capture
 
-- [`ui`](ui/README.md) — host / player console (`etherquic-ui`). The taskbar icon is present only while this PC is hosting.
-- [`input`](input/README.md) — keyboard, mouse, and gamepad events (`etherquic-input-send` / `etherquic-input-recv`)
-- [`container`](container/README.md) — LOC objects ([draft-ietf-moq-loc](https://github.com/moq-wg/loc))
-- [`audio`](audio/README.md) — Opus packets wrapped in those objects (`etherquic-audio-send` / `etherquic-audio-recv`)
-- [`video`](video/README.md) — a file copied on one QUIC stream (`etherquic-video-send` / `etherquic-video-recv`)
+Preferences has Capture. It writes `ether.pcap` and `app.pcap` under `$XDG_STATE_HOME/etherquic/capture/`, or `%LOCALAPPDATA%\etherquic\capture\` on Windows. `ETHERQUIC_CAPTURE=DIR` starts that for the window and for `etherquic-play`. Decode both with `wireshark/etherquic.lua`. Capture is off until it is turned on, and the switch is not saved.
 
-On a shared connection Quinn sends a higher stream priority first: input (20), then audio (10), then video (0).
+## Crates
 
-## Layout
+| Crate | What it does |
+| --- | --- |
+| [`ui`](ui/README.md) | Window. Taskbar button only while hosting. |
+| [`play`](play/README.md) | Desktop, audio, and input on one connection. |
+| [`input`](input/README.md) | Keyboard, mouse, gamepad. Service 4435, priority 20. |
+| [`audio`](audio/README.md) | Opus as LOC objects. Service 4434, priority 10. |
+| [`video`](video/README.md) | One file, one stream. Service 4433, priority 0. |
+| [`container`](container/README.md) | LOC objects. |
 
-- `src/frame.rs` — EtherType + dst/src service ids + opaque QUIC payload
-- `src/fabric.rs` — in-memory L2 segment
-- `src/socket.rs` — Quinn `AsyncUdpSocket` / `UdpSender`
-- `src/addr.rs` — MAC ↔ IPv6 link-local `SocketAddr`
-- `src/tls.rs` / `src/endpoint.rs` — pure TLS + endpoint helpers
-- `certs/` — demo server certificate (skip-verify on the client)
-- `vendor/quinn` — submodule, [Lyamc/quinn](https://github.com/Lyamc/quinn) with `rustls-pure`
-- `vendor/rustls-rustcrypto` — submodule, [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) (pure CryptoProvider, QUIC AES-128-GCM)
+On one connection the higher priority is sent first: input, then audio, then video.
 
-## Will it work if QUIC is unaware it sits on Ethernet?
-
-Yes: Quinn only sees datagrams, opaque peers, and a clamped max payload. See `plan.md`.
+Why Quinn can stay unaware of Ethernet: [plan.md](plan.md).

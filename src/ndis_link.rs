@@ -9,7 +9,9 @@
 
 use std::io;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -37,8 +39,14 @@ const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> 
     (device_type << 16) | (access << 14) | (function << 2) | method
 }
 
-const IOCTL_L2_READ_PACKETS: u32 = ctl_code(FILE_DEVICE_L2_CAP, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS);
-const IOCTL_L2_WRITE_PACKET: u32 = ctl_code(FILE_DEVICE_L2_CAP, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+const IOCTL_L2_READ_PACKETS: u32 =
+    ctl_code(FILE_DEVICE_L2_CAP, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS);
+const IOCTL_L2_WRITE_PACKET: u32 = ctl_code(
+    FILE_DEVICE_L2_CAP,
+    0x805,
+    METHOD_BUFFERED,
+    FILE_WRITE_ACCESS,
+);
 
 pub struct NdisLink {
     handle: HANDLE,
@@ -91,6 +99,7 @@ impl NdisLink {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        crate::capture::note_ether(crate::capture::DIR_SEND, frame);
         Ok(())
     }
 
@@ -119,7 +128,10 @@ impl NdisLink {
         if returned == 0 {
             Ok(None)
         } else {
-            Ok(Some(returned as usize))
+            let n = returned as usize;
+            let noted = n.min(buf.len());
+            crate::capture::note_ether(crate::capture::DIR_RECV, &buf[..noted]);
+            Ok(Some(n))
         }
     }
 }

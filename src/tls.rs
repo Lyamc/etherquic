@@ -18,10 +18,9 @@ pub fn install_pure_crypto() {
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    install_pure_crypto();
-    rustls::crypto::CryptoProvider::get_default()
-        .expect("pure crypto provider installed")
-        .clone()
+    // The window installs Graviola as the process default. QUIC needs the
+    // rustls-rustcrypto provider, which is the one with the QUIC cipher suites.
+    Arc::new(rustls_rustcrypto::provider())
 }
 
 /// ALPN identifier for this experimental transport.
