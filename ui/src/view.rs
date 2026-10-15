@@ -287,6 +287,7 @@ struct Desk {
     local_outputs: Vec<String>,
     local_inputs: Vec<String>,
     local_pads: Vec<String>,
+    devices_loading: bool,
     /// Window y of the Settings heading from the last frame.
     settings_y: Rc<Cell<f32>>,
     /// Frames left before scrolling to Settings.
@@ -365,10 +366,11 @@ impl Desk {
             local_outputs: Vec::new(),
             local_inputs: Vec::new(),
             local_pads: Vec::new(),
+            devices_loading: false,
             settings_y: Rc::new(Cell::new(0.)),
             scroll_to_settings: 0,
         };
-        desk.refresh_devices();
+        desk.refresh_devices(cx);
         desk.apply_settings(false);
         desk.refresh_share();
         if !desk.book.saved.is_empty() {
@@ -2309,11 +2311,29 @@ impl Desk {
     }
 
     /// Re-read this computer's sound devices and controllers.
-    fn refresh_devices(&mut self) {
-        let (outputs, inputs) = etherquic_play::audio_devices();
-        self.local_outputs = outputs;
-        self.local_inputs = inputs;
-        self.local_pads = etherquic_play::hostinfo::local_pads();
+    /// List sound devices and controllers off the UI thread. On macOS the
+    /// first CoreAudio probe can wait on the microphone permission prompt, and
+    /// the window must not wait with it.
+    fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+        if self.devices_loading {
+            return;
+        }
+        self.devices_loading = true;
+        let task = cx.background_executor().spawn(async move {
+            let (outputs, inputs) = etherquic_play::audio_devices();
+            (outputs, inputs, etherquic_play::hostinfo::local_pads())
+        });
+        cx.spawn(async move |this, cx| {
+            let (outputs, inputs, pads) = task.await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.local_outputs = outputs;
+                desk.local_inputs = inputs;
+                desk.local_pads = pads;
+                desk.devices_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Push Settings to whatever reads them now: the open view, the next shared
@@ -3149,9 +3169,9 @@ impl Desk {
                         "sound-refresh",
                         "Refresh devices",
                         None,
-                        true,
+                        !self.devices_loading,
                         cx.listener(|desk, _, _, cx| {
-                            desk.refresh_devices();
+                            desk.refresh_devices(cx);
                             cx.notify();
                         }),
                     ))

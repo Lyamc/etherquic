@@ -27,6 +27,11 @@ gpui = { path = "../../../interfaces/gpui", default-features = false, optional =
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true, features = ["wayland"] }
 
+# macOS draws text through font-kit; without it GPUI uses a text system that
+# draws nothing. Runtime shaders build without Xcode's separate Metal Toolchain.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true, features = ["font-kit", "runtime_shaders"] }
+
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = [
