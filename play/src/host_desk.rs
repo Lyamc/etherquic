@@ -186,6 +186,18 @@ async fn listen(
 
     let inject_screen = screen.clone();
     let (ack_tx, ack_rx) = mpsc::channel(64);
+    // macOS input injection holds a CGEventSource, which is not Send, so it
+    // gets a blocking thread there; elsewhere it stays an async task.
+    #[cfg(target_os = "macos")]
+    let inject = tokio::task::spawn_blocking(move || {
+        let mut hands = Hands::open();
+        while let Some(events) = input_rx.blocking_recv() {
+            let width = inject_screen.width.load(Ordering::Relaxed).max(1);
+            let height = inject_screen.height.load(Ordering::Relaxed).max(1);
+            hands.apply(&events, width, height, &ack_tx);
+        }
+    });
+    #[cfg(not(target_os = "macos"))]
     let inject = tokio::spawn(async move {
         let mut hands = Hands::open();
         while let Some(events) = input_rx.recv().await {
