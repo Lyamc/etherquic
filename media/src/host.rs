@@ -284,7 +284,9 @@ fn video_pump(
         let (max_w, max_h) = offer.as_ref().map(|o| (o.max.width, o.max.height)).unwrap_or((0, 0));
         let frame = yuv::fit(&frame, max_w, max_h);
         if active.as_ref().map(|a| a.size != (frame.width, frame.height)).unwrap_or(true) {
-            active = None;
+            // The old encoder (and an ffmpeg reader thread) ends before the
+            // next config record, so no stale bytes follow it.
+            drop(active.take());
             loop {
                 let (video, encoder_name) = match &offer {
                     None => (Video::Mjpeg, "jpeg".to_string()),

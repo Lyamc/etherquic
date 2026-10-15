@@ -12,6 +12,7 @@ autobins = false
 etherquic = { path = ".." }
 etherquic-container = { path = "../container" }
 etherquic-input = { path = "../input" }
+etherquic-media = { path = "../media" }
 jpeg-encoder = "0.6"
 quinn = { path = "../vendor/quinn/quinn", default-features = false, features = [
     "runtime-tokio",

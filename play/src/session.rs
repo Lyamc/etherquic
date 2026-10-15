@@ -1,6 +1,6 @@
 //! Host and player roles on one Quinn connection.
 
-use etherquic::{PRIORITY_AUDIO, PRIORITY_INPUT, PRIORITY_TRACE, PRIORITY_VIDEO};
+use etherquic::{PRIORITY_INPUT, PRIORITY_TRACE};
 use etherquic_input::{decode, encode, Event};
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -102,59 +102,62 @@ pub fn resample(chunk: &AudioChunk, out_channels: u16, out_rate: u32) -> Result<
     Ok(out)
 }
 
+/// Media for a host session: the newest captured frame and audio chunks.
+pub struct HostMedia {
+    pub frames: etherquic_media::host::FrameSlot,
+    pub audio: mpsc::Receiver<AudioChunk>,
+    pub fps: u32,
+    pub log: etherquic_media::Log,
+}
+
 /// Send desktop and audio. Read player input until the player closes it.
 ///
-/// `video` payloads are JPEG bytes. Closing either sender finishes that
-/// stream. This returns after both streams are finished and the input
-/// stream has ended.
+/// A player that agreed on `etherquic/2` sends an offer first, and gets the
+/// codecs both ends support; any other player gets MJPEG and PCM on the
+/// original streams. This returns after media ends and the input stream has
+/// ended.
 pub async fn serve(
     conn: Connection,
-    mut video: mpsc::Receiver<Vec<u8>>,
-    mut audio: mpsc::Receiver<AudioChunk>,
+    media: HostMedia,
     input: mpsc::Sender<Vec<Event>>,
     acks: Option<mpsc::Receiver<InputAck>>,
 ) -> Result<(), Error> {
+    use etherquic_media::host;
+    let wire_err = |error: String| Error::Wire(error);
+    let (negotiated, stray) = host::accept_offer(&conn).await.map_err(wire_err)?;
+    if let Some((_, magic)) = &stray {
+        return Err(Error::Wire(format!("expected an offer, got {}", magic_name(magic))));
+    }
     // Open picture and audio before reading input. A confirmation opened
     // earlier could be accepted in place of those two streams.
-    let mut video_send = open_uni(&conn, PRIORITY_VIDEO, VIDEO_MAGIC).await?;
-    let mut audio_send = open_uni(&conn, PRIORITY_AUDIO, AUDIO_MAGIC).await?;
+    let streams = host::open_streams(&conn, negotiated.is_v2()).await.map_err(wire_err)?;
     let input_conn = conn.clone();
     let input_task = tokio::spawn(async move { read_input(input_conn, input).await });
     let ack_task = acks.map(|acks| {
         let ack_conn = conn.clone();
         tokio::spawn(async move { write_acks(ack_conn, acks).await })
     });
-    let mut video_open = true;
-    let mut audio_open = true;
-    while video_open || audio_open {
-        tokio::select! {
-            biased;
-            msg = video.recv(), if video_open => {
-                match msg {
-                    Some(jpeg) => wire::write_record(&mut video_send, VIDEO_MAGIC, &jpeg).await?,
-                    None => {
-                        finish(&mut video_send).await?;
-                        video_open = false;
-                    }
-                }
-            }
-            msg = audio.recv(), if audio_open => {
-                match msg {
-                    Some(chunk) => {
-                        let payload = chunk.encode()?;
-                        wire::write_record(&mut audio_send, AUDIO_MAGIC, &payload).await?;
-                    }
-                    None => {
-                        finish(&mut audio_send).await?;
-                        audio_open = false;
-                    }
-                }
+    let (pcm_tx, pcm_rx) = mpsc::channel(8);
+    let mut audio = media.audio;
+    let forward = tokio::spawn(async move {
+        while let Some(chunk) = audio.recv().await {
+            let pcm = etherquic_media::Pcm { sample_rate: chunk.sample_rate, channels: chunk.channels, samples: chunk.pcm };
+            if pcm_tx.send(pcm).await.is_err() {
+                break;
             }
         }
-    }
+    });
+    let options = host::HostOptions {
+        fps: media.fps.max(1),
+        caps: etherquic_media::caps::host_caps(),
+        log: media.log,
+    };
+    let result = host::run(streams, negotiated, media.frames, pcm_rx, options).await;
+    forward.abort();
     if let Some(task) = ack_task {
         task.abort();
     }
+    result.map_err(wire_err)?;
     match input_task.await {
         Ok(result) => result,
         Err(error) => Err(Error::Wire(error.to_string())),
@@ -179,6 +182,14 @@ async fn write_acks(conn: Connection, mut acks: mpsc::Receiver<InputAck>) -> Res
     Ok(())
 }
 
+/// What the player asks for, and where session events go.
+pub struct PlayerMedia {
+    /// Sent when the host agreed on `etherquic/2`.
+    pub offer: etherquic_media::negotiate::Offer,
+    pub frames: etherquic_media::Sink<etherquic_media::Frame>,
+    pub events: mpsc::UnboundedSender<etherquic_media::player::PlayerEvent>,
+}
+
 /// Receive desktop and audio. Forward player events until `input` closes
 /// or both media streams end.
 ///
@@ -186,15 +197,34 @@ async fn write_acks(conn: Connection, mut acks: mpsc::Receiver<InputAck>) -> Res
 /// before accepting the other fills the unread stream and stalls the host.
 pub async fn play(
     conn: Connection,
-    video: mpsc::Sender<Vec<u8>>,
+    media: PlayerMedia,
     audio: mpsc::Sender<AudioChunk>,
     input: mpsc::Receiver<Vec<Event>>,
     acks: Option<mpsc::Sender<InputAck>>,
 ) -> Result<(), Error> {
+    use etherquic_media::negotiate::{AUDIO2_MAGIC, VIDEO2_MAGIC};
+    use etherquic_media::player::{self, PlayerEvent};
+    let PlayerMedia { mut offer, frames, events } = media;
+    let negotiates = etherquic::negotiates(&conn);
+    let mut offer_send = if negotiates {
+        Some(player::send_offer(&conn, &offer).await.map_err(Error::Wire)?)
+    } else {
+        None
+    };
+    let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<PlayerEvent>();
     let (done_tx, mut done_rx) = mpsc::channel(2);
     let mut got_video = false;
     let mut got_audio = false;
     let mut early_ack = None;
+    let (pcm_tx, mut pcm_rx) = mpsc::channel::<etherquic_media::Pcm>(8);
+    tokio::spawn(async move {
+        while let Some(pcm) = pcm_rx.recv().await {
+            let chunk = AudioChunk { sample_rate: pcm.sample_rate, channels: pcm.channels, pcm: pcm.samples };
+            if audio.send(chunk).await.is_err() {
+                break;
+            }
+        }
+    });
     while !got_video || !got_audio {
         let mut recv = conn
             .accept_uni()
@@ -202,18 +232,24 @@ pub async fn play(
             .map_err(|error| Error::Wire(error.to_string()))?;
         let magic = wire::read_magic(&mut recv).await?;
         let done = done_tx.clone();
-        if &magic == VIDEO_MAGIC && !got_video {
+        let is_video = &magic == VIDEO_MAGIC || &magic == VIDEO2_MAGIC;
+        let is_audio = &magic == AUDIO_MAGIC || &magic == AUDIO2_MAGIC;
+        if is_video && !got_video {
             got_video = true;
-            let video = video.clone();
+            let v2 = &magic == VIDEO2_MAGIC;
+            let frames = frames.clone();
+            let events = inner_tx.clone();
             tokio::spawn(async move {
-                let result = read_video(recv, video).await;
+                let result = player::read_video(recv, v2, frames, events).await.map_err(Error::Wire);
                 let _ = done.send(result).await;
             });
-        } else if &magic == AUDIO_MAGIC && !got_audio {
+        } else if is_audio && !got_audio {
             got_audio = true;
-            let audio = audio.clone();
+            let v2 = &magic == AUDIO2_MAGIC;
+            let pcm = pcm_tx.clone();
+            let events = inner_tx.clone();
             tokio::spawn(async move {
-                let result = read_audio(recv, audio).await;
+                let result = player::read_audio(recv, v2, pcm, events).await.map_err(Error::Wire);
                 let _ = done.send(result).await;
             });
         } else if &magic == ACK_MAGIC && early_ack.is_none() {
@@ -225,6 +261,35 @@ pub async fn play(
             )));
         }
     }
+    drop(pcm_tx);
+    drop(inner_tx);
+    // A decoder that breaks sends a new offer without that codec. The host
+    // answers with a config record for the next codec on the same stream.
+    tokio::spawn(async move {
+        while let Some(event) = inner_rx.recv().await {
+            if let PlayerEvent::VideoFailed { video, reason } = &event {
+                eprintln!("etherquic-play: {} decoder failed: {reason}", video.name());
+                if !offer.failed.contains(video) {
+                    offer.failed.push(*video);
+                }
+                if let Some(send) = offer_send.as_mut() {
+                    if let Err(error) = player::resend_offer(send, &offer).await {
+                        eprintln!("etherquic-play: renegotiate: {error}");
+                    }
+                }
+            }
+            if let PlayerEvent::AudioFailed { audio, reason } = &event {
+                eprintln!("etherquic-play: {} audio decoder failed: {reason}", audio.name());
+                offer.audio.retain(|row| row != audio);
+                if let Some(send) = offer_send.as_mut() {
+                    let _ = player::resend_offer(send, &offer).await;
+                }
+            }
+            if events.send(event).is_err() && offer_send.is_none() {
+                break;
+            }
+        }
+    });
     if let Some(acks) = acks {
         let ack_conn = conn.clone();
         tokio::spawn(async move {
@@ -343,25 +408,6 @@ async fn write_input(
         }
     }
     finish(send).await
-}
-
-async fn read_video(mut recv: RecvStream, video: mpsc::Sender<Vec<u8>>) -> Result<(), Error> {
-    while let Some(jpeg) = wire::read_record(&mut recv, VIDEO_MAGIC).await? {
-        if video.send(jpeg).await.is_err() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn read_audio(mut recv: RecvStream, audio: mpsc::Sender<AudioChunk>) -> Result<(), Error> {
-    while let Some(payload) = wire::read_record(&mut recv, AUDIO_MAGIC).await? {
-        let chunk = AudioChunk::decode(&payload)?;
-        if audio.send(chunk).await.is_err() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 fn magic_name(magic: &[u8; 4]) -> String {

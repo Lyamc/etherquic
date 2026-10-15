@@ -13,6 +13,7 @@
 mod ack;
 mod capture;
 mod codec;
+pub mod negotiated;
 pub mod hostinfo;
 mod outbox;
 mod pad;
@@ -38,7 +39,9 @@ pub use picture::{
     PictureCodec,
 };
 pub use pointer::{ei_absolute, place_pointer, wayland_wheel, PointerPlace};
-pub use session::{play, resample, serve, AudioChunk};
+pub use session::{play, resample, serve, AudioChunk, HostMedia, PlayerMedia};
+pub use etherquic_media;
+pub use negotiated::{CodecChoice, SessionLine};
 pub use svc::{drop_jitter_enhancement, SvcLayer};
 pub use view_options::{
     live, place, slot_for, snapshot, to_remote, LiveView, PadSlot, Placement, ScaleMode, SizeMatch,

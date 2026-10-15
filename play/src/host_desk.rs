@@ -16,8 +16,8 @@ use xcap::Monitor;
 
 use crate::pad_inject::Pads;
 use crate::{
-    desktop_audio, encode_picture, fit_rgba, format_mac, pad_report, place_pointer, serve,
-    AudioChunk, DesktopAudio, PictureCodec, PointerPlace, Status,
+    desktop_audio, fit_rgba, format_mac, pad_report, place_pointer, serve,
+    AudioChunk, DesktopAudio, PointerPlace, Status,
 };
 
 /// Refresh rate of the monitor `host` captures, in whole frames per second.
@@ -79,10 +79,12 @@ async fn listen(
         width: AtomicU32::new(1),
         height: AtomicU32::new(1),
     });
-    let (video_tx, video_rx) = mpsc::channel(2);
+    let frames = etherquic_media::host::FrameSlot::new();
+    let video_tx = frames.clone();
     let (audio_tx, audio_rx) = mpsc::channel(8);
+    etherquic_media::caps::warm();
     let (input_tx, mut input_rx) = mpsc::channel::<Vec<Event>>(32);
-    let mut video_rx = Some(video_rx);
+    let mut video_rx = Some(frames);
     let mut audio_rx = Some(audio_rx);
 
     let capture_stop = Arc::clone(&stop);
@@ -207,10 +209,21 @@ async fn listen(
         }
     });
 
+    let codec_status = status.clone();
+    let log: etherquic_media::Log = Arc::new(move |line: &str| {
+        eprintln!("etherquic-play: {line}");
+        if line.starts_with("video ") || line.starts_with("audio ") {
+            codec_status(&format!("Sending {line}."));
+        }
+    });
     let session = serve(
         conn,
-        video_rx.take().expect("video receiver"),
-        audio_rx.take().expect("audio receiver"),
+        crate::HostMedia {
+            frames: video_rx.clone().expect("frame slot"),
+            audio: audio_rx.take().expect("audio receiver"),
+            fps,
+            log,
+        },
         input_tx,
         Some(ack_rx),
     );
@@ -256,13 +269,15 @@ fn release_host(
     stop: &AtomicBool,
     up: &AtomicBool,
     peers: &AtomicUsize,
-    video: &mut Option<mpsc::Receiver<Vec<u8>>>,
+    video: &mut Option<etherquic_media::host::FrameSlot>,
     audio_rx: &mut Option<mpsc::Receiver<AudioChunk>>,
     capture: &mut Option<JoinHandle<()>>,
     audio: &mut Option<JoinHandle<()>>,
 ) {
-    // Drop the receivers first. A full queue would otherwise block the join.
-    video.take();
+    // Close the slot and drop the receiver first. A full queue would otherwise block the join.
+    if let Some(slot) = video.take() {
+        slot.close();
+    }
     audio_rx.take();
     stop.store(true, Ordering::SeqCst);
     up.store(false, Ordering::SeqCst);
@@ -289,7 +304,7 @@ struct Screen {
 fn capture_loop(
     stop: Arc<AtomicBool>,
     screen: Arc<Screen>,
-    video: mpsc::Sender<Vec<u8>>,
+    video: etherquic_media::host::FrameSlot,
     max_width: u32,
     fps: u32,
 ) {
@@ -299,18 +314,19 @@ fn capture_loop(
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
         match one_frame(&screen, max_width) {
-            Ok(jpeg) => {
+            Ok(frame) => {
                 frames += 1;
-                if logged.elapsed() >= Duration::from_secs(2) {
+                if logged.elapsed() >= Duration::from_secs(10) {
                     eprintln!(
-                        "etherquic-play: {frames} frames, last jpeg {} bytes",
-                        jpeg.len()
+                        "etherquic-play: {frames} frames captured, last {}x{}",
+                        frame.width, frame.height
                     );
                     logged = Instant::now();
                 }
-                if video.blocking_send(jpeg).is_err() {
+                if video.is_closed() {
                     break;
                 }
+                video.put(frame);
             }
             Err(error) => {
                 eprintln!("etherquic-play: capture: {error}");
@@ -325,7 +341,7 @@ fn capture_loop(
     }
 }
 
-fn one_frame(screen: &Screen, max_width: u32) -> Result<Vec<u8>, String> {
+fn one_frame(screen: &Screen, max_width: u32) -> Result<etherquic_media::Frame, String> {
     let monitors = Monitor::all().map_err(|error| error.to_string())?;
     let index = monitors
         .iter()
@@ -339,7 +355,11 @@ fn one_frame(screen: &Screen, max_width: u32) -> Result<Vec<u8>, String> {
     let image = monitor.capture_image().map_err(|error| error.to_string())?;
     let picture = fit_rgba(image.as_raw(), image.width(), image.height(), max_width)
         .map_err(|error| error.to_string())?;
-    encode_picture(PictureCodec::Mjpeg, &picture, 40).map_err(|error| error.to_string())
+    Ok(etherquic_media::Frame {
+        width: picture.width,
+        height: picture.height,
+        rgb: picture.rgb,
+    })
 }
 
 fn capture_audio(

@@ -26,3 +26,7 @@ path = "src/bin/probe.rs"
 [[bin]]
 name = "eqmedia-latency"
 path = "src/bin/latency.rs"
+
+[[bin]]
+name = "eqmedia-client"
+path = "src/bin/client.rs"

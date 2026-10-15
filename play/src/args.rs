@@ -33,6 +33,8 @@ pub struct Connect {
     /// Stop when stdin closes. A parent process (the macOS app) uses this to end
     /// the session cleanly.
     pub parent_pipe: bool,
+    /// Codec order and pins for the offer.
+    pub codecs: etherquic_play::CodecChoice,
 }
 
 pub enum Command {
@@ -93,6 +95,7 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
     let mut trace_input = false;
     let mut view = ViewOptions::default();
     let mut parent_pipe = false;
+    let mut codecs = etherquic_play::CodecChoice::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -119,6 +122,18 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
             "--peer-mac" => peer_mac = Some(mac(need(args, &mut i, "--peer-mac")?)?),
             "--service-id" => service_id = number(need(args, &mut i, "--service-id")?)?,
             "--udp" => udp = Some(number(need(args, &mut i, "--udp")?)?),
+            "--video" => codecs.video = etherquic_play::CodecChoice::parse_video(&need(args, &mut i, "--video")?),
+            "--audio" => codecs.audio = etherquic_play::CodecChoice::parse_audio(&need(args, &mut i, "--audio")?),
+            "--video-pin" => {
+                let token = need(args, &mut i, "--video-pin")?;
+                codecs.video_pin = Some(etherquic_play::PicturePref::from_token(&token).ok_or_else(|| format!("bad --video-pin {token}"))?);
+            }
+            "--audio-pin" => {
+                let token = need(args, &mut i, "--audio-pin")?;
+                codecs.audio_pin = Some(etherquic_play::AudioId::from_token(&token).ok_or_else(|| format!("bad --audio-pin {token}"))?);
+            }
+            "--max-width" => codecs.max_width = number(need(args, &mut i, "--max-width")?)?,
+            "--bitrate" => codecs.bitrate_kbps = number(need(args, &mut i, "--bitrate")?)?,
             other => return Err(format!("unknown arg {other}\n{}", usage())),
         }
     }
@@ -136,6 +151,7 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
         trace_input,
         view,
         parent_pipe,
+        codecs,
     }))
 }
 
@@ -202,6 +218,8 @@ etherquic-play connect --udp IP:PORT
   connect also takes: [--trace-input] [--scale fit|fill|stretch|native]
     [--size-match independent|window-to-host] [--no-keyboard] [--no-mouse] [--no-pads]
     [--output-device NAME] [--pad SLOT=NAME]... [--parent-pipe]
+    [--video av1-hw,h265-hw,h264-hw,pyrowave,mjpeg,h264-sw] [--audio opus,pcm]
+    [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--bitrate KBPS]
 
 host shares this desktop, its audio, and takes keyboard, mouse, and gamepad from one player.
 connect opens the view. The player window has to be focused to send the keyboard and the mouse. Gamepads send while that view is open.
@@ -212,6 +230,19 @@ connect opens the view. The player window has to be focused to send the keyboard
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_flags_reach_the_offer_choice() {
+        let args = ["connect", "--udp", "1.2.3.4:5", "--video", "pyrowave,mjpeg,nope", "--audio", "opus,pcm", "--video-pin", "h264-sw", "--bitrate", "9000"];
+        let Ok(Command::Connect(c)) = parse(args.iter().map(|s| s.to_string())) else { panic!() };
+        assert_eq!(c.codecs.video, vec![etherquic_play::PicturePref::Pyrowave, etherquic_play::PicturePref::Mjpeg]);
+        assert_eq!(c.codecs.audio, vec![etherquic_play::AudioId::Opus, etherquic_play::AudioId::Pcm]);
+        assert_eq!(c.codecs.video_pin, Some(etherquic_play::PicturePref::H264Sw));
+        assert_eq!(c.codecs.bitrate_kbps, 9000);
+        let back = c.codecs.args();
+        assert!(back.windows(2).any(|w| w[0] == "--video" && w[1] == "pyrowave,mjpeg"));
+        assert!(back.windows(2).any(|w| w[0] == "--video-pin" && w[1] == "h264-sw"));
+    }
 
     fn connect(args: &[&str]) -> Connect {
         match parse(args.iter().map(|s| s.to_string())) {

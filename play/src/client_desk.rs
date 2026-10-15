@@ -29,7 +29,7 @@ use winit::window::{Window, WindowId};
 use crate::ack::TraceClock;
 use crate::outbox::Gate;
 use crate::{
-    blit_rgb, decode_picture, format_mac, play, resample, session_end_status, AudioChunk, Picture,
+    blit_rgb, format_mac, play, resample, session_end_status, AudioChunk, Picture,
     Status,
 };
 
@@ -44,6 +44,8 @@ pub struct ConnectSession {
     pub udp: Option<SocketAddr>,
     /// Scale, what to send, pad slots, and the speaker. Read while the view runs.
     pub view: crate::LiveView,
+    /// Codec order, pins and limits for the offer.
+    pub codecs: crate::CodecChoice,
 }
 
 /// Wayland only allows a winit loop on the main thread unless the builder opts in.
@@ -412,7 +414,6 @@ async fn connect_player(
     status(&format!(
         "Viewing {peer_text}. Focus the picture window to use the keyboard and the mouse. A gamepad sends while it is open.{tracing}"
     ));
-    let (video_tx, mut video_rx) = mpsc::channel(2);
     let (audio_tx, mut audio_rx) = mpsc::channel(8);
     let (ack_tx, mut ack_rx) = mpsc::channel::<crate::ack::InputAck>(32);
     let acks = if connect.trace_input {
@@ -446,28 +447,49 @@ async fn connect_player(
         }
     });
     let watch = conn.clone();
-    let mut session =
-        tokio::spawn(async move { play(conn, video_tx, audio_tx, input, acks).await });
+    let negotiates = etherquic::negotiates(&conn);
+    let offer = connect.codecs.offer();
+    if negotiates {
+        let video: Vec<&str> = offer.video.iter().map(|row| row.token()).collect();
+        let audio: Vec<&str> = offer.audio.iter().map(|row| row.token()).collect();
+        eprintln!("etherquic-play: offer video [{}] audio [{}]", video.join(" "), audio.join(" "));
+    } else {
+        eprintln!("etherquic-play: the host does not negotiate codecs; MJPEG and PCM");
+    }
     let shown = frames.clone();
+    let sink: etherquic_media::Sink<etherquic_media::Frame> = Arc::new(move |frame| {
+        if let Ok(mut slot) = shown.lock() {
+            *slot = Some(Picture {
+                width: frame.width,
+                height: frame.height,
+                rgb: frame.rgb,
+            });
+        }
+        true
+    });
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let media = crate::PlayerMedia {
+        offer,
+        frames: sink,
+        events: event_tx,
+    };
+    let mut session = tokio::spawn(async move { play(conn, media, audio_tx, input, acks).await });
+    let codec_status = Arc::clone(&status);
+    let codec_title = Arc::clone(&title);
+    let quiet_stats = connect.trace_input;
     let pictures = tokio::spawn(async move {
-        let mut logged = false;
-        while let Some(jpeg) = video_rx.recv().await {
-            match decode_picture(&jpeg) {
-                Ok(picture) => {
-                    if !logged && picture.width > 0 && picture.height > 0 && !jpeg.is_empty() {
-                        eprintln!(
-                            "etherquic-play: frame {}x{} jpeg {} bytes",
-                            picture.width,
-                            picture.height,
-                            jpeg.len()
-                        );
-                        logged = true;
-                    }
-                    if let Ok(mut slot) = shown.lock() {
-                        *slot = Some(picture);
-                    }
+        let mut line = crate::SessionLine::new(peer_text.clone(), negotiates);
+        while let Some(event) = event_rx.recv().await {
+            let show = line.apply(&event);
+            if let Some(log) = line.log_line(&event) {
+                eprintln!("etherquic-play: {log}");
+            }
+            if show && !(quiet_stats && matches!(event, etherquic_media::player::PlayerEvent::Stats(_))) {
+                let text = line.text();
+                codec_status(&text);
+                if let Ok(mut title) = codec_title.lock() {
+                    *title = line.short();
                 }
-                Err(error) => eprintln!("etherquic-play: picture: {error}"),
             }
         }
     });
