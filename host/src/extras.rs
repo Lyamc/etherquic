@@ -43,7 +43,9 @@ pub struct HostExtras {
 
 impl HostExtras {
     /// Start the refresher. It stops with `stop`.
-    pub fn start(picture: Picture, stop: Arc<AtomicBool>) -> Self {
+    /// `mac` is this host's L2 address. It names the host in every offer, so
+    /// a player merges the raw Ethernet and UDP answers into one row.
+    pub fn start(picture: Picture, mac: [u8; 6], stop: Arc<AtomicBool>) -> Self {
         let cache = Arc::new(Mutex::new(Cache {
             budgets: vec![SEED_BUDGET],
             ..Cache::default()
@@ -52,7 +54,7 @@ impl HostExtras {
         let cjxl = cjxl_path();
         let _ = thread::Builder::new()
             .name("etherquic-extras".into())
-            .spawn(move || refresh_loop(worker, picture, cjxl, stop));
+            .spawn(move || refresh_loop(worker, picture, cjxl, mac, stop));
         Self { cache }
     }
 }
@@ -88,6 +90,7 @@ fn refresh_loop(
     cache: Arc<Mutex<Cache>>,
     picture: Picture,
     cjxl: Option<PathBuf>,
+    mac: [u8; 6],
     stop: Arc<AtomicBool>,
 ) {
     let mut last: Option<Instant> = None;
@@ -108,7 +111,10 @@ fn refresh_loop(
                     lock(&cache).frame = Some((rgba, w, h));
                 }
                 let frame_size = lock(&cache).frame.as_ref().map(|(_, w, h)| (*w, *h));
-                lock(&cache).caps = Some(capabilities(frame_size));
+                let mut caps = capabilities(frame_size);
+                // Npcap and Membrane report no adapter MAC on Windows.
+                caps.nic_mac = Some(mac);
+                lock(&cache).caps = Some(caps);
                 last = Some(Instant::now());
             }
             let (frame, budgets) = {
@@ -226,9 +232,10 @@ mod tests {
     #[test]
     fn no_frame_yet_means_no_picture_but_caps_still_answer() {
         let stop = Arc::new(AtomicBool::new(false));
-        let extras = HostExtras::start(Arc::new(Mutex::new(None)), Arc::clone(&stop));
+        let extras = HostExtras::start(Arc::new(Mutex::new(None)), [2, 0, 0, 0, 0, 7], Arc::clone(&stop));
         thread::sleep(Duration::from_millis(400));
-        assert!(extras.capabilities().is_some());
+        let caps = extras.capabilities().expect("caps");
+        assert_eq!(caps.nic_mac, Some([2, 0, 0, 0, 0, 7]));
         assert!(extras.thumbnail(1000).is_none());
         stop.store(true, Ordering::SeqCst);
     }

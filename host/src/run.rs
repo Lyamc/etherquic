@@ -174,7 +174,7 @@ fn spawn_discovery(
         l2_backend,
     };
     let extras: Arc<crate::extras::HostExtras> =
-        Arc::new(crate::extras::HostExtras::start(picture, Arc::clone(&stop)));
+        Arc::new(crate::extras::HostExtras::start(picture, cfg.mac, Arc::clone(&stop)));
     let card = Arc::new(card);
     let mut handles = Vec::new();
     for udp in [false, true] {
