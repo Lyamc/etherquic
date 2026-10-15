@@ -105,7 +105,19 @@ fn native_opus_present() -> bool {
         }
         file_named_in(&["libopus.dll", "opus.dll"], &dirs)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        dirs.extend(macos_library_dirs());
+        file_named_in(
+            &[
+                "libpyrowave-shared.dylib",
+                "libpyrowave-shared.1.dylib",
+                "libpyrowave-shared.1.0.0.dylib",
+            ],
+            &dirs,
+        )
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
             dirs.extend(std::env::split_paths(&path));
@@ -268,7 +280,92 @@ pub fn nvidia_present() -> bool {
     }
 }
 
+/// Where a macOS build looks for a dylib: the app bundle's `Frameworks`,
+/// the dyld paths, then Homebrew and `/usr/local`.
+#[cfg(target_os = "macos")]
+fn macos_library_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(contents) = macos_bundle_contents() {
+        dirs.push(contents.join("Frameworks"));
+    }
+    for var in ["DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
+        if let Some(path) = std::env::var_os(var) {
+            dirs.extend(std::env::split_paths(&path));
+        }
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/lib"));
+    dirs.push(PathBuf::from("/usr/local/lib"));
+    dirs
+}
+
+/// `Foo.app/Contents` when this program runs from an app bundle.
+#[cfg(target_os = "macos")]
+fn macos_bundle_contents() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents")
+        .then(|| contents.to_path_buf())
+}
+
+/// Vulkan driver manifests a macOS build can use for PyroWave.
+///
+/// PyroWave's encoder needs a compute shader pinned to one subgroup size.
+/// MoltenVK reports subgroup sizes 4 to 32 and no stage that can require a
+/// size, so the encoder refuses it. Mesa's KosmicKrisp reports exactly 32,
+/// which PyroWave accepts. Only KosmicKrisp counts here.
+#[cfg(target_os = "macos")]
+pub fn macos_pyrowave_icds() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(contents) = macos_bundle_contents() {
+        dirs.push(contents.join("Resources/vulkan/icd.d"));
+    }
+    for dir in [
+        "/opt/homebrew/share/vulkan/icd.d",
+        "/opt/homebrew/etc/vulkan/icd.d",
+        "/usr/local/share/vulkan/icd.d",
+        "/usr/local/etc/vulkan/icd.d",
+    ] {
+        dirs.push(PathBuf::from(dir));
+    }
+    let mut found: Vec<PathBuf> = std::env::var_os("VK_DRIVER_FILES")
+        .or_else(|| std::env::var_os("VK_ICD_FILENAMES"))
+        .map(|files| std::env::split_paths(&files).collect())
+        .unwrap_or_default();
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut names: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            names.sort();
+            found.extend(names);
+        }
+    }
+    found
+        .into_iter()
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_ascii_lowercase().contains("kosmickrisp"))
+                && path.is_file()
+        })
+        .collect()
+}
+
+/// A Vulkan loader and a driver PyroWave runs on, on macOS.
+#[cfg(target_os = "macos")]
+fn macos_vulkan_compute() -> bool {
+    file_named_in(
+        &["libvulkan.1.dylib", "libvulkan.dylib"],
+        &macos_library_dirs(),
+    ) && !macos_pyrowave_icds().is_empty()
+}
+
 pub fn gpu_compute_present() -> bool {
+    #[cfg(target_os = "macos")]
+    if macos_vulkan_compute() {
+        return true;
+    }
     nvidia_present()
         || std::env::var_os("VK_DRIVER_FILES").is_some()
         || Path::new("/dev/dri/renderD128").exists()
