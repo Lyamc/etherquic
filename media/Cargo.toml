@@ -1,0 +1,28 @@
+[package]
+name = "etherquic-media"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Negotiated codecs for etherquic: PyroWave, Opus, ffmpeg H.264/HEVC/AV1, MJPEG, PCM"
+publish = false
+
+[dependencies]
+etherquic = { path = ".." }
+jpeg-encoder = "0.6"
+libloading = "0.8"
+quinn = { path = "../vendor/quinn/quinn", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-pure",
+] }
+tokio = { version = "1.28", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+zune-core = "0.4"
+zune-jpeg = "0.4"
+
+[[bin]]
+name = "eqmedia-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "eqmedia-latency"
+path = "src/bin/latency.rs"
