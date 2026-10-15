@@ -259,6 +259,32 @@ pub fn connect_view(
             }
         }
     });
+    // Diagnostics: ETHERQUIC_PROBE_INPUT=1 moves the host pointer in a small
+    // circle a few seconds in, so a headless test sees input arrive (with
+    // --trace-input the host confirms each move).
+    if std::env::var_os("ETHERQUIC_PROBE_INPUT").is_some() {
+        let probe_gate = Arc::clone(&gate);
+        let _ = thread::Builder::new()
+            .name("etherquic-probe-input".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(4));
+                for step in 0..40u32 {
+                    let angle = step as f32 * 0.3;
+                    probe_gate.push(Event {
+                        time_us: 1_000 + u64::from(step) * 1_000,
+                        body: Body::Pointer {
+                            x: (32768.0 + 6000.0 * angle.cos()) as u16,
+                            y: (32768.0 + 6000.0 * angle.sin()) as u16,
+                            buttons: 0,
+                            wheel_y: 0,
+                            wheel_x: 0,
+                        },
+                    });
+                    thread::sleep(Duration::from_millis(100));
+                }
+                eprintln!("etherquic-play: probe input sent 40 pointer moves");
+            });
+    }
     // Closed with the view, including when the caller sets `stop`.
     let pads_stop = Arc::new(AtomicBool::new(false));
     let pad_flag = Arc::clone(&pads_stop);
@@ -373,6 +399,12 @@ async fn connect_player(
         (endpoint, addr, addr.to_string())
     } else {
         let net = net.ok_or("no adapter for the L2 dial")?;
+        // One discovery burst first. The host answers from its L2 MAC, so a
+        // Wi-Fi bridge that has forgotten that MAC learns it again. Without
+        // this an idle bridge drops the Initial and the dial times out.
+        status("Finding the host on the network.");
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let _ = etherquic::discover::discover_burst(net.adapter(), &generation, 0);
         let endpoint = l2_client_endpoint(net, connect.local_mac, connect.service_id)?;
         let peer = peer_to_socket_addr(connect.peer_mac, connect.service_id);
         (endpoint, peer, format_mac(connect.peer_mac))

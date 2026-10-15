@@ -32,6 +32,7 @@ pub struct L2Net {
     ethertype: u16,
     l2_backend: u8,
     hw_mac: Option<Mac>,
+    adapter: Option<String>,
 }
 
 impl L2Net {
@@ -41,6 +42,7 @@ impl L2Net {
         let mut io = open_packet_io(nic, ethertype)?;
         let l2_backend = io.l2_backend();
         let hw_mac = io.hw_mac();
+        let adapter = io.adapter();
         eprintln!(
             "etherquic L2: backend={} ethertype=0x{ethertype:04x} mtu={mtu} adapter={}",
             io.name(),
@@ -96,6 +98,7 @@ impl L2Net {
             ethertype,
             l2_backend,
             hw_mac,
+            adapter,
         }))
     }
 
@@ -112,6 +115,11 @@ impl L2Net {
     /// The adapter's own MAC, when the OS reports it.
     pub fn hardware_mac(&self) -> Option<Mac> {
         self.hw_mac
+    }
+
+    /// The pcap device name this net opened. `None` for Membrane.
+    pub fn adapter(&self) -> Option<&str> {
+        self.adapter.as_deref()
     }
 }
 
@@ -320,6 +328,14 @@ impl PacketIo {
             PacketIo::Pcap(_) => crate::discover::L2_LIBPCAP,
             #[cfg(windows)]
             PacketIo::Ndis(_) => crate::discover::L2_MEMBRANE,
+        }
+    }
+
+    fn adapter(&self) -> Option<String> {
+        match self {
+            PacketIo::Pcap(link) => Some(link.nic.name.clone()),
+            #[cfg(windows)]
+            PacketIo::Ndis(_) => None,
         }
     }
 
