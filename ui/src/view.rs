@@ -234,6 +234,8 @@ struct Desk {
     qr: Option<QrGrid>,
     /// Global order. The first codec a discovered computer can run is the match.
     video_pref: Vec<PicturePref>,
+    /// Rows switched off in Settings. A pin still uses them.
+    video_off: Vec<PicturePref>,
     audio_pref: Vec<AudioId>,
     /// Skip a codec unless the sender has a hardware encoder. MJPEG stays available.
     skip_without_hw: bool,
@@ -341,6 +343,7 @@ impl Desk {
             share: Share::blank(),
             qr: None,
             video_pref: saved.video,
+            video_off: saved.video_off,
             audio_pref: saved.audio,
             skip_without_hw: saved.skip_without_hw,
             trace_input: saved.trace_input,
@@ -1962,6 +1965,7 @@ impl Desk {
     fn preferences_now(&self) -> Preferences {
         Preferences {
             video: self.video_pref.clone(),
+            video_off: self.video_off.clone(),
             audio: self.audio_pref.clone(),
             opus: self.backend_pref.clone(),
             skip_without_hw: self.skip_without_hw,
@@ -2456,6 +2460,7 @@ impl Desk {
                 }
                 Section::Codecs => {
                     self.video_pref = default_video();
+                    self.video_off.clear();
                     self.audio_pref = default_audio();
                     self.skip_without_hw = false;
                     self.session_video = None;
@@ -3390,7 +3395,10 @@ impl Desk {
         let audio_local = if self.local_audio.opus { "PCM, Opus" } else { "PCM" };
         let mut video = div().flex().flex_col().gap_2().w_full().min_w_0();
         for (index, codec) in self.video_pref.iter().copied().enumerate() {
-            video = video.child(pref_row(
+            let off = self.video_off.contains(&codec);
+            // MJPEG is the floor every session can fall back to.
+            let switchable = codec != PicturePref::Mjpeg;
+            let row = pref_row(
                 SharedString::from(format!("vid-{index}")),
                 codec.name(),
                 video_hint(codec),
@@ -3404,7 +3412,33 @@ impl Desk {
                     desk.persist();
                     cx.notify();
                 }),
-            ));
+            );
+            video = video.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .when(off, |this| this.opacity(0.5))
+                    .when(switchable, |this| {
+                        this.child(order_chip(
+                            SharedString::from(format!("vid-{index}-on")),
+                            if off { "Off" } else { "On" },
+                            cx.listener(move |desk, _, _, cx| {
+                                if let Some(at) = desk.video_off.iter().position(|row| *row == codec) {
+                                    desk.video_off.remove(at);
+                                } else {
+                                    desk.video_off.push(codec);
+                                }
+                                desk.persist();
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .child(div().flex_1().min_w_0().child(row)),
+            );
         }
         let mut audio = div().flex().flex_col().gap_2().w_full().min_w_0();
         for (index, codec) in self.audio_pref.iter().copied().enumerate() {

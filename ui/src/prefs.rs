@@ -69,7 +69,10 @@ pub fn swap_later<T>(items: &mut [T], index: usize) {
 pub fn video_hint(pref: PicturePref) -> &'static str {
     match pref {
         PicturePref::Pyrowave => {
-            "GPU compute on both ends, needs libpyrowave-shared, spends bandwidth"
+            "GPU compute (Vulkan, or Metal on a Mac) on both ends, needs libpyrowave-shared, spends bandwidth"
+        }
+        PicturePref::PyrowaveCpu => {
+            "PyroWave on a CPU Vulkan driver (no GPU). Uses many cores and about 40 Mbit/s"
         }
         PicturePref::Mjpeg => "intra, weak compression, no encode hardware",
         PicturePref::H264Hw => "compresses well. Hardware encode on the side that sends",
@@ -569,6 +572,8 @@ pub fn listed_top(video: &[PicturePref], audio: &[AudioId], fps: FrameRate) -> S
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
     pub video: Vec<PicturePref>,
+    /// Rows left out of offers unless pinned.
+    pub video_off: Vec<PicturePref>,
     pub audio: Vec<AudioId>,
     pub opus: Vec<MediaBackend>,
     pub skip_without_hw: bool,
@@ -581,6 +586,7 @@ impl Preferences {
     pub fn baseline() -> Self {
         Self {
             video: default_video(),
+            video_off: Vec::new(),
             audio: default_audio(),
             opus: etherquic::default_backend_order().to_vec(),
             skip_without_hw: false,
@@ -646,8 +652,9 @@ fn store_preferences_at(path: &Path, prefs: &Preferences) -> Result<(), String> 
 
 fn render_preferences(prefs: &Preferences) -> String {
     format!(
-        "video={}\naudio={}\nopus={}\nskip-without-hw={}\ntrace-input={}\nfps={}\n",
+        "video={}\nvideo-off={}\naudio={}\nopus={}\nskip-without-hw={}\ntrace-input={}\nfps={}\n",
         join_tokens(prefs.video.iter().map(|pref| pref.token())),
+        join_tokens(prefs.video_off.iter().map(|pref| pref.token())),
         join_tokens(prefs.audio.iter().map(|codec| codec.token())),
         join_tokens(prefs.opus.iter().copied().map(backend_token)),
         yes_no(prefs.skip_without_hw),
@@ -658,6 +665,7 @@ fn render_preferences(prefs: &Preferences) -> String {
 
 fn parse_preferences(text: &str) -> Preferences {
     let mut video = None;
+    let mut video_off = Vec::new();
     let mut audio = None;
     let mut opus = None;
     let mut skip_without_hw = false;
@@ -669,6 +677,7 @@ fn parse_preferences(text: &str) -> Preferences {
         };
         match key.trim() {
             "video" => video = Some(parse_list(value, PicturePref::from_token)),
+            "video-off" => video_off = parse_list(value, PicturePref::from_token),
             "audio" => audio = Some(parse_list(value, AudioId::from_token)),
             "opus" => opus = Some(parse_list(value, backend_from_token)),
             "skip-without-hw" => skip_without_hw = parse_yes(value),
@@ -683,6 +692,7 @@ fn parse_preferences(text: &str) -> Preferences {
     }
     Preferences {
         video: fill(video.unwrap_or_default(), &PicturePref::order()),
+        video_off,
         audio: fill(audio.unwrap_or_default(), &AudioId::order()),
         opus: fill(
             opus.unwrap_or_default(),
@@ -802,11 +812,15 @@ pub struct Applied {
 
 pub fn apply_override(prefs: &Preferences, over: Option<&ConnectionOverride>) -> Applied {
     let over = over.filter(|over| !over.is_empty());
+    let pin = over.and_then(|over| over.video);
+    let mut video = match pin {
+        Some(pin) => pin_first(&prefs.video, pin),
+        None => prefs.video.clone(),
+    };
+    // A switched-off row is not offered, unless this computer pins it.
+    video.retain(|row| Some(*row) == pin || !prefs.video_off.contains(row));
     Applied {
-        video: match over.and_then(|over| over.video) {
-            Some(pin) => pin_first(&prefs.video, pin),
-            None => prefs.video.clone(),
-        },
+        video,
         audio: match over.and_then(|over| over.audio) {
             Some(pin) => pin_first(&prefs.audio, pin),
             None => prefs.audio.clone(),
@@ -1052,6 +1066,25 @@ mod tests {
         assert_eq!(choice.video.first(), Some(&PicturePref::Mjpeg));
         assert_eq!(choice.video_pin, Some(PicturePref::Mjpeg));
         assert_eq!(choice.video.len(), applied.video.len());
+    }
+
+    #[test]
+    fn cpu_pyrowave_is_last_can_be_switched_off_and_pinned() {
+        let order = default_video();
+        assert_eq!(order.last(), Some(&PicturePref::PyrowaveCpu));
+        assert_eq!(PicturePref::PyrowaveCpu.name(), "PyroWave (CPU)");
+        // A file saved before the row existed gets it appended at the end.
+        let old = parse_preferences("video=pyrowave,mjpeg,h264-sw\n");
+        assert_eq!(old.video.last(), Some(&PicturePref::PyrowaveCpu));
+        let mut prefs = Preferences::baseline();
+        prefs.video_off = vec![PicturePref::PyrowaveCpu];
+        let back = parse_preferences(&render_preferences(&prefs));
+        assert_eq!(back.video_off, vec![PicturePref::PyrowaveCpu]);
+        let applied = apply_override(&back, None);
+        assert!(!applied.video.contains(&PicturePref::PyrowaveCpu));
+        let pinned = ConnectionOverride { video: Some(PicturePref::PyrowaveCpu), ..ConnectionOverride::default() };
+        let applied = apply_override(&back, Some(&pinned));
+        assert_eq!(applied.video.first(), Some(&PicturePref::PyrowaveCpu));
     }
 
     #[test]

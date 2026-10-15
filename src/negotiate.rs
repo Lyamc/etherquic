@@ -35,6 +35,10 @@ pub const RECORD_DATA: u8 = b'D';
 
 /// One row of a picture preference list. The suffix is the sender's encoder:
 /// `-hw` is an encode ASIC (NVENC, VideoToolbox, AMF, Quick Sync), `-sw` the CPU.
+/// PyroWave is two rows over one bitstream: `pyrowave` runs on a GPU (or on
+/// Metal through KosmicKrisp), `pyrowave-cpu` on a CPU Vulkan driver
+/// (lavapipe/llvmpipe, SwiftShader). A host from before the split announces
+/// plain `pyrowave` whatever it ran on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Video {
     Av1Hw,
@@ -43,6 +47,7 @@ pub enum Video {
     Pyrowave,
     Mjpeg,
     H264Sw,
+    PyrowaveCpu,
 }
 
 /// The bitstream a [`Video`] row produces. The player decodes this.
@@ -56,13 +61,16 @@ pub enum VideoCodec {
 }
 
 impl Video {
-    pub const ALL: [Video; 6] = [
+    /// Default order. PyroWave on a CPU is last: it works, but takes many
+    /// cores and about 40 Mbit/s, so Auto prefers MJPEG and x264.
+    pub const ALL: [Video; 7] = [
         Video::Av1Hw,
         Video::H265Hw,
         Video::H264Hw,
         Video::Pyrowave,
         Video::Mjpeg,
         Video::H264Sw,
+        Video::PyrowaveCpu,
     ];
 
     pub fn token(self) -> &'static str {
@@ -73,6 +81,7 @@ impl Video {
             Video::Pyrowave => "pyrowave",
             Video::Mjpeg => "mjpeg",
             Video::H264Sw => "h264-sw",
+            Video::PyrowaveCpu => "pyrowave-cpu",
         }
     }
 
@@ -85,9 +94,10 @@ impl Video {
             Video::Av1Hw => "AV1 (HW)",
             Video::H265Hw => "H.265 (HW)",
             Video::H264Hw => "H.264 (HW)",
-            Video::Pyrowave => "Pyrowave",
+            Video::Pyrowave => "PyroWave (GPU)",
             Video::Mjpeg => "MJPEG",
             Video::H264Sw => "H.264 (SW)",
+            Video::PyrowaveCpu => "PyroWave (CPU)",
         }
     }
 
@@ -96,7 +106,7 @@ impl Video {
             Video::Av1Hw => VideoCodec::Av1,
             Video::H265Hw => VideoCodec::H265,
             Video::H264Hw | Video::H264Sw => VideoCodec::H264,
-            Video::Pyrowave => VideoCodec::Pyrowave,
+            Video::Pyrowave | Video::PyrowaveCpu => VideoCodec::Pyrowave,
             Video::Mjpeg => VideoCodec::Mjpeg,
         }
     }
@@ -273,6 +283,10 @@ pub struct Offer {
     pub bitrate_kbps: u32,
     /// Rows the player could not decode in this session.
     pub failed: Vec<Video>,
+    /// The player knows `pyrowave-cpu` (line `knows pyrowave-cpu`). A player
+    /// from before the split does not, and its plain `pyrowave` also takes a
+    /// CPU PyroWave encoder, as it did then.
+    pub knows_pyrowave_cpu: bool,
 }
 
 impl Offer {
@@ -288,6 +302,9 @@ impl Offer {
             let failed: Vec<&str> = self.failed.iter().map(|row| row.token()).collect();
             let _ = writeln!(out, "failed {}", failed.join(" "));
         }
+        if self.knows_pyrowave_cpu {
+            let _ = writeln!(out, "knows pyrowave-cpu");
+        }
         out.into_bytes()
     }
 
@@ -300,6 +317,7 @@ impl Offer {
             max: Limit::NONE,
             bitrate_kbps: 0,
             failed: Vec::new(),
+            knows_pyrowave_cpu: false,
         };
         for (key, words) in &lines.rows {
             match key.as_str() {
@@ -312,6 +330,7 @@ impl Offer {
                     offer.bitrate_kbps = words.first().and_then(|w| w.parse().ok()).unwrap_or(0)
                 }
                 "failed" => offer.failed = dedup(words.iter().filter_map(|w| Video::from_token(w))),
+                "knows" => offer.knows_pyrowave_cpu |= words.contains(&"pyrowave-cpu"),
                 _ => {}
             }
         }
@@ -534,6 +553,7 @@ pub fn build_offer(input: &OfferInput<'_>) -> Offer {
         max: input.max,
         bitrate_kbps: input.bitrate_kbps,
         failed: Vec::new(),
+        knows_pyrowave_cpu: true,
     }
 }
 
@@ -570,7 +590,16 @@ pub fn choose_video(
             skipped.push(Skip { row: *row, reason: "failed earlier in this session" });
             continue;
         }
-        let Some(cap) = host.encodes(*row) else {
+        let cap = host.encodes(*row).or_else(|| {
+            // An old player's plain `pyrowave` is served by a CPU encoder too,
+            // under the token it knows.
+            if *row == Video::Pyrowave && !offer.knows_pyrowave_cpu {
+                host.encodes(Video::PyrowaveCpu)
+            } else {
+                None
+            }
+        });
+        let Some(cap) = cap else {
             skipped.push(Skip { row: *row, reason: "the host has no such encoder" });
             continue;
         };
@@ -688,6 +717,59 @@ mod tests {
     }
 
     #[test]
+    fn cpu_pyrowave_is_its_own_row_and_last_by_default() {
+        assert_eq!(Video::from_token("pyrowave-cpu"), Some(Video::PyrowaveCpu));
+        assert_eq!(Video::PyrowaveCpu.codec(), VideoCodec::Pyrowave);
+        assert_eq!(Video::PyrowaveCpu.name(), "PyroWave (CPU)");
+        assert_eq!(Video::Pyrowave.name(), "PyroWave (GPU)");
+        let pos = |v: Video| Video::ALL.iter().position(|x| *x == v).unwrap();
+        assert!(pos(Video::PyrowaveCpu) > pos(Video::Mjpeg));
+        assert!(pos(Video::PyrowaveCpu) > pos(Video::H264Sw));
+        let caps = host(&[Video::PyrowaveCpu, Video::H264Sw], &[Audio::Opus]);
+        let back = HostCaps::from_text(&caps.to_text()).unwrap();
+        assert!(back.encodes(Video::PyrowaveCpu).is_some());
+        assert!(back.encodes(Video::Pyrowave).is_none());
+    }
+
+    #[test]
+    fn auto_does_not_pick_cpu_pyrowave_but_a_pin_does() {
+        let host = host(&[Video::PyrowaveCpu, Video::H264Sw], &[]);
+        let auto = offer(&Video::ALL, &all_decodes());
+        assert_eq!(choose_video(&auto, &host, &[], None).row, Video::Mjpeg);
+        let pinned = build_offer(&OfferInput {
+            video_order: &Video::ALL,
+            video_pin: Some(Video::PyrowaveCpu),
+            decodes: &all_decodes(),
+            ..OfferInput::default()
+        });
+        assert_eq!(choose_video(&pinned, &host, &[], None).row, Video::PyrowaveCpu);
+        // Asking for GPU PyroWave does not get the CPU one.
+        let gpu = offer(&[Video::Pyrowave, Video::Mjpeg], &all_decodes());
+        assert_eq!(choose_video(&gpu, &host, &[], None).row, Video::Mjpeg);
+    }
+
+    #[test]
+    fn an_old_player_still_gets_pyrowave_from_a_cpu_host() {
+        let old = Offer::decode(b"eqneg 1\nvideo pyrowave mjpeg\naudio opus pcm\nmax 0x0@0\nbitrate 0\n").unwrap();
+        assert!(!old.knows_pyrowave_cpu);
+        let host = host(&[Video::PyrowaveCpu], &[]);
+        let pick = choose_video(&old, &host, &[], None);
+        assert_eq!(pick.row, Video::Pyrowave);
+        assert_eq!(StreamConfig::video(pick.row, &pick.encoder, 64, 64, 30).encode()[1..].starts_with(b"eqneg 1\nvideo pyrowave\n"), true);
+    }
+
+    #[test]
+    fn new_offers_say_they_know_cpu_pyrowave_and_old_hosts_ignore_the_row() {
+        let offer = offer(&Video::ALL, &all_decodes());
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert!(back.knows_pyrowave_cpu);
+        assert_eq!(back.video, offer.video);
+        // An old host's plain pyrowave is treated as GPU.
+        let old_host = HostCaps::from_text("host-video mjpeg=jpeg:0x0@0 pyrowave=pyrowave:7680x4320@0\nhost-audio pcm\n").unwrap();
+        assert_eq!(choose_video(&offer, &old_host, &[], None).row, Video::Pyrowave);
+    }
+
+    #[test]
     fn player_order_wins_over_host_order() {
         let order = [Video::H264Sw, Video::Pyrowave, Video::Mjpeg];
         let offer = offer(&order, &all_decodes());
@@ -715,7 +797,7 @@ mod tests {
             ..OfferInput::default()
         });
         assert_eq!(offer.video[0], Video::H264Sw);
-        assert_eq!(offer.video.len(), 6);
+        assert_eq!(offer.video.len(), Video::ALL.len());
         assert_eq!(offer.audio, vec![Audio::Pcm, Audio::Opus]);
         let host = host(&[Video::Pyrowave, Video::H264Sw], &[Audio::Opus]);
         assert_eq!(choose_video(&offer, &host, &[], None).row, Video::H264Sw);

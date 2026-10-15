@@ -43,7 +43,7 @@ pub fn candidates(video: Video) -> &'static [&'static str] {
         }
         Video::Av1Hw => &["av1_nvenc", "av1_amf", "av1_qsv"],
         Video::H264Sw => &["libx264"],
-        Video::Pyrowave | Video::Mjpeg => &[],
+        Video::Pyrowave | Video::PyrowaveCpu | Video::Mjpeg => &[],
     }
 }
 

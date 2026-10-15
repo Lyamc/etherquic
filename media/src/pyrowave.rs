@@ -87,6 +87,8 @@ struct Api {
     is_ready: unsafe extern "C" fn(Handle, bool) -> bool,
     decode_cpu: unsafe extern "C" fn(Handle, *const CpuBuffer) -> c_int,
     decoder_destroy: unsafe extern "C" fn(Handle),
+    /// `pyrowave_device_get_vk_device_handles`, missing in older builds.
+    vk_handles: Option<unsafe extern "C" fn(Handle, *mut Handle, *mut Handle, *mut Handle)>,
 }
 
 // The function pointers and the library handle are plain data.
@@ -275,6 +277,7 @@ fn open_api() -> Result<Api, String> {
             is_ready: sym!("pyrowave_decoder_decode_is_ready"),
             decode_cpu: sym!("pyrowave_decoder_decode_cpu_buffer_synchronous"),
             decoder_destroy: sym!("pyrowave_decoder_destroy"),
+            vk_handles: unsafe { lib.get(b"pyrowave_device_get_vk_device_handles\0") }.ok().map(|f| *f),
             _lib: lib,
         };
         let (mut major, mut minor, mut patch) = (0, 0, 0);
@@ -312,6 +315,86 @@ impl Device {
             return Err("pyrowave device: null handle".into());
         }
         Ok(Device { api, handle })
+    }
+}
+
+/// The Vulkan device PyroWave picked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDevice {
+    pub name: String,
+    /// `VK_PHYSICAL_DEVICE_TYPE_CPU`, or a known CPU driver name.
+    pub cpu: bool,
+}
+
+const VK_PHYSICAL_DEVICE_TYPE_CPU: i32 = 4;
+
+/// A Vulkan device name that is a CPU driver, for drivers that do not say so.
+pub fn cpu_driver_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["llvmpipe", "lavapipe", "swiftshader", "softpipe"].iter().any(|n| name.contains(n))
+}
+
+/// Read `deviceType` and `deviceName` out of a `VkPhysicalDeviceProperties`.
+fn device_from_properties(bytes: &[u8]) -> Option<VulkanDevice> {
+    // apiVersion, driverVersion, vendorID, deviceID: 4 x u32, then deviceType,
+    // then deviceName[256].
+    let kind = i32::from_ne_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let raw = bytes.get(20..276)?;
+    let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+    let name = String::from_utf8_lossy(&raw[..end]).into_owned();
+    let cpu = kind == VK_PHYSICAL_DEVICE_TYPE_CPU || cpu_driver_name(&name);
+    Some(VulkanDevice { name, cpu })
+}
+
+type GetInstanceProcAddr = unsafe extern "system" fn(Handle, *const std::os::raw::c_char) -> Option<unsafe extern "system" fn()>;
+
+/// `vkGetInstanceProcAddr` of the loader Granite already opened. Only an
+/// already-loaded module is used, so this never pairs Granite's instance with
+/// a second loader.
+fn loaded_instance_proc_addr() -> Option<GetInstanceProcAddr> {
+    #[cfg(windows)]
+    let lib: Library = libloading::os::windows::Library::open_already_loaded("vulkan-1.dll").ok()?.into();
+    #[cfg(unix)]
+    let lib: Library = {
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_LAZY, RTLD_LOCAL};
+        const RTLD_NOLOAD: std::os::raw::c_int = if cfg!(target_os = "macos") { 0x10 } else { 0x4 };
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        if let Some(path) = std::env::var_os("GRANITE_VULKAN_LIBRARY") {
+            names.push(path);
+        }
+        let defaults: &[&str] = if cfg!(target_os = "macos") {
+            &["libvulkan.1.dylib", "libMoltenVK.dylib"]
+        } else {
+            &["libvulkan.so.1", "libvulkan.so"]
+        };
+        names.extend(defaults.iter().map(|n| n.into()));
+        names
+            .into_iter()
+            .find_map(|name| unsafe { UnixLibrary::open(Some(name), RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD) }.ok())?
+            .into()
+    };
+    let gipa: GetInstanceProcAddr = *unsafe { lib.get(b"vkGetInstanceProcAddr\0") }.ok()?;
+    // The module stays loaded for Granite anyway; drop only our reference count.
+    drop(lib);
+    Some(gipa)
+}
+
+impl Device {
+    fn vulkan_device(&self) -> Option<VulkanDevice> {
+        let get = self.api.vk_handles?;
+        let (mut instance, mut physical): (Handle, Handle) = (std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe { get(self.handle, &mut instance, &mut physical, std::ptr::null_mut()) };
+        if instance.is_null() || physical.is_null() {
+            return None;
+        }
+        let gipa = loaded_instance_proc_addr()?;
+        let f = unsafe { gipa(instance, b"vkGetPhysicalDeviceProperties\0".as_ptr().cast()) }?;
+        let props: unsafe extern "system" fn(Handle, *mut u8) = unsafe { std::mem::transmute(f) };
+        // VkPhysicalDeviceProperties is 824 bytes; leave room.
+        let mut buf = vec![0u64; 160];
+        unsafe { props(physical, buf.as_mut_ptr().cast()) };
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * 8) };
+        device_from_properties(bytes)
     }
 }
 
@@ -377,6 +460,11 @@ impl Encoder {
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// The Vulkan device this encoder runs on, when the library can say.
+    pub fn vulkan_device(&self) -> Option<VulkanDevice> {
+        self.device.vulkan_device()
     }
 
     /// One record: u32le packet count, then u32le size and bytes per packet.
@@ -498,4 +586,29 @@ fn take_u32(rest: &mut &[u8]) -> Result<u32, String> {
 /// Default per-frame budget: about 1.5 bits per pixel.
 pub fn default_frame_bytes(width: u32, height: u32) -> usize {
     (width as usize * height as usize * 3 / 16).max(32 * 1024)
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    fn props(kind: i32, name: &str) -> Vec<u8> {
+        let mut bytes = vec![0u8; 824];
+        bytes[16..20].copy_from_slice(&kind.to_ne_bytes());
+        bytes[20..20 + name.len()].copy_from_slice(name.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn cpu_device_type_or_driver_name_is_software() {
+        assert!(device_from_properties(&props(4, "llvmpipe (LLVM 19.1.7, 256 bits)")).unwrap().cpu);
+        assert!(device_from_properties(&props(4, "Some CPU")).unwrap().cpu);
+        // A driver that reports "other" but is SwiftShader.
+        assert!(device_from_properties(&props(0, "SwiftShader Device (Subzero)")).unwrap().cpu);
+        let gpu = device_from_properties(&props(2, "NVIDIA GeForce RTX 4090")).unwrap();
+        assert!(!gpu.cpu);
+        assert_eq!(gpu.name, "NVIDIA GeForce RTX 4090");
+        // KosmicKrisp on Metal is an integrated GPU.
+        assert!(!device_from_properties(&props(1, "Apple M2 Pro (KosmicKrisp)")).unwrap().cpu);
+    }
 }

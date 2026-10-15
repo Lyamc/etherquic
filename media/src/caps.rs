@@ -40,10 +40,24 @@ fn run_probe() -> Probe {
         notes: Vec::new(),
     };
     // PyroWave: a real encode and decode of one small picture.
-    match pyrowave::Encoder::new(256, 144, 32 * 1024).and_then(|mut enc| enc.encode(&test_frame(256, 144))) {
-        Ok(record) => {
+    // The row says where it ran: a CPU Vulkan device is `pyrowave-cpu`.
+    let encoded = pyrowave::Encoder::new(256, 144, 32 * 1024).and_then(|mut enc| {
+        let record = enc.encode(&test_frame(256, 144))?;
+        Ok((record, enc.vulkan_device()))
+    });
+    match encoded {
+        Ok((record, device)) => {
+            let cpu = device.as_ref().is_some_and(|d| d.cpu);
+            match &device {
+                Some(d) => probe.notes.push(format!(
+                    "pyrowave vulkan: {} ({})",
+                    d.name,
+                    if d.cpu { "CPU" } else { "GPU" }
+                )),
+                None => probe.notes.push("pyrowave vulkan: device type unknown, counted as GPU".into()),
+            }
             probe.caps.video.push(EncodeCap {
-                video: Video::Pyrowave,
+                video: if cpu { Video::PyrowaveCpu } else { Video::Pyrowave },
                 encoder: "pyrowave".into(),
                 limit: Limit { width: 7680, height: 4320, fps: 0 },
             });

@@ -25,6 +25,8 @@ pub enum PicturePref {
     Pyrowave,
     Mjpeg,
     H264Sw,
+    /// PyroWave on a CPU Vulkan driver (lavapipe, SwiftShader).
+    PyrowaveCpu,
 }
 
 impl PicturePref {
@@ -33,7 +35,7 @@ impl PicturePref {
             Self::Av1Hw => CodecId::Av1,
             Self::H265Hw => CodecId::H265,
             Self::H264Hw | Self::H264Sw => CodecId::H264,
-            Self::Pyrowave => CodecId::Pyrowave,
+            Self::Pyrowave | Self::PyrowaveCpu => CodecId::Pyrowave,
             Self::Mjpeg => CodecId::Mjpeg,
         }
     }
@@ -43,14 +45,16 @@ impl PicturePref {
             Self::Av1Hw => "AV1 (HW)",
             Self::H265Hw => "H.265 (HW)",
             Self::H264Hw => "H.264 (HW)",
-            Self::Pyrowave => "Pyrowave",
+            Self::Pyrowave => "PyroWave (GPU)",
             Self::Mjpeg => "MJPEG",
             Self::H264Sw => "H.264 (SW)",
+            Self::PyrowaveCpu => "PyroWave (CPU)",
         }
     }
 
     /// Default preference order.
-    pub fn order() -> [Self; 6] {
+    /// Default preference order. CPU PyroWave is last, below MJPEG and x264.
+    pub fn order() -> [Self; 7] {
         [
             Self::Av1Hw,
             Self::H265Hw,
@@ -58,6 +62,7 @@ impl PicturePref {
             Self::Pyrowave,
             Self::Mjpeg,
             Self::H264Sw,
+            Self::PyrowaveCpu,
         ]
     }
 
@@ -69,6 +74,7 @@ impl PicturePref {
             Self::Pyrowave => "pyrowave",
             Self::Mjpeg => "mjpeg",
             Self::H264Sw => "h264-sw",
+            Self::PyrowaveCpu => "pyrowave-cpu",
         }
     }
 
@@ -364,6 +370,15 @@ fn codec_gate(
                 Ok(())
             } else {
                 Err("no gpu compute on both ends")
+            }
+        }
+        PicturePref::PyrowaveCpu => {
+            if skip_without_hardware_encode {
+                Err("no hardware encode")
+            } else if decoder.gpu_compute {
+                Ok(())
+            } else {
+                Err("no gpu compute on the receiver")
             }
         }
         PicturePref::Mjpeg => Ok(()),

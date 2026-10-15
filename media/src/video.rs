@@ -28,7 +28,7 @@ impl VideoEncoder {
     pub fn open(setup: &EncodeSetup, sink: Sink<Vec<u8>>) -> Result<(VideoEncoder, u32), String> {
         match setup.video {
             Video::Mjpeg => Ok((VideoEncoder::Mjpeg { sink }, 0)),
-            Video::Pyrowave => {
+            Video::Pyrowave | Video::PyrowaveCpu => {
                 let frame_bytes = if setup.kbps > 0 {
                     (setup.kbps as usize * 1000 / 8) / setup.fps.max(1) as usize
                 } else {

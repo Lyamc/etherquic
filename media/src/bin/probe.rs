@@ -51,7 +51,7 @@ fn main() {
             }
         }
         let enc_time = t.elapsed();
-        if video != Video::Mjpeg && video != Video::Pyrowave {
+        if video != Video::Mjpeg && video.codec() != etherquic_media::negotiate::VideoCodec::Pyrowave {
             std::thread::sleep(Duration::from_millis(800));
         }
         drop(enc);
