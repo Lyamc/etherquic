@@ -19,6 +19,7 @@ pub mod frame;
 #[cfg(windows)]
 pub mod hostinput;
 pub mod l2_endpoint;
+pub mod negotiate;
 #[cfg(windows)]
 pub mod ndis_link;
 pub mod pcap_link;
@@ -53,7 +54,7 @@ pub use priority::{
     VIDEO as PRIORITY_VIDEO,
 };
 pub use socket::EtherSocket;
-pub use tls::{install_pure_crypto, ALPN_ETHERQUIC};
+pub use tls::{agreed_alpn, alpn_protocols, install_pure_crypto, negotiates, ALPN_ETHERQUIC};
 pub use udp_endpoint::{
     udp_accept, udp_client_endpoint, udp_client_endpoint_on, udp_listeners, udp_port_for,
     udp_server_endpoint, UdpListeners, UDP_PORT_TRIES,

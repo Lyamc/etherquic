@@ -255,7 +255,7 @@ mod tests {
         assert!(listeners.note.contains("another program"), "{}", listeners.note);
         let server = listeners.v4.as_ref().expect("IPv4 listener");
         let alpn = handshake(listeners.port, server).await.unwrap();
-        assert_eq!(alpn, tls::ALPN_ETHERQUIC);
+        assert_eq!(alpn, crate::negotiate::ALPN_NEGOTIATE);
         drop(other);
     }
 
@@ -266,6 +266,35 @@ mod tests {
         let listeners = udp_listeners(port, &cert, &key);
         assert_eq!(listeners.port, port, "{}", listeners.note);
         let server = listeners.v4.as_ref().expect("IPv4 listener");
-        assert_eq!(handshake(port, server).await.unwrap(), tls::ALPN_ETHERQUIC);
+        assert_eq!(handshake(port, server).await.unwrap(), crate::negotiate::ALPN_NEGOTIATE);
+    }
+
+    /// A player built before negotiation lists only `etherquic`. The new
+    /// host must still take it, on the legacy ALPN.
+    #[tokio::test]
+    async fn old_player_gets_the_legacy_alpn() {
+        let (cert, key) = certs();
+        let port = free_port();
+        let listeners = udp_listeners(port, &cert, &key);
+        let server = listeners.v4.as_ref().expect("IPv4 listener");
+        let mut rustls_client = tls::load_client_config(true).unwrap();
+        rustls_client.alpn_protocols = vec![tls::ALPN_ETHERQUIC.to_vec()];
+        let client_config = ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(rustls_client).unwrap(),
+        ));
+        let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dial = client
+            .connect_with(
+                client_config,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, listeners.port)),
+                "localhost",
+            )
+            .unwrap();
+        let accept = async { server.accept().await.unwrap().await.unwrap() };
+        let (client_side, server_side) = tokio::join!(dial, accept);
+        let client_side = client_side.unwrap();
+        assert!(!tls::negotiates(&client_side));
+        assert!(!tls::negotiates(&server_side));
+        assert_eq!(tls::agreed_alpn(&server_side).unwrap(), tls::ALPN_ETHERQUIC);
     }
 }

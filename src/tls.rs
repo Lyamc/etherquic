@@ -26,6 +26,29 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// ALPN identifier for this experimental transport.
 pub const ALPN_ETHERQUIC: &[u8] = b"etherquic";
 
+/// Both ALPNs, newest first. A server picks the first one the client also
+/// lists, so two new peers agree on [`crate::negotiate::ALPN_NEGOTIATE`] and a
+/// new peer with an old one falls back to plain `etherquic`.
+pub fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![
+        crate::negotiate::ALPN_NEGOTIATE.to_vec(),
+        ALPN_ETHERQUIC.to_vec(),
+    ]
+}
+
+/// True when the peer agreed on codec negotiation.
+pub fn negotiates(conn: &quinn::Connection) -> bool {
+    agreed_alpn(conn).as_deref() == Some(crate::negotiate::ALPN_NEGOTIATE)
+}
+
+/// The ALPN the handshake settled on.
+pub fn agreed_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?
+        .protocol
+}
+
 pub fn load_server_config(cert_pem: &Path, key_pem: &Path) -> Result<ServerConfig, TlsError> {
     let provider = provider();
     let certs = load_certs(cert_pem).map_err(io_to_tls)?;
@@ -37,7 +60,7 @@ pub fn load_server_config(cert_pem: &Path, key_pem: &Path) -> Result<ServerConfi
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| TlsError::General(e.to_string()))?;
-    cfg.alpn_protocols = vec![ALPN_ETHERQUIC.to_vec()];
+    cfg.alpn_protocols = alpn_protocols();
     Ok(cfg)
 }
 
@@ -49,7 +72,7 @@ pub fn load_client_config(skip_verify: bool) -> Result<ClientConfig, TlsError> {
         .map_err(|e| TlsError::General(e.to_string()))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![ALPN_ETHERQUIC.to_vec()];
+    cfg.alpn_protocols = alpn_protocols();
     if skip_verify {
         cfg.dangerous()
             .set_certificate_verifier(Arc::new(SkipServerVerification(provider)));
