@@ -1,0 +1,55 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a2b682a..247d259 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -217,7 +217,9 @@ add_subdirectory(util)
+ add_subdirectory(path)
+ add_subdirectory(math)
+ add_subdirectory(threading)
+-add_subdirectory(compiler)
++if (GRANITE_VULKAN_SHADER_MANAGER_RUNTIME_COMPILER)
++    add_subdirectory(compiler)
++endif()
+ add_subdirectory(filesystem)
+ add_subdirectory(vulkan)
+ add_subdirectory(ecs)
+diff --git a/third_party/volk b/third_party/volk
+--- a/third_party/volk
++++ b/third_party/volk
+@@ -1 +1 @@
+-Subproject commit 47cddf7ed97b94118a08aacb548a411188e016cc
++Subproject commit 47cddf7ed97b94118a08aacb548a411188e016cc-dirty
+diff --git a/util/timer.cpp b/util/timer.cpp
+index a140835..c9e5b77 100644
+--- a/util/timer.cpp
++++ b/util/timer.cpp
+@@ -138,6 +138,15 @@ void sleep_until_nsecs(int64_t timepoint)
+ 		_mm_pause();
+ #endif
+ 	}
++#elif defined(__APPLE__)
++	// macOS has no clock_nanosleep. Sleep the time left, relative.
++	int64_t d = timepoint - get_current_time_nsecs();
++	if (d <= 0)
++		return;
++	struct timespec ts = {};
++	ts.tv_sec = d / 1000000000ll;
++	ts.tv_nsec = d % 1000000000ll;
++	while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+ #else
+ 	constexpr auto timebase = CLOCK_MONOTONIC;
+ 	struct timespec ts = {};
+diff --git a/vulkan/context.cpp b/vulkan/context.cpp
+index e76839b..4034e3b 100644
+--- a/vulkan/context.cpp
++++ b/vulkan/context.cpp
+@@ -225,6 +225,9 @@ bool Context::init_loader(PFN_vkGetInstanceProcAddr addr, bool force_reload)
+ 			if (!vulkan_path.empty())
+ 				module = dlopen(vulkan_path.c_str(), RTLD_LOCAL | RTLD_LAZY);
+ #ifdef __APPLE__
++			// A loader shipped beside this library (an app bundle's Frameworks) first.
++			if (!module)
++				module = dlopen("@loader_path/libvulkan.1.dylib", RTLD_LOCAL | RTLD_LAZY);
+ 			if (!module)
+ 				module = dlopen("libvulkan.1.dylib", RTLD_LOCAL | RTLD_LAZY);
+ 			if (!module)

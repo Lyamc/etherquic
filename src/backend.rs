@@ -105,19 +105,7 @@ fn native_opus_present() -> bool {
         }
         file_named_in(&["libopus.dll", "opus.dll"], &dirs)
     }
-    #[cfg(target_os = "macos")]
-    {
-        dirs.extend(macos_library_dirs());
-        file_named_in(
-            &[
-                "libpyrowave-shared.dylib",
-                "libpyrowave-shared.1.dylib",
-                "libpyrowave-shared.1.0.0.dylib",
-            ],
-            &dirs,
-        )
-    }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(not(windows))]
     {
         if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
             dirs.extend(std::env::split_paths(&path));
@@ -161,7 +149,19 @@ pub fn pyrowave_library_present() -> bool {
             &dirs,
         )
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        dirs.extend(macos_library_dirs());
+        file_named_in(
+            &[
+                "libpyrowave-shared.dylib",
+                "libpyrowave-shared.1.dylib",
+                "libpyrowave-shared.1.0.0.dylib",
+            ],
+            &dirs,
+        )
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
             dirs.extend(std::env::split_paths(&path));
