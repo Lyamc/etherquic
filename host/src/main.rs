@@ -6,6 +6,7 @@
 mod cli;
 mod config;
 mod confirm;
+mod extras;
 mod identity;
 mod media;
 mod proto;

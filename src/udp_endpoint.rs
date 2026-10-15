@@ -24,41 +24,116 @@ fn transport() -> TransportConfig {
 
 /// IPv6 and IPv4 listeners for one play port.
 ///
-/// IPv6 is bound first. On Windows that socket often accepts IPv4 as well, so
-/// a following IPv4 bind can fail with the address already in use. That case
-/// still counts as both families.
+/// Both sockets are bound on the same port, and the IPv6 one is IPv6-only, so
+/// each family has its own socket. Before, IPv6 was bound dual-stack first and
+/// an IPv4 "address in use" was taken to mean that socket already covered
+/// IPv4. On Windows that is wrong: `[::]` is IPv6-only there, so the error
+/// meant another program held `0.0.0.0` on the port, and every IPv4 player
+/// reached that program instead. On AN515 RoSE holds UDP `0.0.0.0:4433`, and
+/// its QUIC stack rejected ours with "peer doesn't support any known protocol".
 pub struct UdpListeners {
     pub v4: Option<Endpoint>,
     pub v6: Option<Endpoint>,
+    /// The port both listen on. It differs from the asked port when another
+    /// program held that one; announce this one.
+    pub port: u16,
     pub note: String,
 }
 
-pub fn udp_listeners(port: u16, cert_pem: &Path, key_pem: &Path) -> UdpListeners {
-    let v6_addr = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
-    let v4_addr = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
-    let v6 = match udp_server_endpoint(v6_addr, cert_pem, key_pem) {
-        Ok(endpoint) => Some(endpoint),
-        Err(error) => {
-            eprintln!("etherquic: udp {v6_addr}: {error}");
-            None
-        }
-    };
-    let v4_result = udp_server_endpoint(v4_addr, cert_pem, key_pem);
-    let v4_error = v4_result.as_ref().err().map(ToString::to_string);
-    let v4 = v4_result.ok();
-    if let Some(error) = v4_error.as_deref() {
-        if !(v6.is_some() && already_bound(error)) {
-            eprintln!("etherquic: udp {v4_addr}: {error}");
+/// Ports tried after the asked one when another program holds it.
+pub const UDP_PORT_TRIES: u16 = 16;
+
+fn std_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+/// The sockets for one port: IPv4 must bind, IPv6 is kept when it binds.
+/// `Err` only when IPv4 is taken, so the caller moves to the next port.
+fn bind_pair(port: u16) -> std::io::Result<(std::net::UdpSocket, Option<std::net::UdpSocket>)> {
+    let v4 = std_socket(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)))?;
+    let v6 = std_socket(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port))).ok();
+    Ok((v4, v6))
+}
+
+/// The first port from `port` on whose IPv4 address no other program
+/// listens. Discovery announces this, and [`udp_listeners`] binds it.
+pub fn udp_port_for(port: u16) -> u16 {
+    for candidate in port..=port.saturating_add(UDP_PORT_TRIES) {
+        if bind_pair(candidate).is_ok() {
+            return candidate;
         }
     }
-    let v4_open = v4.is_some() || (v4_error.as_deref().is_some_and(already_bound) && v6.is_some());
-    let note = match (v4_open, v6.is_some()) {
-        (true, true) => format!("IPv4 and IPv6 on {port}."),
-        (true, false) => format!("IPv4 on {port}."),
-        (false, true) => format!("IPv6 on {port}."),
-        (false, false) => format!("UDP {port} did not open."),
-    };
-    UdpListeners { v4, v6, note }
+    port
+}
+
+pub fn udp_listeners(port: u16, cert_pem: &Path, key_pem: &Path) -> UdpListeners {
+    let mut taken = false;
+    let mut last_error = String::new();
+    for candidate in port..=port.saturating_add(UDP_PORT_TRIES) {
+        let (v4_socket, v6_socket) = match bind_pair(candidate) {
+            Ok(pair) => pair,
+            Err(error) => {
+                taken |= error.kind() == std::io::ErrorKind::AddrInUse
+                    || already_bound(&error.to_string());
+                last_error = error.to_string();
+                continue;
+            }
+        };
+        let v4 = server_on(v4_socket, cert_pem, key_pem, "IPv4");
+        let v6 = v6_socket.and_then(|socket| server_on(socket, cert_pem, key_pem, "IPv6"));
+        let families = match (v4.is_some(), v6.is_some()) {
+            (true, true) => "IPv4 and IPv6",
+            (true, false) => "IPv4",
+            (false, true) => "IPv6",
+            (false, false) => continue,
+        };
+        let note = if candidate == port {
+            format!("{families} on {candidate}.")
+        } else {
+            format!("{families} on {candidate}: another program uses UDP {port}.")
+        };
+        return UdpListeners { v4, v6, port: candidate, note };
+    }
+    let why = if taken { "is in use" } else { "did not open" };
+    eprintln!("etherquic: udp {port}: {last_error}");
+    UdpListeners {
+        v4: None,
+        v6: None,
+        port,
+        note: format!("UDP {port} {why}, and the next {UDP_PORT_TRIES} ports too."),
+    }
+}
+
+fn server_on(
+    socket: std::net::UdpSocket,
+    cert_pem: &Path,
+    key_pem: &Path,
+    family: &str,
+) -> Option<Endpoint> {
+    let result = server_config(cert_pem, key_pem).and_then(|config| {
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| EndpointError::Other("no async runtime".into()))?;
+        Ok(Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(config),
+            socket,
+            runtime,
+        )?)
+    });
+    match result {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            eprintln!("etherquic: udp {family}: {error}");
+            None
+        }
+    }
 }
 
 /// `accept` on a listener, or wait forever when that family did not bind.
@@ -74,12 +149,7 @@ fn already_bound(error: &str) -> bool {
     error.contains("in use") || error.contains("10048") || error.contains("only one usage")
 }
 
-/// UDP QUIC server bound to `addr`.
-pub fn udp_server_endpoint(
-    addr: SocketAddr,
-    cert_pem: &Path,
-    key_pem: &Path,
-) -> Result<Endpoint, EndpointError> {
+fn server_config(cert_pem: &Path, key_pem: &Path) -> Result<ServerConfig, EndpointError> {
     tls::install_pure_crypto();
     let rustls_server = tls::load_server_config(cert_pem, key_pem)?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(
@@ -87,7 +157,16 @@ pub fn udp_server_endpoint(
             .map_err(|e| EndpointError::Other(format!("QuicServerConfig: {e}")))?,
     ));
     server_config.transport_config(Arc::new(transport()));
-    Ok(Endpoint::server(server_config, addr)?)
+    Ok(server_config)
+}
+
+/// UDP QUIC server bound to `addr`.
+pub fn udp_server_endpoint(
+    addr: SocketAddr,
+    cert_pem: &Path,
+    key_pem: &Path,
+) -> Result<Endpoint, EndpointError> {
+    Ok(Endpoint::server(server_config(cert_pem, key_pem)?, addr)?)
 }
 
 /// UDP QUIC client bound to an ephemeral IPv4 port.
@@ -115,4 +194,78 @@ pub fn udp_client_endpoint_on(addr: SocketAddr) -> Result<Endpoint, EndpointErro
     let endpoint = Endpoint::client(addr)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, UdpSocket};
+    use std::path::PathBuf;
+
+    fn certs() -> (PathBuf, PathBuf) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("certs");
+        (root.join("cert.pem"), root.join("key.pem"))
+    }
+
+    /// A port the OS hands out, with room for the tries above it.
+    fn free_port() -> u16 {
+        loop {
+            let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            if port < u16::MAX - UDP_PORT_TRIES {
+                return port;
+            }
+        }
+    }
+
+    async fn handshake(port: u16, server: &Endpoint) -> Result<Vec<u8>, String> {
+        let client =
+            udp_client_endpoint_on("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
+        let dial = client
+            .connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), "localhost")
+            .map_err(|e| e.to_string())?;
+        let accept = async {
+            let incoming = server.accept().await.ok_or("listener closed")?;
+            incoming.await.map_err(|e| e.to_string())
+        };
+        let (client_side, server_side) = tokio::join!(dial, accept);
+        let connection = client_side.map_err(|e| e.to_string())?;
+        server_side?;
+        let alpn = connection
+            .handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|data| data.protocol)
+            .ok_or("no ALPN")?;
+        connection.close(0u32.into(), b"done");
+        Ok(alpn)
+    }
+
+    #[tokio::test]
+    async fn ipv4_player_reaches_us_when_another_program_holds_the_port() {
+        let (cert, key) = certs();
+        let port = free_port();
+        // Stands in for RoSE on AN515: a plain IPv4 socket on our port.
+        let other = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap();
+        // Discovery asks before the listeners bind, and must name their port.
+        let announced = udp_port_for(port);
+        assert_ne!(announced, port);
+        let listeners = udp_listeners(port, &cert, &key);
+        assert_eq!(listeners.port, announced, "{}", listeners.note);
+        assert!(listeners.note.contains("another program"), "{}", listeners.note);
+        let server = listeners.v4.as_ref().expect("IPv4 listener");
+        let alpn = handshake(listeners.port, server).await.unwrap();
+        assert_eq!(alpn, tls::ALPN_ETHERQUIC);
+        drop(other);
+    }
+
+    #[tokio::test]
+    async fn free_port_is_kept_and_ipv4_has_its_own_socket() {
+        let (cert, key) = certs();
+        let port = free_port();
+        let listeners = udp_listeners(port, &cert, &key);
+        assert_eq!(listeners.port, port, "{}", listeners.note);
+        let server = listeners.v4.as_ref().expect("IPv4 listener");
+        assert_eq!(handshake(port, server).await.unwrap(), tls::ALPN_ETHERQUIC);
+    }
 }

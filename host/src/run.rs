@@ -100,15 +100,17 @@ pub fn serve(stop: &AtomicBool, log: &Log, mut note: impl FnMut(Note)) -> Result
     };
     let net = L2Net::open(nic, MTU, ETHERTYPE_QUIC).map_err(|err| err.to_string())?;
     let discovery_stop = Arc::new(AtomicBool::new(false));
+    let picture: crate::extras::Picture = Arc::new(std::sync::Mutex::new(None));
     let discovery = spawn_discovery(
         &cfg,
         &paths.log,
         Arc::clone(&discovery_stop),
         net.l2_backend(),
+        Arc::clone(&picture),
     );
     if stop.load(Ordering::SeqCst) {
         discovery_stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = discovery {
+        for handle in discovery {
             let _ = handle.join();
         }
         return Ok(());
@@ -119,10 +121,10 @@ pub fn serve(stop: &AtomicBool, log: &Log, mut note: impl FnMut(Note)) -> Result
         .map_err(|err| err.to_string())?;
     let control = paths.control_dir();
     let result = runtime.block_on(accept_loop(
-        net, cfg, cert, key, control, stop, log, &mut note,
+        net, cfg, cert, key, control, stop, log, &mut note, picture,
     ));
     discovery_stop.store(true, Ordering::SeqCst);
-    if let Some(handle) = discovery {
+    for handle in discovery {
         let _ = handle.join();
     }
     result
@@ -133,7 +135,8 @@ fn spawn_discovery(
     log_path: &Path,
     stop: Arc<AtomicBool>,
     l2_backend: u8,
-) -> Option<thread::JoinHandle<()>> {
+    picture: crate::extras::Picture,
+) -> Vec<thread::JoinHandle<()>> {
     let nic = cfg.nic.clone();
     let probe = etherquic::probe_backends();
     let backend = etherquic::selected_backend(&probe);
@@ -163,18 +166,34 @@ fn spawn_discovery(
         name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "etherquic".into()),
         l2_mac: cfg.mac,
         l2_service: cfg.service,
-        l3_port: cfg.service,
+        // The port the UDP listeners will take: another program can hold
+        // the service number on IPv4 (RoSE does on 4433).
+        l3_port: etherquic::udp_port_for(cfg.service),
         video: Some(video),
         audio: Some(audio),
         l2_backend,
     };
-    let log_path = log_path.to_path_buf();
-    match thread::Builder::new()
-        .name("etherquic-discover".into())
-        .spawn(move || {
+    let extras: Arc<crate::extras::HostExtras> =
+        Arc::new(crate::extras::HostExtras::start(picture, Arc::clone(&stop)));
+    let card = Arc::new(card);
+    let mut handles = Vec::new();
+    for udp in [false, true] {
+        let nic = nic.clone();
+        let card = Arc::clone(&card);
+        let extras = Arc::clone(&extras);
+        let stop = Arc::clone(&stop);
+        let log_path = log_path.to_path_buf();
+        let name = if udp { "etherquic-discover-udp" } else { "etherquic-discover" };
+        match thread::Builder::new().name(name.into()).spawn(move || {
             let nic = if nic.is_empty() { None } else { Some(nic) };
-            if let Err(err) = etherquic::discover::serve(nic.as_deref(), &card, &stop) {
-                let line = format!("{} discovery: {err}\n", utc_now());
+            let served = if udp {
+                etherquic::discover::serve_udp(nic.as_deref(), &card, &*extras, &stop)
+            } else {
+                etherquic::discover::serve_with(nic.as_deref(), &card, &*extras, &stop)
+            };
+            if let Err(err) = served {
+                let kind = if udp { "udp discovery" } else { "discovery" };
+                let line = format!("{} {kind}: {err}\n", utc_now());
                 if let Ok(mut file) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -185,12 +204,11 @@ fn spawn_discovery(
                 eprint!("{line}");
             }
         }) {
-        Ok(handle) => Some(handle),
-        Err(err) => {
-            eprintln!("discovery thread: {err}");
-            None
+            Ok(handle) => handles.push(handle),
+            Err(err) => eprintln!("discovery thread: {err}"),
         }
     }
+    handles
 }
 
 /// Connect to a host and hold the session until `stop` or the host closes it.
@@ -264,6 +282,7 @@ async fn accept_loop(
     stop: &AtomicBool,
     log: &Log,
     note: &mut impl FnMut(Note),
+    picture: crate::extras::Picture,
 ) -> Result<(), String> {
     let endpoint = l2_server_endpoint(net, cfg.mac, cfg.service, &cert, &key)
         .map_err(|err| err.to_string())?;
@@ -274,14 +293,17 @@ async fn accept_loop(
     };
     let udp = udp_listeners(cfg.service, &cert, &key);
     log.line(&format!(
-        "listening. This PC is {} on service {}. {} {access}",
+        "listening. This PC is {} on service {}, UDP port {}. {} {access}",
         config::format_mac(cfg.mac),
         cfg.service,
+        udp.port,
         udp.note
     ));
     note(Note::Ready);
     #[cfg(windows)]
-    let desk = crate::bridge::Desk::spawn(log);
+    let desk = crate::bridge::Desk::spawn(log, picture);
+    #[cfg(not(windows))]
+    drop(picture);
     let mut udp_v4 = udp.v4;
     let mut udp_v6 = udp.v6;
     let mut closed_by_endpoint = false;

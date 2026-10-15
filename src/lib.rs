@@ -24,6 +24,7 @@ pub mod ndis_link;
 pub mod pcap_link;
 pub mod priority;
 pub mod socket;
+pub mod thumbnail;
 pub mod tls;
 pub mod udp_endpoint;
 
@@ -54,6 +55,6 @@ pub use priority::{
 pub use socket::EtherSocket;
 pub use tls::{install_pure_crypto, ALPN_ETHERQUIC};
 pub use udp_endpoint::{
-    udp_accept, udp_client_endpoint, udp_client_endpoint_on, udp_listeners, udp_server_endpoint,
-    UdpListeners,
+    udp_accept, udp_client_endpoint, udp_client_endpoint_on, udp_listeners, udp_port_for,
+    udp_server_endpoint, UdpListeners, UDP_PORT_TRIES,
 };

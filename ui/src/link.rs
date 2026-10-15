@@ -267,6 +267,9 @@ fn host_thread(
     let discovery_stop = Arc::new(AtomicBool::new(false));
     let discovery_flag = Arc::clone(&discovery_stop);
     let l2_backend = net.l2_backend();
+    // Probed before this host binds, so it names the port the listeners take
+    // (the next free one when another program holds the service number).
+    let l3_port = etherquic::udp_port_for(PLAY_SERVICE_ID);
     let discovery = std::thread::Builder::new()
         .name("etherquic-announce".into())
         .spawn(move || {
@@ -275,7 +278,7 @@ fn host_thread(
                 name: crate::share::machine_name(),
                 l2_mac: HOST_MAC,
                 l2_service: PLAY_SERVICE_ID,
-                l3_port: PLAY_SERVICE_ID,
+                l3_port,
                 video,
                 audio,
                 l2_backend,

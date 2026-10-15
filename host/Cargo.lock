@@ -362,6 +362,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-pki-types",
  "rustls-rustcrypto",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",
@@ -380,6 +381,7 @@ dependencies = [
  "winapi",
  "windows-service",
  "windows-sys 0.59.0",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1075,7 +1077,6 @@ dependencies = [
  "aead",
  "aes",
  "aes-gcm",
- "chacha20 0.9.1",
  "chacha20poly1305",
  "crypto-common",
  "der",
@@ -1668,4 +1669,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zune-core"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
+
+[[package]]
+name = "zune-jpeg"
+version = "0.4.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
+dependencies = [
+ "zune-core",
 ]

@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 rustls-rustcrypto = { path = "vendor/rustls-rustcrypto" }
+# The IPv6 play listener is IPv6-only, so IPv4 has a socket of its own.
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1.28", features = [
     "rt",

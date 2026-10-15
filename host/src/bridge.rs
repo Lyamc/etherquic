@@ -24,6 +24,8 @@ struct Outbound {
     acks: mpsc::Sender<Vec<u8>>,
 }
 
+pub use crate::extras::Picture;
+
 pub struct Desk {
     stop: Arc<AtomicBool>,
     /// True while a player is attached. The input thread tells the helper.
@@ -35,7 +37,7 @@ pub struct Desk {
 }
 
 impl Desk {
-    pub fn spawn(log: &Log) -> Self {
+    pub fn spawn(log: &Log, picture: Picture) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let session = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
@@ -66,7 +68,7 @@ impl Desk {
                 let outbound = Arc::clone(&outbound);
                 let generation = Arc::clone(&generation);
                 let log = log.clone();
-                move || supervise(stop, pipe_slot, outbound, generation, log)
+                move || supervise(stop, pipe_slot, outbound, generation, log, picture)
             })
             .ok();
         if writer.is_none() || supervisor.is_none() {
@@ -140,6 +142,7 @@ fn supervise(
     outbound: Arc<Mutex<Option<Outbound>>>,
     generation: Arc<AtomicU64>,
     log: Log,
+    picture: Picture,
 ) {
     let mut last_error = String::new();
     let mut logged_at = Instant::now() - Duration::from_secs(60);
@@ -150,6 +153,7 @@ fn supervise(
             Arc::clone(&outbound),
             &generation,
             &log,
+            &picture,
         ) {
             Ok(()) => break,
             Err(error) => {
@@ -170,6 +174,7 @@ fn run_once(
     outbound: Arc<Mutex<Option<Outbound>>>,
     generation: &AtomicU64,
     log: &Log,
+    picture: &Picture,
 ) -> Result<(), String> {
     if stop.load(Ordering::SeqCst) {
         return Ok(());
@@ -196,7 +201,8 @@ fn run_once(
             let stop = Arc::clone(&stop);
             let outbound = Arc::clone(&outbound);
             let log = log.clone();
-            move || reader_loop(reader_pipe, stop, outbound, log)
+            let picture = Arc::clone(picture);
+            move || reader_loop(reader_pipe, stop, outbound, log, picture)
         })
         .map_err(|err| err.to_string())?;
     let _ = reader.join();
@@ -215,8 +221,10 @@ fn reader_loop(
     stop: Arc<AtomicBool>,
     outbound: Arc<Mutex<Option<Outbound>>>,
     log: Log,
+    picture: Picture,
 ) {
     let mut saw_frame = false;
+    let mut kept_at: Option<Instant> = None;
     let mut saw_audio = false;
     let mut logged_audio_error = false;
     while !stop.load(Ordering::SeqCst) {
@@ -226,6 +234,11 @@ fn reader_loop(
                 if !saw_frame && !jpeg.is_empty() {
                     log.line(&format!("picture {} bytes", jpeg.len()));
                     saw_frame = true;
+                }
+                // The thumbnail is refreshed every 30 s; one copy a second is plenty.
+                if !jpeg.is_empty() && kept_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                    *lock(&picture) = Some(jpeg.clone());
+                    kept_at = Some(Instant::now());
                 }
                 if let Some(tx) = video_sender(&outbound) {
                     let _ = tx.send(jpeg);
