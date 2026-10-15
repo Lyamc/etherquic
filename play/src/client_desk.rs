@@ -42,6 +42,8 @@ pub struct ConnectSession {
     pub trace_input: bool,
     /// Dial this UDP address instead of the L2 service.
     pub udp: Option<SocketAddr>,
+    /// Scale, what to send, pad slots, and the speaker. Read while the view runs.
+    pub view: crate::LiveView,
 }
 
 /// Wayland only allows a winit loop on the main thread unless the builder opts in.
@@ -50,6 +52,7 @@ pub struct ConnectSession {
 /// winit permits one [`EventLoop`] per process and `run_app` consumes it. This
 /// builder runs on the picture-window thread, and each connect calls
 /// [`EventLoopExtRunOnDemand::run_app_on_demand`] on that same loop.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn player_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     let mut builder = EventLoop::builder();
     #[cfg(target_os = "linux")]
@@ -70,12 +73,14 @@ struct ViewRequest {
     input: Arc<Gate>,
     stop: Arc<AtomicBool>,
     trace: bool,
+    view: crate::LiveView,
     stamps: Arc<Mutex<HashMap<u64, Instant>>>,
     title: Arc<Mutex<String>>,
     proxy: std::sync::mpsc::Sender<Result<EventLoopProxy<()>, String>>,
     done: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn window_sender() -> Result<std::sync::mpsc::Sender<ViewRequest>, String> {
     static SLOT: OnceLock<std::sync::mpsc::Sender<ViewRequest>> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
@@ -95,6 +100,7 @@ fn window_sender() -> Result<std::sync::mpsc::Sender<ViewRequest>, String> {
     Ok(sender)
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn window_thread(receiver: std::sync::mpsc::Receiver<ViewRequest>) {
     let mut event_loop = match player_event_loop() {
         Ok(event_loop) => event_loop,
@@ -107,10 +113,17 @@ fn window_thread(receiver: std::sync::mpsc::Receiver<ViewRequest>) {
         }
     };
     while let Ok(request) = receiver.recv() {
+        run_view(&mut event_loop, request);
+    }
+}
+
+/// Run one picture window on `event_loop` until it closes, and report on `done`.
+fn run_view(event_loop: &mut EventLoop<()>, request: ViewRequest) {
+    {
         let proxy = event_loop.create_proxy();
         if request.proxy.send(Ok(proxy)).is_err() {
             let _ = request.done.send(Err("the picture window stopped".into()));
-            continue;
+            return;
         }
         let mut app = App {
             frames: request.frames,
@@ -130,18 +143,71 @@ fn window_thread(receiver: std::sync::mpsc::Receiver<ViewRequest>) {
             shortcuts: None,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
-            letterbox: Letterbox {
-                x: 0,
-                y: 0,
-                w: 1,
-                h: 1,
-            },
+            letterbox: crate::place(crate::ScaleMode::Fit, 0, 0, 1, 1),
+            view: request.view,
+            fitted: (0, 0),
         };
         let result = event_loop
             .run_app_on_demand(&mut app)
             .map_err(|err| err.to_string());
         app.drop_window();
         let _ = request.done.send(result);
+    }
+}
+
+/// macOS runs a winit loop on the main thread only. The command-line player
+/// calls [`connect_view`] there, so its window runs inline on one loop kept
+/// for the process. A caller on another thread gets an error, not a panic.
+#[cfg(target_os = "macos")]
+fn on_main_thread() -> bool {
+    // Rust names the thread that runs `main` "main". The crate forbids unsafe,
+    // so this stands in for pthread_main_np.
+    std::thread::current().name() == Some("main")
+}
+
+#[cfg(target_os = "macos")]
+fn run_view_here(request: ViewRequest) {
+    thread_local! {
+        static LOOP: std::cell::RefCell<Option<EventLoop<()>>> = const { std::cell::RefCell::new(None) };
+    }
+    LOOP.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            match EventLoop::builder().build() {
+                Ok(event_loop) => *slot = Some(event_loop),
+                Err(err) => {
+                    let _ = request.proxy.send(Err(err.to_string()));
+                    let _ = request.done.send(Err(err.to_string()));
+                    return;
+                }
+            }
+        }
+        if let Some(event_loop) = slot.as_mut() {
+            run_view(event_loop, request);
+        }
+    });
+}
+
+/// Wake the window when a picture or a title arrives, and close it on Stop.
+async fn wake_window(
+    proxy: EventLoopProxy<()>,
+    frames: Arc<Mutex<Option<Picture>>>,
+    stop: Arc<AtomicBool>,
+    pads_stop: Arc<AtomicBool>,
+    title: Arc<Mutex<String>>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if stop.load(Ordering::SeqCst) {
+            pads_stop.store(true, Ordering::SeqCst);
+            let _ = proxy.send_event(());
+            break;
+        }
+        let ready = frames.lock().map(|slot| slot.is_some()).unwrap_or(false);
+        let titled = title.lock().map(|slot| !slot.is_empty()).unwrap_or(false);
+        if ready || titled {
+            let _ = proxy.send_event(());
+        }
     }
 }
 
@@ -159,6 +225,12 @@ pub fn connect_view(
     stop: Arc<AtomicBool>,
     status: Status,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "macos")]
+    if !on_main_thread() {
+        return Err(view_error(
+            "On macOS the picture window has to run on the main thread, which this window already uses. Use etherquic-play connect from a terminal for now.",
+        ));
+    }
     install_pure_crypto();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -167,7 +239,10 @@ pub fn connect_view(
     let (audio_tx, audio_rx) = std::sync::mpsc::channel::<AudioChunk>();
     let playback = thread::Builder::new()
         .name("etherquic-play-playback".into())
-        .spawn(move || play_audio(audio_rx))?;
+        .spawn({
+            let output = crate::snapshot(&connect.view).output_device;
+            move || play_audio(audio_rx, output)
+        })?;
     // One slot. The gate keeps the latest pointer and every key, and keys leave first.
     let (input_tx, input_rx) = mpsc::channel::<Vec<Event>>(1);
     let gate = Arc::new(Gate::new());
@@ -186,9 +261,11 @@ pub fn connect_view(
     let pads_stop = Arc::new(AtomicBool::new(false));
     let pad_flag = Arc::clone(&pads_stop);
     let pad_input = Arc::clone(&gate);
+    let pad_view = Arc::clone(&connect.view);
+    let window_view = Arc::clone(&connect.view);
     let gamepad = thread::Builder::new()
         .name("etherquic-play-gamepad".into())
-        .spawn(move || crate::player_pad::run(pad_input, pad_flag))?;
+        .spawn(move || crate::player_pad::run(pad_input, pad_flag, pad_view))?;
     let net_frames = frames.clone();
     let dial_stop = Arc::clone(&stop);
     let dial_status = Arc::clone(&status);
@@ -217,49 +294,46 @@ pub fn connect_view(
 
     let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    window_sender()
-        .map_err(view_error)?
-        .send(ViewRequest {
-            frames: frames.clone(),
-            input: Arc::clone(&gate),
-            stop: Arc::clone(&stop),
-            trace: trace_input,
-            stamps: Arc::clone(&stamps),
-            title: Arc::clone(&title),
-            proxy: proxy_tx,
-            done: done_tx,
-        })
-        .map_err(|_| view_error("the picture window stopped"))?;
-    let proxy = proxy_rx
-        .recv()
-        .map_err(|_| view_error("the picture window stopped"))?
-        .map_err(view_error)?;
+    let request = ViewRequest {
+        frames: frames.clone(),
+        input: Arc::clone(&gate),
+        stop: Arc::clone(&stop),
+        trace: trace_input,
+        view: window_view,
+        stamps: Arc::clone(&stamps),
+        title: Arc::clone(&title),
+        proxy: proxy_tx,
+        done: done_tx,
+    };
     let wake_frames = frames.clone();
     let wake_stop = Arc::clone(&stop);
     let wake_pads = Arc::clone(&pads_stop);
     let wake_title = Arc::clone(&title);
-    // The spawn above has no proxy. A second task watches the same slot and Stop.
-    rt.spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            if wake_stop.load(Ordering::SeqCst) {
-                wake_pads.store(true, Ordering::SeqCst);
-                let _ = proxy.send_event(());
-                break;
-            }
-            let ready = wake_frames
-                .lock()
-                .map(|slot| slot.is_some())
-                .unwrap_or(false);
-            let titled = wake_title
-                .lock()
-                .map(|slot| !slot.is_empty())
-                .unwrap_or(false);
-            if ready || titled {
-                let _ = proxy.send_event(());
-            }
-        }
-    });
+    #[cfg(target_os = "macos")]
+    {
+        // The window runs on this thread, so the waker picks up the proxy itself.
+        rt.spawn(async move {
+            let proxy = match tokio::task::spawn_blocking(move || proxy_rx.recv()).await {
+                Ok(Ok(Ok(proxy))) => proxy,
+                _ => return,
+            };
+            wake_window(proxy, wake_frames, wake_stop, wake_pads, wake_title).await;
+        });
+        run_view_here(request);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        window_sender()
+            .map_err(view_error)?
+            .send(request)
+            .map_err(|_| view_error("the picture window stopped"))?;
+        let proxy = proxy_rx
+            .recv()
+            .map_err(|_| view_error("the picture window stopped"))?
+            .map_err(view_error)?;
+        // The spawn above has no proxy. A second task watches the same slot and Stop.
+        rt.spawn(wake_window(proxy, wake_frames, wake_stop, wake_pads, wake_title));
+    }
     done_rx
         .recv()
         .map_err(|_| view_error("the picture window stopped"))?
@@ -472,14 +546,14 @@ async fn until_stop(stop: &AtomicBool) {
 }
 
 /// The output stream stays on this thread. ALSA's handle is not `Send`.
-fn play_audio(chunks: std::sync::mpsc::Receiver<AudioChunk>) {
+fn play_audio(chunks: std::sync::mpsc::Receiver<AudioChunk>, output: Option<String>) {
     let queue = Arc::new(Mutex::new(VecDeque::<i16>::new()));
     let mut stream = None;
     let mut channels = 0u16;
     let mut rate = 0u32;
     while let Ok(chunk) = chunks.recv() {
         if stream.is_none() {
-            match open_output(queue.clone()) {
+            match open_output(queue.clone(), output.as_deref()) {
                 Ok((opened, opened_channels, opened_rate)) => {
                     channels = opened_channels;
                     rate = opened_rate;
@@ -511,10 +585,19 @@ fn play_audio(chunks: std::sync::mpsc::Receiver<AudioChunk>) {
     }
 }
 
-fn open_output(queue: Arc<Mutex<VecDeque<i16>>>) -> Result<(cpal::Stream, u16, u32), String> {
+fn open_output(
+    queue: Arc<Mutex<VecDeque<i16>>>,
+    wanted: Option<&str>,
+) -> Result<(cpal::Stream, u16, u32), String> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
+    // A named device that is gone falls back to the default.
+    let named = wanted.and_then(|wanted| {
+        host.output_devices()
+            .ok()?
+            .find(|device| device.name().map(|name| name == wanted).unwrap_or(false))
+    });
+    let device = named
+        .or_else(|| host.default_output_device())
         .ok_or("no audio output device")?;
     let config = device
         .default_output_config()
@@ -580,7 +663,10 @@ struct App {
     shortcuts: Option<ShortcutHold>,
     modifiers: ModifiersState,
     cursor: (f64, f64),
-    letterbox: Letterbox,
+    letterbox: crate::Placement,
+    view: crate::LiveView,
+    /// Picture size the window was last fitted to, for "window matches host".
+    fitted: (u32, u32),
 }
 
 /// Blocks compositor shortcuts while the picture window is focused, so the
@@ -628,13 +714,6 @@ fn block_shortcuts(block: bool) {
     {
         let _ = block;
     }
-}
-
-struct Letterbox {
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
 }
 
 impl ApplicationHandler for App {
@@ -789,14 +868,17 @@ impl App {
         event_loop.set_control_flow(ControlFlow::Wait);
         buffer.fill(0);
         if let Some(picture) = &self.picture {
-            self.letterbox = letterbox(picture.width, picture.height, size.width, size.height);
-            let mut view = vec![0u32; (self.letterbox.w as usize) * (self.letterbox.h as usize)];
-            blit_rgb(picture, &mut view, self.letterbox.w, self.letterbox.h);
-            for y in 0..self.letterbox.h {
-                for x in 0..self.letterbox.w {
-                    let dst = ((self.letterbox.y + y) * size.width + self.letterbox.x + x) as usize;
+            let scale = crate::snapshot(&self.view).scale;
+            let place = crate::place(scale, picture.width, picture.height, size.width, size.height);
+            self.letterbox = place;
+            let mut view = vec![0u32; (place.view_w as usize) * (place.view_h as usize)];
+            blit_rgb(picture, &mut view, place.view_w, place.view_h);
+            for y in 0..place.h {
+                let row = ((place.crop_y + y) * place.view_w + place.crop_x) as usize;
+                for x in 0..place.w {
+                    let dst = ((place.dst_y + y) * size.width + place.dst_x + x) as usize;
                     if dst < buffer.len() {
-                        buffer[dst] = view[(y * self.letterbox.w + x) as usize];
+                        buffer[dst] = view[row + x as usize];
                     }
                 }
             }
@@ -807,9 +889,25 @@ impl App {
     fn take_frame(&mut self) {
         let next = self.frames.lock().ok().and_then(|mut slot| slot.take());
         if let Some(picture) = next {
+            let size = (picture.width, picture.height);
             self.picture = Some(picture);
             if let Some(window) = &self.window {
+                let options = crate::snapshot(&self.view);
+                if options.size_match == crate::SizeMatch::WindowToHost && size != self.fitted {
+                    self.fitted = size;
+                    let _ = window.request_inner_size(PhysicalSize::new(size.0, size.1));
+                }
                 window.request_redraw();
+            }
+        } else if let Some(window) = &self.window {
+            // A scale change made in the console shows without a new frame.
+            let scale = crate::snapshot(&self.view).scale;
+            if let Some(picture) = &self.picture {
+                let size = window.inner_size();
+                let place = crate::place(scale, picture.width, picture.height, size.width, size.height);
+                if place != self.letterbox {
+                    window.request_redraw();
+                }
             }
         }
     }
@@ -818,13 +916,11 @@ impl App {
         if self.picture.is_none() {
             return;
         }
+        if !crate::snapshot(&self.view).send_mouse {
+            return;
+        }
         let (x, y) = self.cursor;
-        let box_w = self.letterbox.w.max(1) as f64;
-        let box_h = self.letterbox.h.max(1) as f64;
-        let local_x = (x - f64::from(self.letterbox.x)).clamp(0.0, box_w - 1.0);
-        let local_y = (y - f64::from(self.letterbox.y)).clamp(0.0, box_h - 1.0);
-        let px = ((local_x / box_w) * 65535.0).round() as u16;
-        let py = ((local_y / box_h) * 65535.0).round() as u16;
+        let (px, py) = crate::to_remote(&self.letterbox, x, y);
         self.emit(vec![Event {
             time_us: 0,
             body: Body::Pointer {
@@ -853,6 +949,9 @@ impl App {
     }
 
     fn send_key(&mut self, key: &Key, down: bool) {
+        if !crate::snapshot(&self.view).send_keyboard {
+            return;
+        }
         let Some(code) = keysym(key) else {
             return;
         };
@@ -867,6 +966,10 @@ impl App {
     }
 
     fn send_modifiers(&mut self, next: ModifiersState) {
+        if !crate::snapshot(&self.view).send_keyboard {
+            self.modifiers = next;
+            return;
+        }
         let mut events = Vec::new();
         for (was, now, code) in [
             (self.modifiers.shift_key(), next.shift_key(), 0xffe1),
@@ -907,32 +1010,6 @@ impl App {
             }
             self.input.push(event.clone());
         }
-    }
-}
-
-fn letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Letterbox {
-    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-        return Letterbox {
-            x: 0,
-            y: 0,
-            w: dst_w.max(1),
-            h: dst_h.max(1),
-        };
-    }
-    let src_aspect = src_w as f64 / src_h as f64;
-    let dst_aspect = dst_w as f64 / dst_h as f64;
-    let (w, h) = if src_aspect > dst_aspect {
-        (dst_w, ((dst_w as f64) / src_aspect).round() as u32)
-    } else {
-        (((dst_h as f64) * src_aspect).round() as u32, dst_h)
-    };
-    let w = w.clamp(1, dst_w);
-    let h = h.clamp(1, dst_h);
-    Letterbox {
-        x: (dst_w - w) / 2,
-        y: (dst_h - h) / 2,
-        w,
-        h,
     }
 }
 
@@ -1008,6 +1085,7 @@ mod tests {
                     input: Arc::new(Gate::new()),
                     stop: Arc::clone(&stop),
                     trace: false,
+                    view: crate::live(crate::ViewOptions::default()),
                     stamps: Arc::new(Mutex::new(HashMap::new())),
                     title: Arc::new(Mutex::new(String::new())),
                     proxy: proxy_tx,

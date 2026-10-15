@@ -16,12 +16,15 @@ pub mod discover;
 pub mod endpoint;
 pub mod fabric;
 pub mod frame;
+#[cfg(windows)]
+pub mod hostinput;
 pub mod l2_endpoint;
 #[cfg(windows)]
 pub mod ndis_link;
 pub mod pcap_link;
 pub mod priority;
 pub mod socket;
+pub mod thumbnail;
 pub mod tls;
 pub mod udp_endpoint;
 
@@ -41,7 +44,9 @@ pub use capture::{
 pub use endpoint::{client_endpoint, server_endpoint, EndpointError};
 pub use fabric::Fabric;
 pub use frame::{max_quic_datagram, Frame, DEFAULT_ETHER_TYPE};
-pub use l2_endpoint::{l2_client_endpoint, l2_server_endpoint, L2Net};
+pub use l2_endpoint::{
+    l2_client_endpoint, l2_preference, l2_server_endpoint, set_l2_preference, L2Net,
+};
 pub use pcap_link::{parse_mac, ETHERTYPE_QUIC};
 pub use priority::{
     AUDIO as PRIORITY_AUDIO, INPUT as PRIORITY_INPUT, TRACE as PRIORITY_TRACE,
@@ -50,6 +55,6 @@ pub use priority::{
 pub use socket::EtherSocket;
 pub use tls::{install_pure_crypto, ALPN_ETHERQUIC};
 pub use udp_endpoint::{
-    udp_accept, udp_client_endpoint, udp_client_endpoint_on, udp_listeners, udp_server_endpoint,
-    UdpListeners,
+    udp_accept, udp_client_endpoint, udp_client_endpoint_on, udp_listeners, udp_port_for,
+    udp_server_endpoint, UdpListeners, UDP_PORT_TRIES,
 };

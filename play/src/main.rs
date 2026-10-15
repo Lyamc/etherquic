@@ -36,6 +36,7 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     fps: host.fps,
                     cert: host.cert,
                     key: host.key,
+                    audio_device: None,
                 },
                 stop,
                 Arc::new(AtomicBool::new(false)),
@@ -44,15 +45,19 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
         }
         args::Command::Connect(connect) => {
-            let net = L2Net::open(connect.nic.as_deref(), 1500, ETHERTYPE_QUIC)?;
+            let net = match connect.udp {
+                Some(_) => None,
+                None => Some(L2Net::open(connect.nic.as_deref(), 1500, ETHERTYPE_QUIC)?),
+            };
             etherquic_play::connect_view(
-                Some(net),
+                net,
                 etherquic_play::ConnectSession {
                     local_mac: connect.local_mac,
                     peer_mac: connect.peer_mac,
                     service_id: connect.service_id,
                     trace_input: false,
-                    udp: None,
+                    udp: connect.udp,
+                    view: etherquic_play::live(etherquic_play::ViewOptions::default()),
                 },
                 stop,
                 etherquic_play::stderr_status(),

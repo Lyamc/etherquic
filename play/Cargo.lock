@@ -1178,6 +1178,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-pki-types",
  "rustls-rustcrypto",
+ "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

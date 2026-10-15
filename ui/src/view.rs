@@ -5,7 +5,12 @@
 //! callback so the Win32 call is not inside the render borrow. It runs only
 //! when the desired state changes.
 
-use std::time::{Duration, Instant};
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use etherquic::discover::Found;
 use etherquic::{BackendProbe, MediaBackend};
@@ -21,12 +26,25 @@ use etherquic_ui::{
     ConnectionPrefs, DialTarget, FrameRate, HexMac, Layer, Link, NicChoice, Preferences, QrGrid,
     Role, Share, CLIENT_MAC, FPS_CHOICES, HOST_MAC, SOFTWARE_FPS,
 };
+use etherquic_ui::{
+    backends as backend_list, chosen_audio, chosen_video, default_audio, default_video,
+    load_defaults, load_settings, move_to_front, store_defaults, store_settings, BackendState,
+    Field, NetworkDriver, Part, RosterRow, Section, Settings,
+};
+use etherquic_play::{ScaleMode, SizeMatch, PAD_SLOTS};
+use etherquic_ui::{
+    caps_details, caps_summary, decode_thumbnail,
+    ago, load_hosts, matches_filter, scrollbar, store_hosts, HostAddr, HostBook, Presence, Roster,
+    Sighting,
+};
 
 use crate::scan::Scan;
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, App, Application, Bounds, ClickEvent,
-    Context, FocusHandle, FontWeight, KeyDownEvent, SharedString, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    canvas, div, fill, point, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds,
+    ClickEvent, Context, Div, FocusHandle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, img, ImageSource, ObjectFit, RenderImage,
+    anchored, deferred,
 };
 
 const BG: u32 = 0x12141a;
@@ -38,6 +56,23 @@ const HOST_GREEN: u32 = 0x3dd68c;
 const PLAYER_BLUE: u32 = 0x4cc2ff;
 const DANGER: u32 = 0xff6b6b;
 const INK: u32 = 0x0e1116;
+/// Room kept free on the right of a scrolling area for its scrollbar, shown or not.
+const BAR_W: f32 = 12.0;
+/// Tallest the host list grows before it scrolls on its own: two and a half
+/// rows, so a cut-off row shows there is more.
+const HOST_LIST_MAX_H: f32 = 2.5 * HOST_ROW_H + 2. * 4.;
+/// One compact host row.
+/// Room for the widest set of row buttons, so a delete confirmation does not
+/// move the status column.
+const ACTIONS_W: f32 = 236.;
+/// Discovery thumbnails show at 16:9 in this box.
+const THUMB_W: f32 = 64.;
+const THUMB_H: f32 = 36.;
+const HOST_ROW_H: f32 = 64.0;
+/// Two lines of status. Longer text is clipped so the page under it never moves.
+const STATUS_H: f32 = 40.0;
+/// Sound devices listed before "Show all devices".
+const DEVICES_SHOWN: usize = 4;
 
 const USAGE: &str = "\
 etherquic
@@ -196,7 +231,39 @@ struct Desk {
     connections: ConnectionPrefs,
     /// Packet capture. Not written to the preferences file.
     capturing: bool,
-    prefs_open: bool,
+    /// Collapsible sections. All start closed.
+    open: Panels,
+    /// The page and the host list scroll separately.
+    page_scroll: ScrollHandle,
+    list_scroll: ScrollHandle,
+    drag: Option<Drag>,
+    /// Scrollbar inputs seen last frame. A change asks for one more frame.
+    bar_sig: [f32; 4],
+    book: HostBook,
+    roster: Roster,
+    roster_burst: u64,
+    tab: HostTab,
+    filter: String,
+    filter_focus: FocusHandle,
+    add_open: bool,
+    add_name: String,
+    add_addr: String,
+    add_error: Option<String>,
+    add_name_focus: FocusHandle,
+    add_addr_focus: FocusHandle,
+    /// Index into `book.saved` and the name being typed.
+    renaming: Option<(usize, String)>,
+    rename_focus: FocusHandle,
+    /// Index into `book.saved` waiting for Delete to be confirmed.
+    confirm_delete: Option<usize>,
+    /// An IP host picked from Saved or Recent. `None` dials `peer` and `layer`.
+    direct: Option<HostAddr>,
+    /// Name of the picked host, for Recent.
+    target_name: Option<String>,
+    /// Goes to Recent once the view reports it is up.
+    pending_recent: Option<(String, HostAddr)>,
+    /// Decoded discovery thumbnails by host key, with the codestream they came from.
+    thumbs: HashMap<[u8; 6], (u64, Option<Arc<RenderImage>>)>,
     local_video: MachineCodecs,
     local_audio: AudioMachine,
     /// Tools found once at startup. Rendering does not probe again.
@@ -207,6 +274,26 @@ struct Desk {
     backend: MediaBackend,
     /// Themaister's shared library, not merely a Vulkan loader.
     pyrowave_library: bool,
+    /// Settings that are not codec order. Saved in `settings.txt` and pushed
+    /// to the open view as they change.
+    settings: Settings,
+    /// Picked in the Connect card and not saved yet.
+    session_video: Option<PicturePref>,
+    session_audio: Option<AudioId>,
+    /// The dropdown that is open. It draws over the page and moves nothing.
+    menu: Option<Menu>,
+    /// A Reset waiting for its confirmation. `Some(None)` is Reset all.
+    confirm_reset: Option<Option<Section>>,
+    /// The user's defaults: what Reset returns to and what "default" marks.
+    defaults: Settings,
+    local_outputs: Vec<String>,
+    local_inputs: Vec<String>,
+    local_pads: Vec<String>,
+    devices_loading: bool,
+    /// Window y of the Settings heading from the last frame.
+    settings_y: Rc<Cell<f32>>,
+    /// Frames left before scrolling to Settings.
+    scroll_to_settings: u8,
 }
 
 impl Desk {
@@ -243,15 +330,55 @@ impl Desk {
             display_hz: display_hz(),
             connections: load_connections(),
             capturing: etherquic::capture_active(),
-            prefs_open: false,
+            open: Panels::default(),
+            page_scroll: ScrollHandle::new(),
+            list_scroll: ScrollHandle::new(),
+            drag: None,
+            bar_sig: [0.0; 4],
+            tab: HostTab::Discovered,
+            book: load_hosts(),
+            roster: Roster::default(),
+            roster_burst: 0,
+            filter: String::new(),
+            filter_focus: cx.focus_handle(),
+            add_open: false,
+            add_name: String::new(),
+            add_addr: String::new(),
+            add_error: None,
+            add_name_focus: cx.focus_handle(),
+            add_addr_focus: cx.focus_handle(),
+            renaming: None,
+            rename_focus: cx.focus_handle(),
+            confirm_delete: None,
+            direct: None,
+            target_name: None,
+            pending_recent: None,
+            thumbs: HashMap::new(),
             local_video: this_computer(),
             local_audio: audio_for(backends, backend),
             backends,
             backend_pref: saved.opus,
             backend,
             pyrowave_library: etherquic::pyrowave_library_present(),
+            settings: load_settings(),
+            defaults: load_defaults(),
+            session_video: None,
+            session_audio: None,
+            menu: None,
+            confirm_reset: None,
+            local_outputs: Vec::new(),
+            local_inputs: Vec::new(),
+            local_pads: Vec::new(),
+            devices_loading: false,
+            settings_y: Rc::new(Cell::new(0.)),
+            scroll_to_settings: 0,
         };
+        desk.refresh_devices(cx);
+        desk.apply_settings(false);
         desk.refresh_share();
+        if !desk.book.saved.is_empty() {
+            desk.tab = HostTab::Saved;
+        }
         desk.message = match launch.command {
             Command::Host => {
                 let fps = desk.capture_fps();
@@ -259,6 +386,7 @@ impl Desk {
             }
             Command::Connect => match desk.peer.parse() {
                 Some(peer) => {
+                    desk.pending_recent = Some((format_mac(peer), HostAddr::Mac(peer)));
                     let trace = desk.applied(peer).trace_input;
                     desk.link.connect(launch.nic, peer, trace, 0, None).err()
                 }
@@ -334,6 +462,10 @@ impl Desk {
             cx.notify();
             return;
         }
+        if let Some(HostAddr::Ip { ip, port }) = self.direct {
+            self.connect_direct(ip, port, cx);
+            return;
+        }
         let Some(peer) = self.peer.parse() else {
             self.message = Some("Peer address needs 12 hex digits.".into());
             cx.notify();
@@ -364,11 +496,77 @@ impl Desk {
                 return;
             }
         };
+        let used = match layer {
+            Layer::L2 => HostAddr::Mac(peer),
+            Layer::V4(ip) => HostAddr::Ip {
+                ip: ip.into(),
+                port,
+            },
+            Layer::V6(ip) => HostAddr::Ip {
+                ip: ip.into(),
+                port,
+            },
+        };
+        let name = self.target_name.clone().unwrap_or_else(|| {
+            device
+                .as_ref()
+                .map(|device| device.name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format_mac(peer))
+        });
         match self
             .link
             .connect(self.nic.clone(), peer, trace, host_l2, udp)
         {
-            Ok(()) => self.message = None,
+            Ok(()) => {
+                self.message = None;
+                self.pending_recent = Some((name, used));
+            }
+            Err(err) => self.message = Some(err),
+        }
+        cx.notify();
+    }
+
+    /// An IP host from Saved or Recent. It need not be discovered first.
+    fn connect_direct(&mut self, ip: std::net::IpAddr, port: u16, cx: &mut Context<Self>) {
+        let addr = HostAddr::Ip { ip, port };
+        let known = self.roster.find(&addr).cloned();
+        let port = if port == 0 {
+            known.as_ref().map(|row| row.port).unwrap_or(0)
+        } else {
+            port
+        };
+        let layer = match ip {
+            std::net::IpAddr::V4(ip) => Layer::V4(ip),
+            std::net::IpAddr::V6(ip) => Layer::V6(ip),
+        };
+        let udp = match dial_target(layer, port, ipv6_scope(self.nic.as_deref(), &self.nics)) {
+            DialTarget::Udp(addr) => Some(addr),
+            DialTarget::L2 => None,
+            DialTarget::NeedsNic => {
+                self.message = Some(
+                    "That IPv6 address is link-local. Pick the adapter, not Auto.".into(),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let peer = known
+            .as_ref()
+            .map(|row| row.mac)
+            .or_else(|| self.peer.parse())
+            .unwrap_or([0; 6]);
+        let trace = self.applied(peer).trace_input;
+        let name = self
+            .target_name
+            .clone()
+            .or_else(|| known.as_ref().map(|row| row.title()))
+            .unwrap_or_else(|| addr.display());
+        match self.link.connect(self.nic.clone(), peer, trace, 0, udp) {
+            Ok(()) => {
+                self.message = None;
+                self.pending_recent = Some((name, addr));
+            }
             Err(err) => self.message = Some(err),
         }
         cx.notify();
@@ -398,6 +596,13 @@ impl Desk {
     fn on_peer_key(&mut self, ev: &KeyDownEvent) {
         let key = ev.keystroke.key.as_str();
         let mods = &ev.keystroke.modifiers;
+        if key == "enter" || key == "escape" || key == "tab" {
+            return;
+        }
+        if self.direct.take().is_some() {
+            self.peer.clear();
+        }
+        self.target_name = None;
         if key == "backspace" {
             if mods.control || mods.alt || mods.platform {
                 self.peer.clear();
@@ -453,7 +658,9 @@ impl Desk {
         let label = if hosting { "Stop hosting" } else { "Host" };
         let edge = if hosting { HOST_GREEN } else { CARD_EDGE };
         let capture = self.capture_fps();
-        let rates = self.global_fps_row("host-fps", cx);
+        let open = self.open.host;
+        let rates = open.then(|| self.global_fps_row("host-fps", cx));
+        let qr = open.then(|| phone_share(&self.qr));
         div()
             .flex()
             .flex_col()
@@ -467,13 +674,7 @@ impl Desk {
             .border_color(rgb(edge))
             .rounded_md()
             .child(card_title("Host", HOST_GREEN))
-            .child(card_body(
-                "Share this desktop and its audio. A player sees it, hears it, and controls it.",
-            ))
-            .child(card_meta(format!("This PC captures at {capture} fps.")))
-            .child(rates)
-            .child(phone_share(&self.qr))
-            .child(div().flex_1())
+            .child(muted_line("Share this desktop and its audio.".into()))
             .child(action_button(
                 "host-btn",
                 label,
@@ -483,6 +684,24 @@ impl Desk {
                     desk.on_host(window, cx);
                 }),
             ))
+            .child(disclosure(
+                "host-more",
+                "Hosting options",
+                format!("{capture} fps · phone code"),
+                open,
+                cx.listener(|desk, _, _, cx| {
+                    desk.open.host = !desk.open.host;
+                    cx.notify();
+                }),
+            ))
+            .when(open, |card| {
+                card.child(card_body(
+                    "A player sees this desktop, hears it, and controls it. The taskbar button is on only while hosting.",
+                ))
+                .child(card_meta(format!("This PC captures at {capture} fps.")))
+                .when_some(rates, |card, rates| card.child(rates))
+                .when_some(qr, |card, qr| card.child(qr))
+            })
     }
 
     fn connect_card(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -491,14 +710,24 @@ impl Desk {
         let label = if playing { "Disconnect" } else { "Connect" };
         let edge = if playing { PLAYER_BLUE } else { CARD_EDGE };
         let focused = self.focus.is_focused(window);
-        let selection = self.connection_selection();
-        let typed = self.peer.display();
+        let open = self.open.connect;
+        let selection = open.then(|| self.connection_selection());
+        let path = open.then(|| self.path_row(cx));
+        let typed = match self.direct {
+            Some(addr) => addr.display(),
+            None => self.peer.display(),
+        };
         let field_color = if typed.is_empty() { MUTED } else { TEXT };
         let field_text = if typed.is_empty() {
-            "Host address".to_string()
+            "Host MAC address".to_string()
         } else {
             typed
         };
+        let target = self.target_label();
+        let via = self.via_label();
+        let tabs = self.transport_tabs(cx);
+        let video = self.codec_row(Menu::Video, cx);
+        let audio = self.codec_row(Menu::Audio, cx);
         div()
             .flex()
             .flex_col()
@@ -511,26 +740,32 @@ impl Desk {
             .border_1()
             .border_color(rgb(edge))
             .rounded_md()
-            .child(card_title("Connect", PLAYER_BLUE))
             .child(
                 div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(PLAYER_BLUE))
-                    .child(selection),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(card_title("Connect", PLAYER_BLUE))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(TEXT))
+                            .child(target),
+                    ),
             )
-            .child(card_body(
-                "Open the remote desktop. Focus that window to use the keyboard and the mouse.",
-            ))
-            .child(card_meta(format!(
-                "This PC appears as {}",
-                format_mac(CLIENT_MAC)
-            )))
+            .child(tabs)
             .child(
                 div()
                     .id("peer-mac")
                     .flex()
                     .w_full()
-                    .h(px(36.))
+                    .h(px(34.))
                     .px_2()
                     .items_center()
                     .overflow_hidden()
@@ -546,13 +781,17 @@ impl Desk {
                         window.focus(&desk.focus);
                         cx.notify();
                     }))
-                    .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, _, cx| {
+                    .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, window, cx| {
+                        if ev.keystroke.key == "enter" {
+                            desk.on_connect(window, cx);
+                            return;
+                        }
                         desk.on_peer_key(ev);
                         cx.notify();
                     })),
             )
-            .child(self.path_row(cx))
-            .child(div().flex_1())
+            .child(video)
+            .child(audio)
             .child(action_button(
                 "connect-btn",
                 label,
@@ -562,6 +801,110 @@ impl Desk {
                     desk.on_connect(window, cx);
                 }),
             ))
+            .child(disclosure(
+                "connect-more",
+                "Connection path",
+                via,
+                open,
+                cx.listener(|desk, _, _, cx| {
+                    desk.open.connect = !desk.open.connect;
+                    cx.notify();
+                }),
+            ))
+            .when(open, |card| {
+                card.child(card_body(
+                    "Open the remote desktop. Focus that window to use the keyboard and the mouse.",
+                ))
+                .child(card_meta(format!(
+                    "This PC appears as {}",
+                    format_mac(CLIENT_MAC)
+                )))
+                .when_some(selection, |card, selection| {
+                    card.child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(PLAYER_BLUE))
+                            .child(selection),
+                    )
+                })
+                .when(self.direct.is_some(), |card| {
+                    card.child(muted_line(
+                        "This saved host dials its IP address. Type a MAC address to use Ethernet instead.".into(),
+                    ))
+                })
+                .when_some(path, |card, path| card.child(path))
+            })
+    }
+
+    /// The decoded picture for one host, decoding again only when the host sent
+    /// a different codestream.
+    fn thumbnail_image(&mut self, key: [u8; 6], bytes: Option<&[u8]>) -> Option<Arc<RenderImage>> {
+        use std::hash::{Hash, Hasher};
+        let bytes = bytes?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let stamp = hasher.finish();
+        if let Some((seen, picture)) = self.thumbs.get(&key) {
+            if *seen == stamp {
+                return picture.clone();
+            }
+        }
+        let picture = decode_thumbnail(bytes).and_then(render_image);
+        self.thumbs.insert(key, (stamp, picture.clone()));
+        picture
+    }
+
+    /// Picture and one-line summary for a Saved or Recent host, from the last
+    /// time discovery heard it.
+    fn row_extras(&mut self, addr: &HostAddr) -> (AnyElement, String) {
+        let row = self.roster.find(addr).cloned();
+        let picture = row
+            .as_ref()
+            .and_then(|row| self.thumbnail_image(row.key, row.thumbnail.as_deref()));
+        let summary = match &row {
+            Some(row) => row_summary(row.caps.as_ref()),
+            None => "Not heard on this network yet".into(),
+        };
+        (thumb_slot(picture), summary)
+    }
+
+    /// The host Connect will dial, by name when one was picked.
+    fn target_label(&self) -> String {
+        if let Some(name) = &self.target_name {
+            return name.clone();
+        }
+        if let Some(addr) = self.direct {
+            return addr.display();
+        }
+        match self.peer.parse() {
+            Some(mac) => self
+                .book
+                .saved
+                .iter()
+                .find(|entry| entry.addr.same_host(&HostAddr::Mac(mac)))
+                .map(|entry| entry.name.clone())
+                .or_else(|| self.roster.find(&HostAddr::Mac(mac)).map(|row| row.title()))
+                .unwrap_or_else(|| "Typed address".into()),
+            None => "No host picked".into(),
+        }
+    }
+
+    fn via_label(&self) -> String {
+        if let Some(addr) = self.direct {
+            return format!("via {}", addr.kind());
+        }
+        let row = self
+            .peer
+            .parse()
+            .and_then(|mac| self.roster.find(&HostAddr::Mac(mac)));
+        let (v4, v6) = row
+            .map(|row| (row.ipv4.clone(), row.ipv6.clone()))
+            .unwrap_or_default();
+        match active_layer(self.layer, &v4, &v6) {
+            Layer::L2 => "via Ethernet (L2)".into(),
+            Layer::V4(ip) => format!("via IPv4 {ip}"),
+            Layer::V6(ip) => format!("via IPv6 {ip}"),
+        }
     }
 
     fn path_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -668,55 +1011,309 @@ impl Desk {
         row
     }
 
-    fn device_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Saved, Recent, and Discovered in one picker with a filter. The list
+    /// scrolls on its own so a long roster does not push the page around.
+    fn host_picker(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let board = self.scan.board();
-        let selected = self.peer.parse();
-        let mut list = div().flex().flex_col().gap_2().w_full().min_w_0();
-        if board.devices.is_empty() {
-            let text = if let Some(err) = board.error.clone() {
-                err
-            } else if board.looking {
-                "Looking for hosts…".into()
-            } else {
-                "No hosts answered.".into()
-            };
-            let color = if board.error.is_some() { DANGER } else { MUTED };
+        let now = now_secs();
+        let idle = self.link.role() == Role::Idle;
+        let filter = self.filter.clone();
+        let mut list = div().flex().flex_col().gap_1().w_full().min_w_0().flex_none();
+        let mut shown = 0usize;
+        let mut empty = String::new();
+        match self.tab {
+            HostTab::Saved => {
+                for index in self.book.saved_order() {
+                    let entry = self.book.saved[index].clone();
+                    let address = format!("{} · {}", entry.addr.display(), entry.addr.kind());
+                    if !matches_filter(&filter, &[&entry.name, &address]) {
+                        continue;
+                    }
+                    shown += 1;
+                    let presence = self.roster.presence(&entry.addr);
+                    let row = self.saved_row(index, entry.name.clone(), entry.addr, address, presence, now, idle, window, cx);
+                    list = list.child(row);
+                }
+                if shown == 0 {
+                    empty = if self.book.saved.is_empty() {
+                        "Nothing saved yet. Use Add host, or Save on a Recent or Discovered host.".into()
+                    } else {
+                        "No saved host matches the filter.".into()
+                    };
+                }
+            }
+            HostTab::Recent => {
+                for (index, entry) in self.book.recent.clone().into_iter().enumerate() {
+                    let address = format!("{} · {}", entry.addr.display(), entry.addr.kind());
+                    if !matches_filter(&filter, &[&entry.name, &address]) {
+                        continue;
+                    }
+                    shown += 1;
+                    let presence = self.roster.presence(&entry.addr);
+                    let saved = self.book.saved_index(&entry.addr).is_some();
+                    let status = format!("{} · used {}", presence.label(now), ago(now, entry.at));
+                    let selected = self.is_target(&entry.addr);
+                    let name = entry.name.clone();
+                    let addr = entry.addr;
+                    let actions = div()
+                        .flex()
+                        .flex_row()
+                        .flex_none()
+                        .gap_1()
+                        .child(save_chip(
+                            SharedString::from(format!("recent-save-{index}")),
+                            saved,
+                            cx.listener({
+                                let name = name.clone();
+                                move |desk, _, _, cx| {
+                                    cx.stop_propagation();
+                                    desk.book.save(&name, addr, now_secs());
+                                    desk.persist_hosts();
+                                    cx.notify();
+                                }
+                            }),
+                        ))
+                        .child(small_chip(
+                            SharedString::from(format!("recent-remove-{index}")),
+                            "Remove",
+                            None,
+                            true,
+                            cx.listener(move |desk, _, _, cx| {
+                                cx.stop_propagation();
+                                desk.book.remove_recent(index);
+                                desk.persist_hosts();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(self.connect_chip(format!("recent-go-{index}"), name.clone(), addr, idle, cx));
+                    let (lead, summary) = self.row_extras(&addr);
+                    list = list.child(host_row(
+                        SharedString::from(format!("recent-{index}")),
+                        Some(lead),
+                        row_title(name.clone()),
+                        address,
+                        summary,
+                        status,
+                        presence_color(presence),
+                        selected,
+                        actions,
+                        cx.listener(move |desk, _: &ClickEvent, _, cx| {
+                            desk.pick(&name, addr);
+                            cx.notify();
+                        }),
+                    ));
+                }
+                if shown == 0 {
+                    empty = if self.book.recent.is_empty() {
+                        "Hosts you connect to show up here.".into()
+                    } else {
+                        "No recent host matches the filter.".into()
+                    };
+                }
+            }
+            HostTab::Discovered => {
+                let details = self.open.devices;
+                let rows: Vec<_> = self.roster.ordered().into_iter().cloned().collect();
+                for row in rows {
+                    let title = row.title();
+                    let summary = row_summary(row.caps.as_ref());
+                    let address = row.address_line();
+                    if !matches_filter(&filter, &[&title, &address, &summary]) {
+                        continue;
+                    }
+                    shown += 1;
+                    let mac = row.mac;
+                    let key = format_mac(row.key).replace(':', "");
+                    let found = board.devices.iter().find(|device| device.key == row.key).cloned();
+                    let picture = self.thumbnail_image(row.key, row.thumbnail.as_deref());
+                    let caps_lines = row.caps.as_ref().map(caps_details).unwrap_or_default();
+                    // A host heard only over UDP is dialed by IP: raw Ethernet is
+                    // not working here, and every host shares one L2 identity.
+                    let udp_only = found.as_ref().is_some_and(|device| device.via_udp && !device.via_l2);
+                    let target = match (udp_only, row.ipv4.first(), row.ipv6.first()) {
+                        (true, Some(ip), _) => HostAddr::Ip { ip: IpAddr::V4(*ip), port: row.port },
+                        (true, None, Some(ip)) => HostAddr::Ip { ip: IpAddr::V6(*ip), port: row.port },
+                        _ => HostAddr::Mac(mac),
+                    };
+                    let status = match (&found, row.online) {
+                        (Some(device), true) => format!("Online · {}", ms(device.stats.avg_ms)),
+                        _ => Presence::Seen(row.last_seen).label(now),
+                    };
+                    let color = if row.online { HOST_GREEN } else { MUTED };
+                    let selected = self.is_target(&target);
+                    let saved = self.book.saved_index(&target).is_some();
+                    let extra = match (&found, details) {
+                        (Some(device), true) => {
+                            let applied = self.applied(mac);
+                            let selection = top_selection(
+                                &applied.video,
+                                &applied.audio,
+                                &self.local_video,
+                                &self.local_audio,
+                                device.video.as_deref(),
+                                device.audio.as_deref(),
+                                applied.skip_without_hw,
+                                applied.fps,
+                                None,
+                            );
+                            Some(device_details(device, &selection, &caps_lines).into_any_element())
+                        }
+                        (None, true) => Some(
+                            muted_line("Not in the latest discovery burst.".into()).into_any_element(),
+                        ),
+                        _ => None,
+                    };
+                    let actions = div()
+                        .flex()
+                        .flex_row()
+                        .flex_none()
+                        .gap_1()
+                        .child(save_chip(
+                            SharedString::from(format!("found-save-{key}")),
+                            saved,
+                            cx.listener({
+                                let title = title.clone();
+                                move |desk, _, _, cx| {
+                                    cx.stop_propagation();
+                                    desk.book.save(&title, target, now_secs());
+                                    desk.persist_hosts();
+                                    cx.notify();
+                                }
+                            }),
+                        ))
+                        .child(self.connect_chip(
+                            format!("found-go-{key}"),
+                            title.clone(),
+                            target,
+                            idle,
+                            cx,
+                        ));
+                    let row_el = host_row(
+                        SharedString::from(format!("found-{key}")),
+                        Some(thumb_slot(picture)),
+                        row_title(title.clone()),
+                        address,
+                        summary,
+                        status,
+                        color,
+                        selected,
+                        actions,
+                        cx.listener(move |desk, _: &ClickEvent, _, cx| {
+                            desk.pick(&title, target);
+                            cx.notify();
+                        }),
+                    );
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .w_full()
+                            .min_w_0()
+                            .child(row_el)
+                            .when_some(extra, |col, extra| {
+                                col.child(div().w_full().min_w_0().px_3().pb_2().child(extra))
+                            }),
+                    );
+                }
+                if shown == 0 {
+                    empty = if let Some(err) = board.error.clone() {
+                        err
+                    } else if !self.roster.is_empty() {
+                        "No discovered host matches the filter.".into()
+                    } else if board.looking {
+                        "Looking for hosts…".into()
+                    } else {
+                        "No hosts answered.".into()
+                    };
+                }
+            }
+        }
+        let scan_error = board.error.clone();
+        let empty_color = if self.tab == HostTab::Discovered && scan_error.is_some() {
+            DANGER
+        } else {
+            MUTED
+        };
+        if shown == 0 {
             list = list.child(
                 div()
                     .w_full()
                     .min_w_0()
-                    .text_color(rgb(color))
+                    .py_2()
+                    .text_color(rgb(empty_color))
                     .whitespace_normal()
-                    .child(text),
+                    .child(empty),
             );
-        } else {
-            for (index, device) in board.devices.iter().enumerate() {
-                let mac = device.l2_mac;
-                let on = selected == Some(mac);
-                let applied = self.applied(mac);
-                let selection = top_selection(
-                    &applied.video,
-                    &applied.audio,
-                    &self.local_video,
-                    &self.local_audio,
-                    device.video.as_deref(),
-                    device.audio.as_deref(),
-                    applied.skip_without_hw,
-                    applied.fps,
-                    None,
+        } else if self.tab == HostTab::Discovered {
+            if let Some(err) = scan_error.clone() {
+                list = list.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .py_1()
+                        .text_color(rgb(DANGER))
+                        .whitespace_normal()
+                        .child(err),
                 );
-                list = list.child(device_card(
-                    SharedString::from(format!("dev-{index}")),
-                    device,
-                    &selection,
-                    on,
-                    cx.listener(move |desk, _: &ClickEvent, _, cx| {
-                        desk.peer = HexMac::from_bytes(mac);
-                        cx.notify();
-                    }),
-                ));
             }
         }
+        let tabs = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .min_w_0()
+            .child(tab_chip(
+                "tab-saved",
+                format!("Saved {}", self.book.saved.len()),
+                self.tab == HostTab::Saved,
+                cx.listener(|desk, _, _, cx| desk.set_tab(HostTab::Saved, cx)),
+            ))
+            .child(tab_chip(
+                "tab-recent",
+                format!("Recent {}", self.book.recent.len()),
+                self.tab == HostTab::Recent,
+                cx.listener(|desk, _, _, cx| desk.set_tab(HostTab::Recent, cx)),
+            ))
+            .child(tab_chip(
+                "tab-found",
+                if scan_error.is_some() {
+                    "Discovered !".to_string()
+                } else {
+                    format!(
+                        "Discovered {}/{}",
+                        self.roster.online_count(),
+                        self.roster.len()
+                    )
+                },
+                self.tab == HostTab::Discovered,
+                cx.listener(|desk, _, _, cx| desk.set_tab(HostTab::Discovered, cx)),
+            ));
+        let filter_field = text_field(
+            "host-filter",
+            &self.filter_focus,
+            self.filter_focus.is_focused(window),
+            &self.filter,
+            "Filter by name or address",
+        )
+        .flex_1()
+        .on_click(cx.listener(|desk, _: &ClickEvent, window, cx| {
+            window.focus(&desk.filter_focus);
+            cx.notify();
+        }))
+        .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, _, cx| {
+            match edit_text(&mut desk.filter, ev, cx) {
+                Edit::Cancel => desk.filter.clear(),
+                Edit::Changed | Edit::Submit | Edit::Ignored => {}
+            }
+            desk.list_scroll.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        }));
+        let add_form = self.add_open.then(|| self.add_form(window, cx));
+        let looking = board.looking;
+        let details_on = self.open.devices;
+        let on_found = self.tab == HostTab::Discovered;
         div()
             .flex()
             .flex_col()
@@ -730,27 +1327,600 @@ impl Desk {
                     .flex_row()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .w_full()
                     .min_w_0()
-                    .child(section_label("Devices"))
+                    .child(tabs)
                     .child(
                         div()
                             .flex()
                             .flex_row()
+                            .flex_none()
                             .items_center()
                             .gap_2()
+                            // Fixed width so "Looking…" coming and going moves nothing.
                             .child(
                                 div()
+                                    .w(px(64.))
                                     .text_color(rgb(MUTED))
-                                    .when(board.looking, |row| row.child("Looking…")),
+                                    .when(looking, |row| row.child("Looking…")),
                             )
+                            .when(on_found, |row| {
+                                row.child(small_chip(
+                                    "found-details",
+                                    if details_on { "Hide details" } else { "Details" },
+                                    None,
+                                    true,
+                                    cx.listener(|desk, _, _, cx| {
+                                        desk.open.devices = !desk.open.devices;
+                                        cx.notify();
+                                    }),
+                                ))
+                            })
                             .child(refresh_chip(cx.listener(|desk, _, _, cx| {
                                 desk.scan.refresh(desk.nic.clone());
                                 cx.notify();
                             }))),
                     ),
             )
-            .child(list)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(filter_field)
+                    .child(small_chip(
+                        "add-host",
+                        if self.add_open { "Close" } else { "Add host" },
+                        Some(PLAYER_BLUE),
+                        true,
+                        cx.listener(|desk, _, window, cx| {
+                            desk.add_open = !desk.add_open;
+                            desk.add_error = None;
+                            if desk.add_open {
+                                window.focus(&desk.add_name_focus);
+                            }
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .when_some(add_form, |col, form| col.child(form))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .child(
+                        div()
+                            .id("host-list")
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            // Fixed, so switching tabs or a short list moves nothing below.
+                            .h(px(HOST_LIST_MAX_H))
+                            .overflow_y_scroll()
+                            .overflow_x_hidden()
+                            .track_scroll(&self.list_scroll)
+                            .on_scroll_wheel(cx.listener(|desk, _: &ScrollWheelEvent, _, cx| {
+                                // The list scrolled; keep the page where it is.
+                                if max_scroll(&desk.list_scroll) > 0.5 {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .child(div().w_full().pr(px(BAR_W + 2.)).child(list)),
+                    )
+                    .child(self.scrollbar(Bar::List, cx)),
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn saved_row(
+        &mut self,
+        index: usize,
+        name: String,
+        addr: HostAddr,
+        address: String,
+        presence: Presence,
+        now: u64,
+        idle: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.is_target(&addr);
+        let renaming = self
+            .renaming
+            .as_ref()
+            .filter(|(at, _)| *at == index)
+            .map(|(_, text)| text.clone());
+        let confirming = self.confirm_delete == Some(index);
+        let title: AnyElement = match &renaming {
+            Some(text) => text_field(
+                "rename-field",
+                &self.rename_focus,
+                self.rename_focus.is_focused(window),
+                text,
+                "Name",
+            )
+            .h(px(26.))
+            .on_click(cx.listener(|desk, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                window.focus(&desk.rename_focus);
+            }))
+            .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, _, cx| {
+                let Some((at, text)) = desk.renaming.as_mut() else {
+                    return;
+                };
+                let at = *at;
+                match edit_text(text, ev, cx) {
+                    Edit::Submit => desk.finish_rename(at),
+                    Edit::Cancel => desk.renaming = None,
+                    Edit::Changed | Edit::Ignored => {}
+                }
+                cx.notify();
+            }))
+            .into_any_element(),
+            None => row_title(name.to_string()).into_any_element(),
+        };
+        let actions = if confirming {
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .child(div().text_color(rgb(DANGER)).child("Delete?"))
+                .child(small_chip(
+                    SharedString::from(format!("saved-del-yes-{index}")),
+                    "Delete",
+                    Some(DANGER),
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        cx.stop_propagation();
+                        desk.book.delete_saved(index);
+                        desk.confirm_delete = None;
+                        desk.renaming = None;
+                        desk.persist_hosts();
+                        cx.notify();
+                    }),
+                ))
+                .child(small_chip(
+                    SharedString::from(format!("saved-del-no-{index}")),
+                    "Keep",
+                    None,
+                    true,
+                    cx.listener(|desk, _, _, cx| {
+                        cx.stop_propagation();
+                        desk.confirm_delete = None;
+                        cx.notify();
+                    }),
+                ))
+        } else if renaming.is_some() {
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .gap_1()
+                .child(small_chip(
+                    SharedString::from(format!("saved-ren-ok-{index}")),
+                    "Save",
+                    Some(PLAYER_BLUE),
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        cx.stop_propagation();
+                        desk.finish_rename(index);
+                        cx.notify();
+                    }),
+                ))
+                .child(small_chip(
+                    SharedString::from(format!("saved-ren-no-{index}")),
+                    "Cancel",
+                    None,
+                    true,
+                    cx.listener(|desk, _, _, cx| {
+                        cx.stop_propagation();
+                        desk.renaming = None;
+                        cx.notify();
+                    }),
+                ))
+        } else {
+            let current = name.to_string();
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .gap_1()
+                .child(small_chip(
+                    SharedString::from(format!("saved-ren-{index}")),
+                    "Rename",
+                    None,
+                    true,
+                    cx.listener(move |desk, _, window, cx| {
+                        cx.stop_propagation();
+                        desk.confirm_delete = None;
+                        desk.renaming = Some((index, current.clone()));
+                        window.focus(&desk.rename_focus);
+                        cx.notify();
+                    }),
+                ))
+                .child(small_chip(
+                    SharedString::from(format!("saved-del-{index}")),
+                    "Delete",
+                    None,
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        cx.stop_propagation();
+                        desk.renaming = None;
+                        desk.confirm_delete = Some(index);
+                        cx.notify();
+                    }),
+                ))
+                .child(self.connect_chip(format!("saved-go-{index}"), name.clone(), addr, idle, cx))
+        };
+        let pick_name = name.to_string();
+        let (lead, summary) = self.row_extras(&addr);
+        host_row(
+            SharedString::from(format!("saved-{index}")),
+            Some(lead),
+            title,
+            address,
+            summary,
+            presence.label(now),
+            presence_color(presence),
+            selected,
+            actions,
+            cx.listener(move |desk, _: &ClickEvent, _, cx| {
+                desk.pick(&pick_name, addr);
+                cx.notify();
+            }),
+        )
+        .into_any_element()
+    }
+
+    fn add_form(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let name = text_field(
+            "add-name",
+            &self.add_name_focus,
+            self.add_name_focus.is_focused(window),
+            &self.add_name,
+            "Name (optional)",
+        )
+        .flex_1()
+        .on_click(cx.listener(|desk, _: &ClickEvent, window, cx| {
+            window.focus(&desk.add_name_focus);
+            cx.notify();
+        }))
+        .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, window, cx| {
+            if ev.keystroke.key == "tab" {
+                window.focus(&desk.add_addr_focus);
+            } else {
+                match edit_text(&mut desk.add_name, ev, cx) {
+                    Edit::Submit => desk.submit_add(),
+                    Edit::Cancel => desk.add_open = false,
+                    Edit::Changed | Edit::Ignored => {}
+                }
+            }
+            cx.notify();
+        }));
+        let addr = text_field(
+            "add-addr",
+            &self.add_addr_focus,
+            self.add_addr_focus.is_focused(window),
+            &self.add_addr,
+            "aa:bb:cc:dd:ee:ff or 192.168.0.5:4433",
+        )
+        .flex_1()
+        .on_click(cx.listener(|desk, _: &ClickEvent, window, cx| {
+            window.focus(&desk.add_addr_focus);
+            cx.notify();
+        }))
+        .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, window, cx| {
+            if ev.keystroke.key == "tab" {
+                window.focus(&desk.add_name_focus);
+            } else {
+                match edit_text(&mut desk.add_addr, ev, cx) {
+                    Edit::Submit => desk.submit_add(),
+                    Edit::Cancel => desk.add_open = false,
+                    Edit::Changed | Edit::Ignored => {}
+                }
+            }
+            cx.notify();
+        }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .p_3()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(CARD_EDGE))
+            .rounded_md()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(name)
+                    .child(addr)
+                    .child(small_chip(
+                        "add-save",
+                        "Save",
+                        Some(PLAYER_BLUE),
+                        true,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.submit_add();
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(match self.add_error.clone() {
+                Some(err) => div()
+                    .w_full()
+                    .text_color(rgb(DANGER))
+                    .whitespace_normal()
+                    .child(err),
+                None => div().w_full().text_color(rgb(MUTED)).whitespace_normal().child(
+                    "A MAC address connects over Ethernet. An IP address, with an optional port, connects over UDP.",
+                ),
+            })
+    }
+
+    fn submit_add(&mut self) {
+        match HostAddr::parse(&self.add_addr) {
+            Ok(addr) => {
+                if let Some(index) = self.book.saved_index(&addr) {
+                    self.add_error = Some(format!(
+                        "Already saved as \u{201c}{}\u{201d}.",
+                        self.book.saved[index].name
+                    ));
+                    return;
+                }
+                self.book.save(&self.add_name, addr, now_secs());
+                self.persist_hosts();
+                self.add_name.clear();
+                self.add_addr.clear();
+                self.add_error = None;
+                self.add_open = false;
+                self.tab = HostTab::Saved;
+            }
+            Err(err) => self.add_error = Some(err),
+        }
+    }
+
+    fn finish_rename(&mut self, index: usize) {
+        if let Some((at, text)) = self.renaming.take() {
+            if at == index {
+                self.book.rename_saved(index, &text);
+                self.persist_hosts();
+            }
+        }
+    }
+
+    fn set_tab(&mut self, tab: HostTab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.renaming = None;
+            self.confirm_delete = None;
+            self.list_scroll.set_offset(point(px(0.), px(0.)));
+        }
+        cx.notify();
+    }
+
+    fn connect_chip(
+        &mut self,
+        id: String,
+        name: String,
+        addr: HostAddr,
+        idle: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        small_chip(
+            SharedString::from(id),
+            "Connect",
+            Some(PLAYER_BLUE),
+            idle,
+            cx.listener(move |desk, _, window, cx| {
+                cx.stop_propagation();
+                if desk.link.role() != Role::Idle {
+                    return;
+                }
+                desk.pick(&name, addr);
+                desk.on_connect(window, cx);
+            }),
+        )
+        .into_any_element()
+    }
+
+    /// Make this host the one Connect dials.
+    fn pick(&mut self, name: &str, addr: HostAddr) {
+        self.target_name = Some(name.to_string());
+        match addr {
+            HostAddr::Mac(mac) => {
+                self.direct = None;
+                self.peer = HexMac::from_bytes(mac);
+                self.layer = Layer::L2;
+            }
+            HostAddr::Ip { .. } => {
+                self.direct = Some(addr);
+                self.peer = match self.roster.find(&addr) {
+                    Some(row) => HexMac::from_bytes(row.mac),
+                    None => HexMac::default(),
+                };
+            }
+        }
+    }
+
+    fn is_target(&self, addr: &HostAddr) -> bool {
+        match (self.direct, addr) {
+            (Some(direct), _) => direct.same_host(addr),
+            (None, HostAddr::Mac(mac)) => self.peer.parse() == Some(*mac),
+            (None, HostAddr::Ip { .. }) => false,
+        }
+    }
+
+    fn persist_hosts(&mut self) {
+        if let Err(err) = store_hosts(&self.book) {
+            self.message = Some(format!("Hosts were not saved: {err}"));
+        }
+    }
+
+    /// Fold a finished discovery burst into the roster, and move a connect that
+    /// came up into Recent.
+    fn track_hosts(&mut self) {
+        let board = self.scan.board();
+        if board.burst != self.roster_burst {
+            self.roster_burst = board.burst;
+            let sightings: Vec<Sighting> = board
+                .devices
+                .iter()
+                .map(|device| Sighting {
+                    key: device.key,
+                    mac: device.l2_mac,
+                    caps: device.caps.clone(),
+                    thumbnail: device.thumbnail.clone(),
+                    name: device.name.trim().to_string(),
+                    ipv4: device.ipv4.clone(),
+                    ipv6: device.ipv6.clone(),
+                    port: device.l3_port,
+                })
+                .collect();
+            self.roster.update(&sightings, now_secs());
+        }
+        if self.pending_recent.is_some() {
+            match self.link.role() {
+                Role::Client => {
+                    if self.link.status().starts_with("Viewing ") {
+                        if let Some((name, addr)) = self.pending_recent.take() {
+                            self.book.record_recent(&name, addr, now_secs());
+                            self.persist_hosts();
+                        }
+                    }
+                }
+                _ => self.pending_recent = None,
+            }
+        }
+    }
+
+    fn scroll_handle(&self, bar: Bar) -> &ScrollHandle {
+        match bar {
+            Bar::Page => &self.page_scroll,
+            Bar::List => &self.list_scroll,
+        }
+    }
+
+    /// Track and thumb drawn over the space the content leaves free on the right.
+    fn scrollbar(&mut self, bar: Bar, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = self.scroll_handle(bar);
+        let geometry = scrollbar::thumb(viewport(handle), max_scroll(handle), scrolled(handle));
+        let dragging = self.drag.is_some_and(|drag| drag.bar == bar);
+        let id = match bar {
+            Bar::Page => "page-bar",
+            Bar::List => "list-bar",
+        };
+        div()
+            .id(id)
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(BAR_W))
+            .when_some(geometry, |track, thumb| {
+                track
+                    .rounded_full()
+                    .bg(rgb(0x1a1e27))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |desk, ev: &MouseDownEvent, _, cx| {
+                            let handle = desk.scroll_handle(bar);
+                            let top = f32::from(handle.bounds().origin.y);
+                            let y = f32::from(ev.position.y) - top;
+                            let down = y > thumb.top + thumb.height;
+                            if y >= thumb.top && !down {
+                                return;
+                            }
+                            let next = scrollbar::page(
+                                scrolled(handle),
+                                viewport(handle),
+                                max_scroll(handle),
+                                down,
+                            );
+                            handle.set_offset(point(px(0.), px(-next)));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{id}-thumb")))
+                            .absolute()
+                            .left(px(3.))
+                            .w(px(BAR_W - 6.))
+                            .top(px(thumb.top))
+                            .h(px(thumb.height))
+                            .rounded_full()
+                            .bg(rgb(if dragging { 0x6b7587 } else { 0x434b5a }))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |desk, ev: &MouseDownEvent, _, cx| {
+                                    let start = scrolled(desk.scroll_handle(bar));
+                                    desk.drag = Some(Drag {
+                                        bar,
+                                        start_y: f32::from(ev.position.y),
+                                        start,
+                                    });
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+            })
+    }
+
+    fn on_drag_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.drag = None;
+            cx.notify();
+            return;
+        }
+        let handle = self.scroll_handle(drag.bar);
+        let max = max_scroll(handle);
+        let Some(thumb) = scrollbar::thumb(viewport(handle), max, scrolled(handle)) else {
+            return;
+        };
+        let next = scrollbar::drag_to(
+            drag.start,
+            f32::from(ev.position.y) - drag.start_y,
+            max,
+            thumb.travel,
+        );
+        handle.set_offset(point(px(0.), px(-next)));
+        cx.notify();
+    }
+
+    /// Scrollbar inputs come from the last layout. When they change, draw once
+    /// more so the thumb matches the content that was just laid out.
+    fn settle_scrollbars(&mut self, window: &mut Window) {
+        let sig = [
+            viewport(&self.page_scroll),
+            max_scroll(&self.page_scroll),
+            viewport(&self.list_scroll),
+            max_scroll(&self.list_scroll),
+        ];
+        if sig != self.bar_sig {
+            self.bar_sig = sig;
+            window.request_animation_frame();
+        }
     }
 
     fn apply_backend_order(&mut self) {
@@ -850,25 +2020,6 @@ impl Desk {
             }
         }
         row
-    }
-
-    fn connection_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mac = self.peer.parse();
-        let controls = mac.map(|mac| self.connection_controls(mac, cx));
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .w_full()
-            .min_w_0()
-            .flex_none()
-            .child(section_label("This connection"))
-            .when(mac.is_none(), |panel| {
-                panel.child(muted_line(
-                    "Select a computer to choose its picture, audio, and rate.".into(),
-                ))
-            })
-            .when_some(controls, |panel, controls| panel.child(controls))
     }
 
     fn connection_controls(&mut self, mac: [u8; 6], cx: &mut Context<Self>) -> impl IntoElement {
@@ -1162,35 +2313,808 @@ impl Desk {
         }
     }
 
-    fn preferences(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let local = local_video_line(&self.local_video);
-        let audio_local = if self.local_audio.opus {
-            "PCM, Opus"
-        } else {
-            "PCM"
-        };
-        let skip_without_hw = self.skip_without_hw;
-        let trace_input = self.trace_input;
-        let capturing = self.capturing;
-        let peer = self.peer.parse();
-        let board = self.scan.board();
-        let connection = peer.and_then(|mac| {
-            let applied = self.applied(mac);
-            let device = board.devices.iter().find(|device| device.l2_mac == mac)?;
-            Some((
-                remote_hardware_line(device.video.as_deref()),
-                video_match_line(
-                    &applied.video,
-                    &self.local_video,
-                    device.video.as_deref(),
-                    applied.skip_without_hw,
-                ),
-                audio_match_line(&applied.audio, &self.local_audio, device.audio.as_deref()),
-                remote_backend_line(device.audio.as_deref()),
-            ))
+    /// Re-read this computer's sound devices and controllers.
+    /// List sound devices and controllers off the UI thread. On macOS the
+    /// first CoreAudio probe can wait on the microphone permission prompt, and
+    /// the window must not wait with it.
+    fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+        if self.devices_loading {
+            return;
+        }
+        self.devices_loading = true;
+        let task = cx.background_executor().spawn(async move {
+            let (outputs, inputs) = etherquic_play::audio_devices();
+            (outputs, inputs, etherquic_play::hostinfo::local_pads())
         });
+        cx.spawn(async move |this, cx| {
+            let (outputs, inputs, pads) = task.await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.local_outputs = outputs;
+                desk.local_inputs = inputs;
+                desk.local_pads = pads;
+                desk.devices_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Push Settings to whatever reads them now: the open view, the next shared
+    /// session's sound source, and the network driver. `persist` also saves them.
+    fn apply_settings(&mut self, persist: bool) {
+        let view = etherquic_ui::live_view();
+        let next = self.settings.view();
+        match view.lock() {
+            Ok(mut guard) => *guard = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
+        etherquic_ui::set_host_audio_device(self.settings.share_device.clone());
+        etherquic::set_l2_preference(self.settings.network.l2_id());
+        if persist {
+            if let Err(err) = store_settings(&self.settings) {
+                self.message = Some(format!("Settings were not saved: {err}"));
+            }
+        }
+    }
+
+    fn edit_settings(&mut self, edit: impl FnOnce(&mut Settings)) {
+        edit(&mut self.settings);
+        self.apply_settings(true);
+    }
+
+    /// Make the current value of `fields` the user's default.
+    fn make_default(&mut self, fields: &[Field]) {
+        for field in fields {
+            self.defaults.take(&self.settings, *field);
+        }
+        if let Err(err) = store_defaults(&self.defaults) {
+            self.message = Some(format!("Defaults were not saved: {err}"));
+        }
+    }
+
+    /// Put a section, or everything with `None`, back to the user's defaults.
+    /// `factory` also forgets those defaults first.
+    fn reset_settings(&mut self, section: Option<Section>, factory: bool) {
+        if factory {
+            self.defaults = Settings::default();
+            if let Err(err) = store_defaults(&self.defaults) {
+                self.message = Some(format!("Defaults were not saved: {err}"));
+            }
+        }
+        let base = self.defaults.clone();
+        let sections: Vec<Section> = match section {
+            Some(section) => vec![section],
+            None => Section::ALL.to_vec(),
+        };
+        for section in sections {
+            self.settings.reset(section, &base);
+            match section {
+                Section::Capture => self.fps = FrameRate::Auto,
+                Section::Sound => {
+                    self.backend_pref = etherquic::default_backend_order().to_vec();
+                    self.apply_backend_order();
+                }
+                Section::Codecs => {
+                    self.video_pref = default_video();
+                    self.audio_pref = default_audio();
+                    self.skip_without_hw = false;
+                    self.session_video = None;
+                    self.session_audio = None;
+                }
+                Section::Input => self.trace_input = false,
+                Section::Appearance | Section::Network | Section::Language => {}
+            }
+        }
+        self.persist();
+        self.apply_settings(true);
+    }
+
+    /// Scroll the page so Settings starts near the top, once it is laid out.
+    fn follow_settings_scroll(&mut self, window: &mut Window) {
+        if self.scroll_to_settings == 0 {
+            return;
+        }
+        self.scroll_to_settings -= 1;
+        if self.scroll_to_settings > 0 {
+            window.request_animation_frame();
+            return;
+        }
+        let handle = &self.page_scroll;
+        let top = f32::from(handle.bounds().origin.y);
+        let now = -f32::from(handle.offset().y);
+        let want = (self.settings_y.get() - top + now - 8.).clamp(0., max_scroll(handle).max(0.));
+        handle.set_offset(point(px(0.), px(-want)));
+        window.request_animation_frame();
+    }
+
+    /// The host Connect will dial, as discovery last heard it.
+    fn selected_row(&self) -> Option<RosterRow> {
+        if let Some(addr) = self.direct {
+            return self.roster.find(&addr).cloned();
+        }
+        let mac = self.peer.parse()?;
+        self.roster.find(&HostAddr::Mac(mac)).cloned()
+    }
+
+    /// Ethernet, IPv4, and IPv6 for the picked host. Picking one fills the field.
+    fn transport_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let row = self.selected_row();
+        let mac = row.as_ref().map(|row| row.mac).or_else(|| self.peer.parse());
+        let (direct_v4, direct_v6, direct_port) = match self.direct {
+            Some(HostAddr::Ip { ip: IpAddr::V4(ip), port }) => (Some(ip), None, port),
+            Some(HostAddr::Ip { ip: IpAddr::V6(ip), port }) => (None, Some(ip), port),
+            _ => (None, None, 0),
+        };
+        let v4 = row.as_ref().and_then(|row| row.ipv4.first().copied()).or(direct_v4);
+        let v6 = row.as_ref().and_then(|row| row.ipv6.first().copied()).or(direct_v6);
+        let port = row.as_ref().map(|row| row.port).filter(|port| *port != 0).unwrap_or(direct_port);
+        let (all_v4, all_v6) = row
+            .as_ref()
+            .map(|row| (row.ipv4.clone(), row.ipv6.clone()))
+            .unwrap_or_default();
+        let active = match self.direct {
+            Some(HostAddr::Ip { ip: IpAddr::V4(_), .. }) => 1,
+            Some(HostAddr::Ip { ip: IpAddr::V6(_), .. }) => 2,
+            _ => match active_layer(self.layer, &all_v4, &all_v6) {
+                Layer::L2 => 0,
+                Layer::V4(_) => 1,
+                Layer::V6(_) => 2,
+            },
+        };
+        let tab = |id: &'static str, (kind, address): (&'static str, String), on: bool, enabled: bool| {
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .h(px(38.))
+                .px_2()
+                .justify_center()
+                .overflow_hidden()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+                .bg(rgb(if on { 0x243044 } else { BG }))
+                .text_xs()
+                .text_color(rgb(if on { TEXT } else { MUTED }))
+                .when(!enabled, |tab| tab.opacity(0.45))
+                .when(enabled, |tab| tab.cursor_pointer())
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(16.))
+                        .line_height(px(16.))
+                        .overflow_hidden()
+                        .when(on, |line| line.font_weight(FontWeight::BOLD))
+                        .child(kind),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(16.))
+                        .line_height(px(16.))
+                        .overflow_hidden()
+                        .whitespace_normal()
+                        .child(address),
+                )
+        };
+        let ether_label = (
+            "Ethernet",
+            mac.map(format_mac).unwrap_or_else(|| "no MAC address".into()),
+        );
+        let v4_label = ("IPv4", v4.map(|ip| ip.to_string()).unwrap_or_else(|| "not announced".into()));
+        let v6_label = ("IPv6", v6.map(|ip| ip.to_string()).unwrap_or_else(|| "not announced".into()));
+        div()
+            .flex()
+            .flex_row()
+            .gap_1()
+            .w_full()
+            .min_w_0()
+            .child(
+                tab("via-l2", ether_label, active == 0, mac.is_some()).when_some(mac, |tab, mac| {
+                    tab.on_click(cx.listener(move |desk, _, _, cx| {
+                        desk.direct = None;
+                        desk.layer = Layer::L2;
+                        desk.peer = HexMac::from_bytes(mac);
+                        cx.notify();
+                    }))
+                }),
+            )
+            .child(tab("via-v4", v4_label, active == 1, v4.is_some()).when_some(v4, |tab, ip| {
+                tab.on_click(cx.listener(move |desk, _, _, cx| {
+                    desk.direct = Some(HostAddr::Ip { ip: IpAddr::V4(ip), port });
+                    desk.layer = Layer::V4(ip);
+                    cx.notify();
+                }))
+            }))
+            .child(tab("via-v6", v6_label, active == 2, v6.is_some()).when_some(v6, |tab, ip| {
+                tab.on_click(cx.listener(move |desk, _, _, cx| {
+                    desk.direct = Some(HostAddr::Ip { ip: IpAddr::V6(ip), port });
+                    desk.layer = Layer::V6(ip);
+                    cx.notify();
+                }))
+            }))
+    }
+
+    /// The discovery record of the picked host, for its codecs.
+    fn selected_device(&self) -> Option<Found> {
+        let mac = self.peer.parse()?;
+        self.scan
+            .board()
+            .devices
+            .into_iter()
+            .find(|device| device.l2_mac == mac)
+    }
+
+    /// Video and audio this connection will use, with the unsaved pick first.
+    fn codec_choice(&self) -> (Option<PicturePref>, Option<AudioId>, bool, bool) {
+        let mac = self.peer.parse();
+        let applied = match mac {
+            Some(mac) => self.applied(mac),
+            None => apply_override(&self.preferences_now(), None),
+        };
+        let pins = mac.and_then(|mac| self.connections.get(&mac_key(mac)).cloned());
+        let mut video = applied.video.clone();
+        if let Some(pick) = self.session_video {
+            move_to_front(&mut video, pick);
+        }
+        let mut audio = applied.audio.clone();
+        if let Some(pick) = self.session_audio {
+            move_to_front(&mut audio, pick);
+        }
+        let device = self.selected_device();
+        let chosen_v = chosen_video(
+            &video,
+            &self.local_video,
+            device.as_ref().and_then(|device| device.video.as_deref()),
+            applied.skip_without_hw,
+        );
+        let chosen_a = chosen_audio(
+            &audio,
+            &self.local_audio,
+            device.as_ref().and_then(|device| device.audio.as_deref()),
+        );
+        let pinned_v = pins.as_ref().is_some_and(|over| over.video.is_some());
+        let pinned_a = pins.as_ref().is_some_and(|over| over.audio.is_some());
+        (chosen_v, chosen_a, pinned_v, pinned_a)
+    }
+
+    /// One codec dropdown with its "Save for" choice when it was changed.
+    fn codec_row(&mut self, which: Menu, cx: &mut Context<Self>) -> impl IntoElement {
+        let (video, audio, pinned_v, pinned_a) = self.codec_choice();
+        let (label, value, overridden, pinned) = match which {
+            Menu::Video => (
+                "Video",
+                video.map(|pref| pref.name()).unwrap_or("none fits"),
+                self.session_video.is_some(),
+                pinned_v,
+            ),
+            Menu::Audio => (
+                "Audio",
+                audio.map(|codec| codec.name()).unwrap_or("none fits"),
+                self.session_audio.is_some(),
+                pinned_a,
+            ),
+        };
+        let shown = if overridden {
+            value.to_string()
+        } else if pinned {
+            format!("{value} · saved for host")
+        } else {
+            format!("Auto · {value}")
+        };
+        let open = self.menu == Some(which);
+        let id = match which {
+            Menu::Video => "codec-video",
+            Menu::Audio => "codec-audio",
+        };
+        let mac = self.peer.parse();
+        let name = self.target_label();
+        let items: Vec<(String, Option<usize>)> = match which {
+            Menu::Video => std::iter::once(("Auto".to_string(), None))
+                .chain(PicturePref::order().into_iter().enumerate().map(|(i, pref)| (pref.name().to_string(), Some(i))))
+                .collect(),
+            Menu::Audio => std::iter::once(("Auto".to_string(), None))
+                .chain(AudioId::order().into_iter().enumerate().map(|(i, codec)| (codec.name().to_string(), Some(i))))
+                .collect(),
+        };
+        let mut menu = div()
+            .id(SharedString::from(format!("{id}-menu")))
+            .flex()
+            .flex_col()
+            .w(px(200.))
+            .p_1()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(PLAYER_BLUE))
+            .rounded_md()
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|desk, _, _, cx| {
+                desk.menu = None;
+                cx.notify();
+            }));
+        for (index, (text, pick)) in items.into_iter().enumerate() {
+            let on = match (pick, which) {
+                (None, _) => !overridden && !pinned,
+                (Some(i), Menu::Video) => overridden && self.session_video == PicturePref::order().get(i).copied(),
+                (Some(i), Menu::Audio) => overridden && self.session_audio == AudioId::order().get(i).copied(),
+            };
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("{id}-item-{index}")))
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(on, |item| item.bg(rgb(0x243044)).font_weight(FontWeight::BOLD))
+                    .hover(|item| item.bg(rgb(0x2a3242)))
+                    .justify_between()
+                    .child(text)
+                    .when(pick.is_none(), |item| item.child(faint_default()))
+                    .on_click(cx.listener(move |desk, _, _, cx| {
+                        match (which, pick) {
+                            (Menu::Video, None) => {
+                                desk.session_video = None;
+                                if let Some(mac) = mac {
+                                    desk.edit_connection(mac, |over| over.video = None);
+                                }
+                            }
+                            (Menu::Audio, None) => {
+                                desk.session_audio = None;
+                                if let Some(mac) = mac {
+                                    desk.edit_connection(mac, |over| over.audio = None);
+                                }
+                            }
+                            (Menu::Video, Some(i)) => desk.session_video = PicturePref::order().get(i).copied(),
+                            (Menu::Audio, Some(i)) => desk.session_audio = AudioId::order().get(i).copied(),
+                        }
+                        desk.menu = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        let save_for = overridden.then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .child(div().text_color(rgb(MUTED)).child("Save for:"))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{id}-save-host")))
+                        .max_w(px(100.))
+                        .h(px(24.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(CARD_EDGE))
+                        .when(mac.is_none(), |chip| chip.opacity(0.45))
+                        .when(mac.is_some(), |chip| chip.cursor_pointer())
+                        .child(
+                            div()
+                                .h(px(16.))
+                                .line_height(px(16.))
+                                .overflow_hidden()
+                                .whitespace_normal()
+                                .child(name.clone()),
+                        )
+                        .when_some(mac, |chip, mac| {
+                            chip.on_click(cx.listener(move |desk, _, _, cx| {
+                                match which {
+                                    Menu::Video => {
+                                        let pick = desk.session_video.take();
+                                        desk.edit_connection(mac, |over| over.video = pick);
+                                    }
+                                    Menu::Audio => {
+                                        let pick = desk.session_audio.take();
+                                        desk.edit_connection(mac, |over| over.audio = pick);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                        }),
+                )
+                .child(div().text_color(rgb(MUTED)).child("|"))
+                .child(
+                    small_chip(
+                        SharedString::from(format!("{id}-save-global")),
+                        "Global",
+                        None,
+                        true,
+                        cx.listener(move |desk, _, _, cx| {
+                            match which {
+                                Menu::Video => {
+                                    if let Some(pick) = desk.session_video.take() {
+                                        move_to_front(&mut desk.video_pref, pick);
+                                    }
+                                }
+                                Menu::Audio => {
+                                    if let Some(pick) = desk.session_audio.take() {
+                                        move_to_front(&mut desk.audio_pref, pick);
+                                    }
+                                }
+                            }
+                            desk.persist();
+                            cx.notify();
+                        }),
+                    ),
+                )
+        });
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .h(px(30.))
+            .child(div().w(px(40.)).flex_none().text_color(rgb(MUTED)).child(label))
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(
+                        div()
+                            .id(id)
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .w(px(150.))
+                            .h(px(28.))
+                            .px_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(if overridden { PLAYER_BLUE } else { CARD_EDGE }))
+                            .bg(rgb(BG))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .h(px(18.))
+                                    .line_height(px(18.))
+                                    .overflow_hidden()
+                                    .whitespace_normal()
+                                    .child(shown),
+                            )
+                            .child(chevron(open))
+                            .on_click(cx.listener(move |desk, _, _, cx| {
+                                desk.menu = if desk.menu == Some(which) { None } else { Some(which) };
+                                cx.notify();
+                            })),
+                    )
+                    .when(open, |anchor| {
+                        anchor.child(
+                            div()
+                                .absolute()
+                                .top(px(30.))
+                                .left_0()
+                                .child(deferred(anchored().snap_to_window().child(menu)).with_priority(1)),
+                        )
+                    }),
+            )
+            .when_some(save_for, |row, save| row.child(save))
+    }
+
+    /// A Settings section: title, the backend this part runs on, and Reset.
+    fn section(
+        &mut self,
+        section: Section,
+        backends: Option<AnyElement>,
+        body: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let reset = self.reset_control(Some(section), cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .p_3()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(CARD_EDGE))
+            .rounded_md()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(120.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(section.title()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            .when_some(backends, |row, list| row.child(list)),
+                    )
+                    .child(reset),
+            )
+            .child(body)
+    }
+
+    /// Reset, then "Reset? / Cancel" in the same fixed box, so nothing moves.
+    fn reset_control(&mut self, target: Option<Section>, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = match target {
+            Some(section) => section.title().to_ascii_lowercase().replace(' ', "-"),
+            None => "all".into(),
+        };
+        let asking = self.confirm_reset == Some(target);
+        let custom = self.defaults != Settings::default();
+        let label: &'static str = if target.is_none() { "Reset all" } else { "Reset" };
+        let mut slot = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .justify_end()
+            .items_center()
+            .gap_1()
+            .w(px(if target.is_none() { 300. } else { 190. }));
+        if asking {
+            let factory_too = target.is_none() && custom;
+            slot = slot
+                .child(div().text_xs().text_color(rgb(DANGER)).child(if factory_too {
+                    "Reset to:"
+                } else {
+                    "Reset to defaults?"
+                }))
+                .child(small_chip(
+                    SharedString::from(format!("reset-yes-{key}")),
+                    if factory_too { "My defaults" } else { "Reset" },
+                    Some(DANGER),
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.reset_settings(target, false);
+                        desk.confirm_reset = None;
+                        cx.notify();
+                    }),
+                ))
+                .when(factory_too, |slot| {
+                    slot.child(small_chip(
+                        "reset-factory",
+                        "Factory",
+                        Some(DANGER),
+                        true,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.reset_settings(None, true);
+                            desk.confirm_reset = None;
+                            cx.notify();
+                        }),
+                    ))
+                })
+                .child(small_chip(
+                    SharedString::from(format!("reset-no-{key}")),
+                    "Cancel",
+                    None,
+                    true,
+                    cx.listener(|desk, _, _, cx| {
+                        desk.confirm_reset = None;
+                        cx.notify();
+                    }),
+                ));
+        } else {
+            slot = slot.child(small_chip(
+                SharedString::from(format!("reset-{key}")),
+                label,
+                None,
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.confirm_reset = Some(target);
+                    cx.notify();
+                }),
+            ));
+        }
+        slot
+    }
+
+    /// A setting's label, and "Make default" when its value is not the default.
+    /// The row has a fixed height, so the button appearing moves nothing.
+    fn field_head(
+        &mut self,
+        label: &'static str,
+        fields: &'static [Field],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let changed = fields.iter().any(|field| !self.settings.same(&self.defaults, *field));
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(24.))
+            .min_w_0()
+            .child(section_label(label))
+            .when(changed, |row| {
+                row.child(small_chip(
+                    SharedString::from(format!("make-default-{label}")),
+                    "Make default",
+                    None,
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.make_default(fields);
+                        cx.notify();
+                    }),
+                ))
+            })
+    }
+
+    /// Backends for one part. Only a real choice is clickable; the rest are
+    /// shown greyed with why.
+    fn backend_row(&mut self, part: Part, cx: &mut Context<Self>) -> AnyElement {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let list = backend_list(part, wayland);
+        let mut row = div().flex().flex_row().flex_wrap().gap_1().min_w_0();
+        for (index, backend) in list.into_iter().enumerate() {
+            let id = SharedString::from(format!("backend-{part:?}-{index}"));
+            let (on, enabled, note) = match &backend.state {
+                BackendState::Active => (true, true, None),
+                BackendState::Available => {
+                    let driver = match backend.label {
+                        "Membrane" => NetworkDriver::Membrane,
+                        "Npcap" => NetworkDriver::Npcap,
+                        _ => NetworkDriver::Automatic,
+                    };
+                    let note = (self.defaults.network == driver).then_some("default");
+                    (self.settings.network == driver, true, note)
+                }
+                BackendState::Unavailable(why) => (false, false, Some(*why)),
+            };
+            let selectable = matches!(backend.state, BackendState::Available);
+            let label = backend.label;
+            row = row.child(
+                backend_chip(id, label, note, on, enabled).when(selectable, |chip| {
+                    chip.cursor_pointer().on_click(cx.listener(move |desk, _, _, cx| {
+                        let driver = match label {
+                            "Membrane" => NetworkDriver::Membrane,
+                            "Npcap" => NetworkDriver::Npcap,
+                            _ => NetworkDriver::Automatic,
+                        };
+                        desk.edit_settings(|settings| settings.network = driver);
+                        cx.notify();
+                    }))
+                }),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// The media backend is the Opus tool order. The first installed one runs.
+    fn media_backend_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div().flex().flex_row().flex_wrap().gap_1().min_w_0();
+        for (index, tool) in etherquic::default_backend_order().iter().copied().enumerate() {
+            let present = self.backends.has(tool);
+            let on = present && tool == self.backend;
+            let note = (!present).then_some("not installed");
+            row = row.child(
+                backend_chip(
+                    SharedString::from(format!("backend-media-{index}")),
+                    backend_label(tool),
+                    note,
+                    on,
+                    present,
+                )
+                .when(present, |chip| {
+                    chip.cursor_pointer().on_click(cx.listener(move |desk, _, _, cx| {
+                        move_to_front(&mut desk.backend_pref, tool);
+                        desk.apply_backend_order();
+                        desk.persist();
+                        cx.notify();
+                    }))
+                }),
+            );
+        }
+        row.into_any_element()
+    }
+
+    fn settings_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let remote = self.selected_row();
+        let remote_caps = remote.as_ref().and_then(|row| row.caps.clone());
+        let remote_name = remote
+            .as_ref()
+            .map(|row| row.title())
+            .unwrap_or_else(|| self.target_label());
+        let reset_all = self.reset_control(None, cx);
+
+        // Appearance
+        let render = self.backend_row(Part::Render, cx);
+        let scale = self.settings.scale;
+        let size_match = self.settings.size_match;
+        let default_scale = self.defaults.scale;
+        let default_size = self.defaults.size_match;
+        let mut scales = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for mode in ScaleMode::ALL {
+            scales = scales.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("scale-{}", mode.token())),
+                    mode.label(),
+                    scale == mode,
+                    96.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.scale = mode);
+                        cx.notify();
+                    }),
+                ),
+                default_scale == mode,
+            ));
+        }
+        let mut sizes = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for choice in SizeMatch::ALL {
+            let chip = choice_chip(
+                SharedString::from(format!("size-{}", choice.token())),
+                choice.label(),
+                size_match == choice,
+                200.,
+                cx.listener(move |desk, _, _, cx| {
+                    if choice.available() {
+                        desk.edit_settings(|settings| settings.size_match = choice);
+                    }
+                    cx.notify();
+                }),
+            );
+            sizes = sizes.child(with_default(
+                div().when(!choice.available(), |chip| chip.opacity(0.45)).child(chip),
+                default_size == choice,
+            ));
+        }
+        let scale_head = self.field_head("Scale to fit", &[Field::Scale], cx);
+        let size_head = self.field_head("Resolution matching", &[Field::SizeMatch], cx);
+        let appearance_body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(scale_head)
+            .child(scales)
+            .child(size_head)
+            .child(sizes)
+            .child(muted_line(
+                "Applies to an open view at once. Host matches window is not available: hosts do not change their resolution yet.".into(),
+            ));
+        let appearance = self.section(Section::Appearance, Some(render), appearance_body, cx);
+
+        // Display Capture
+        let capture_backends = self.backend_row(Part::Capture, cx);
         let capture = self.capture_fps();
         let rates = self.global_fps_row("pref-fps", cx);
+        let capture_body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(section_label("Rate"))
+            .child(rates)
+            .child(muted_line(format!(
+                "This PC captures its primary monitor at {capture} fps. Auto uses the display rate when the picture this PC sends has a hardware encoder. Without one, or when the display rate cannot be read, Auto is {SOFTWARE_FPS} fps."
+            )));
+        let capture_section = self.section(Section::Capture, Some(capture_backends), capture_body, cx);
+
+        // Sound
+        let media = self.media_backend_row(cx);
         let mut tools = div().flex().flex_col().gap_2().w_full().min_w_0();
         for (index, tool) in self.backend_pref.iter().copied().enumerate() {
             let hint = backend_hint(tool, self.backends.has(tool), tool == self.backend);
@@ -1212,6 +3136,163 @@ impl Desk {
                 }),
             ));
         }
+        let share_pick = self.settings.share_device.clone();
+        let share_default = self.defaults.share_device.clone();
+        let out_default = self.defaults.output_device.clone();
+        let share_head = self.field_head("This computer: input (shared when hosting)", &[Field::ShareDevice], cx);
+        let out_head = self.field_head("This computer: output (remote sound plays here)", &[Field::OutputDevice], cx);
+        let mut shared = div().flex().flex_col().gap_1().w_full().min_w_0();
+        shared = shared.child(device_chip(
+            "share-auto".into(),
+            "Desktop audio (automatic)".into(),
+            share_pick.is_none(),
+            share_default.is_none(),
+            true,
+            cx.listener(|desk, _, _, cx| {
+                desk.edit_settings(|settings| settings.share_device = None);
+                cx.notify();
+            }),
+        ));
+        let mut sources: Vec<String> = self.local_inputs.clone();
+        if cfg!(windows) {
+            for name in &self.local_outputs {
+                if !sources.contains(name) {
+                    sources.push(name.clone());
+                }
+            }
+        }
+        let all_devices = self.open.all_devices;
+        let hidden_sources = sources.len().saturating_sub(DEVICES_SHOWN);
+        if !all_devices {
+            sources.truncate(DEVICES_SHOWN);
+        }
+        for (index, name) in sources.into_iter().enumerate() {
+            let on = share_pick.as_deref() == Some(name.as_str());
+            let is_default = share_default.as_deref() == Some(name.as_str());
+            let pick = name.clone();
+            shared = shared.child(device_chip(
+                SharedString::from(format!("share-{index}")),
+                name,
+                on,
+                is_default,
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    let pick = pick.clone();
+                    desk.edit_settings(|settings| settings.share_device = Some(pick));
+                    cx.notify();
+                }),
+            ));
+        }
+        let out_pick = self.settings.output_device.clone();
+        let mut outputs = div().flex().flex_col().gap_1().w_full().min_w_0();
+        outputs = outputs.child(device_chip(
+            "out-default".into(),
+            "System default".into(),
+            out_pick.is_none(),
+            out_default.is_none(),
+            true,
+            cx.listener(|desk, _, _, cx| {
+                desk.edit_settings(|settings| settings.output_device = None);
+                cx.notify();
+            }),
+        ));
+        let mut sinks = self.local_outputs.clone();
+        let hidden_sinks = sinks.len().saturating_sub(DEVICES_SHOWN);
+        if !all_devices {
+            sinks.truncate(DEVICES_SHOWN);
+        }
+        for (index, name) in sinks.into_iter().enumerate() {
+            let on = out_pick.as_deref() == Some(name.as_str());
+            let is_default = out_default.as_deref() == Some(name.as_str());
+            let pick = name.clone();
+            outputs = outputs.child(device_chip(
+                SharedString::from(format!("out-{index}")),
+                name,
+                on,
+                is_default,
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    let pick = pick.clone();
+                    desk.edit_settings(|settings| settings.output_device = Some(pick));
+                    cx.notify();
+                }),
+            ));
+        }
+        let remote_list = |names: Option<&Vec<String>>, empty: &str| {
+            let mut col = div().flex().flex_col().gap_1().w_full().min_w_0();
+            match names.filter(|names| !names.is_empty()) {
+                Some(names) => {
+                    for (index, name) in names.iter().enumerate() {
+                        col = col.child(info_chip(name.clone(), index == 0));
+                    }
+                }
+                None => col = col.child(muted_line(empty.to_string())),
+            }
+            col
+        };
+        let none_heard = if remote_caps.is_some() {
+            "None reported"
+        } else {
+            "Pick a discovered host to see its devices"
+        };
+        let remote_in = remote_list(remote_caps.as_ref().map(|caps| &caps.audio_inputs), none_heard);
+        let remote_out = remote_list(remote_caps.as_ref().map(|caps| &caps.audio_outputs), none_heard);
+        let sound_body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(two_columns(
+                div().flex().flex_col().gap_1().w_full().min_w_0().child(share_head).child(shared),
+                div().flex().flex_col().gap_1().w_full().min_w_0().child(out_head).child(outputs),
+            ))
+            .child(two_columns(
+                column_owned(format!("{remote_name}: input"), remote_in),
+                column_owned(format!("{remote_name}: output (what it shares)"), remote_out),
+            ))
+            .child(muted_line(
+                "The output applies when a view opens its sound. The input applies the next time this PC hosts. The remote's devices are chosen on that computer.".into(),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(small_chip(
+                        "sound-refresh",
+                        "Refresh devices",
+                        None,
+                        !self.devices_loading,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.refresh_devices(cx);
+                            cx.notify();
+                        }),
+                    ))
+                    .when(all_devices || hidden_sources + hidden_sinks > 0, |row| {
+                        row.child(small_chip(
+                            "sound-all",
+                            if all_devices { "Show fewer" } else { "Show all devices" },
+                            None,
+                            true,
+                            cx.listener(|desk, _, _, cx| {
+                                desk.open.all_devices = !desk.open.all_devices;
+                                cx.notify();
+                            }),
+                        ))
+                    }),
+            )
+            .child(section_label("Opus tools"))
+            .child(muted_line(backend_line(self.backends, self.backend)))
+            .child(tools)
+            .child(muted_line(
+                "The first installed tool in this order is announced, and used the next time this computer shares.".into(),
+            ));
+        let sound = self.section(Section::Sound, Some(media), sound_body, cx);
+
+        // Codecs
+        let local = local_video_line(&self.local_video);
+        let audio_local = if self.local_audio.opus { "PCM, Opus" } else { "PCM" };
         let mut video = div().flex().flex_col().gap_2().w_full().min_w_0();
         for (index, codec) in self.video_pref.iter().copied().enumerate() {
             video = video.child(pref_row(
@@ -1248,155 +3329,308 @@ impl Desk {
                 }),
             ));
         }
-        div()
+        let skip_without_hw = self.skip_without_hw;
+        let codecs_body = div()
             .flex()
             .flex_col()
             .gap_2()
             .w_full()
             .min_w_0()
-            .flex_none()
-            .child(section_label("Preferences"))
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .text_color(rgb(MUTED))
-                    .whitespace_normal()
-                    .child(
-                        "This order is the default for every computer. The first row that computer can run is the match. AV1, H.265, and H.264 (HW) need hardware encode. H.264 (SW) is the CPU path. A connection can choose its own picture, audio, and rate. That choice is saved for that computer only.",
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .text_color(rgb(TEXT))
-                    .whitespace_normal()
-                    .child(format!("This computer: {local}. Audio: {audio_local}.")),
-            )
-            .child(section_label("Rate"))
-            .child(muted_line(format!(
-                "This PC captures at {capture} fps. Auto uses the display rate when the picture this PC sends has a hardware encoder. Without one, or when the display rate cannot be read, Auto is {SOFTWARE_FPS} fps."
-            )))
-            .child(rates)
-            .child(section_label("Opus tools"))
-            .child(muted_line(backend_line(self.backends, self.backend)))
-            .child(tools)
             .child(muted_line(
-                "The first installed tool in this order is announced. Move a row to change the order. The announcement is used the next time this computer shares.".into(),
+                "The default order for every computer. The first row both sides can run is the match. A computer can have its own pick: use Save for in the Connect card.".into(),
+            ))
+            .child(muted_line(format!("This computer: {local}. Audio: {audio_local}.")))
+            .child(two_columns(column("Video", video), column("Audio", audio)))
+            .child(toggle_row(
+                "skip-without-hw",
+                "Skip when there's no HW encoder",
+                skip_without_hw,
+                cx.listener(|desk, _, _, cx| {
+                    desk.skip_without_hw = !desk.skip_without_hw;
+                    desk.persist();
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "A codec without a hardware encoder is skipped. MJPEG stays available. The desktop picture stays MJPEG, and desktop audio stays PCM.".into(),
             ))
             .child(muted_line(if self.pyrowave_library {
                 "Pyrowave library: found.".into()
             } else {
                 "Pyrowave library: not found.".into()
-            }))
-            .child(video)
-            .child(
-                div()
-                    .id("skip-without-hw")
-                    .flex()
-                    .w_full()
-                    .min_w_0()
-                    .h(px(32.))
-                    .px_2()
-                    .items_center()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(if skip_without_hw {
-                        PLAYER_BLUE
-                    } else {
-                        CARD_EDGE
-                    }))
-                    .bg(rgb(if skip_without_hw { 0x243044 } else { CARD }))
-                    .cursor_pointer()
-                    .child("Skip when there's no HW encoder")
-                    .on_click(cx.listener(|desk, _, _, cx| {
-                        desk.skip_without_hw = !desk.skip_without_hw;
-                        desk.persist();
+            }));
+        let codecs = self.section(Section::Codecs, None, codecs_body, cx);
+
+        // Input
+        let input_backends = self.backend_row(Part::Input, cx);
+        let keyboard = self.settings.send_keyboard;
+        let mouse = self.settings.send_mouse;
+        let pads = self.settings.send_pads;
+        let trace_input = self.trace_input;
+        let send_head = self.field_head("Send", &[Field::SendKeyboard, Field::SendMouse, Field::SendPads], cx);
+        let slots_head = self.field_head("Controller to player slot", &[Field::PadSlots], cx);
+        let default_pins = self.defaults.clone();
+        let mut slots = div().flex().flex_col().gap_1().w_full().min_w_0();
+        if self.local_pads.is_empty() {
+            slots = slots.child(muted_line(
+                "No controller is plugged in. Plug one in and press Refresh devices.".into(),
+            ));
+        }
+        for (pad_index, name) in self.local_pads.clone().into_iter().enumerate() {
+            let pinned = self.settings.pinned_slot(&name);
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .w_full()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(18.))
+                        .line_height(px(18.))
+                        .overflow_hidden()
+                        .whitespace_normal()
+                        .child(name.clone()),
+                );
+            let auto_name = name.clone();
+            row = row.child(choice_chip(
+                SharedString::from(format!("pad-{pad_index}-auto")),
+                "Auto",
+                pinned.is_none(),
+                56.,
+                cx.listener(move |desk, _, _, cx| {
+                    let name = auto_name.clone();
+                    desk.edit_settings(|settings| settings.pin_pad(&name, None));
+                    cx.notify();
+                }),
+            ));
+            for slot in 0..PAD_SLOTS {
+                let slot_name = name.clone();
+                row = row.child(choice_chip(
+                    SharedString::from(format!("pad-{pad_index}-{slot}")),
+                    format!("P{}", slot + 1),
+                    pinned == Some(slot),
+                    44.,
+                    cx.listener(move |desk, _, _, cx| {
+                        let name = slot_name.clone();
+                        desk.edit_settings(|settings| settings.pin_pad(&name, Some(slot)));
                         cx.notify();
-                    })),
-            )
-            .child(
+                    }),
+                ));
+            }
+            let default_slot = default_pins.pinned_slot(&name);
+            row = row.child(
                 div()
-                    .w_full()
-                    .min_w_0()
+                    .flex_none()
+                    .w(px(64.))
+                    .text_xs()
                     .text_color(rgb(MUTED))
-                    .whitespace_normal()
-                    .child(
-                        "A codec without a hardware encoder is skipped. MJPEG stays available. The desktop picture stays MJPEG, and desktop audio stays PCM.",
-                    ),
+                    .opacity(0.6)
+                    .child(match default_slot {
+                        Some(slot) => format!("default P{}", slot + 1),
+                        None => "default Auto".to_string(),
+                    }),
+            );
+            slots = slots.child(row);
+        }
+        let remote_pads = remote_caps.as_ref().map(|caps| {
+            let virtual_pad = match caps.virtual_pad {
+                etherquic::discover::VPAD_VIGEM => "ViGEmBus",
+                etherquic::discover::VPAD_UINPUT => "uinput",
+                _ => "none",
+            };
+            format!(
+                "{remote_name}: virtual controller {virtual_pad}, {} controller(s) of its own.",
+                caps.pads.len()
             )
+        });
+        let input_body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(send_head)
             .child(
                 div()
-                    .id("trace-input")
                     .flex()
-                    .w_full()
-                    .min_w_0()
-                    .h(px(32.))
-                    .px_2()
-                    .items_center()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(if trace_input { PLAYER_BLUE } else { CARD_EDGE }))
-                    .bg(rgb(if trace_input { 0x243044 } else { CARD }))
-                    .cursor_pointer()
-                    .child("Trace input timing")
-                    .on_click(cx.listener(|desk, _, _, cx| {
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(toggle_chip("send-keyboard", "Send keyboard", keyboard, Some(self.defaults.send_keyboard), cx.listener(|desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.send_keyboard = !settings.send_keyboard);
+                        cx.notify();
+                    })))
+                    .child(toggle_chip("send-mouse", "Send mouse", mouse, Some(self.defaults.send_mouse), cx.listener(|desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.send_mouse = !settings.send_mouse);
+                        cx.notify();
+                    })))
+                    .child(toggle_chip("send-pads", "Send controllers", pads, Some(self.defaults.send_pads), cx.listener(|desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.send_pads = !settings.send_pads);
+                        cx.notify();
+                    })))
+                    .child(toggle_chip("trace-input", "Trace input timing", trace_input, Some(false), cx.listener(|desk, _, _, cx| {
                         desk.trace_input = !desk.trace_input;
                         desk.persist();
                         cx.notify();
-                    })),
+                    }))),
             )
+            .child(muted_line(
+                "Send toggles apply to an open view at once. Trace input asks the remote to confirm each key and click; turn it on, then connect.".into(),
+            ))
+            .child(slots_head)
+            .child(slots)
+            .child(muted_line(
+                "Auto gives the next free slot in plug-in order. A pinned controller always arrives as that player on the host.".into(),
+            ))
+            .when_some(remote_pads, |col, line| col.child(muted_line(line)));
+        let input = self.section(Section::Input, Some(input_backends), input_body, cx);
+
+        // Network
+        let network_backends = self.backend_row(Part::Network, cx);
+        let capturing = self.capturing;
+        let network_body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(muted_line(if cfg!(windows) {
+                "Automatic uses Membrane when its driver is installed and Npcap otherwise. A change applies to the next session.".into()
+            } else {
+                "Raw Ethernet goes through libpcap here. Membrane and Npcap are Windows drivers.".into()
+            }))
+            .child(toggle_row(
+                "capture-traffic",
+                "Capture traffic",
+                capturing,
+                cx.listener(|desk, _, _, cx| {
+                    desk.toggle_capture();
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "Writes ether.pcap and app.pcap for Wireshark. This stays off until you turn it on, and it is not saved.".into(),
+            ));
+        let network = self.section(Section::Network, Some(network_backends), network_body, cx);
+
+        // Language
+        let language_body = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
             .child(
                 div()
-                    .w_full()
-                    .min_w_0()
-                    .text_color(rgb(MUTED))
-                    .whitespace_normal()
-                    .child(
-                        "The remote confirms each key and click. The picture window shows how long that confirmation took. Turn this on, then connect.",
-                    ),
-            )
-            .child(
-                div()
-                    .id("capture-traffic")
+                    .id("lang-en")
                     .flex()
-                    .w_full()
-                    .min_w_0()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
                     .h(px(32.))
                     .px_2()
-                    .items_center()
                     .rounded_sm()
                     .border_1()
-                    .border_color(rgb(if capturing { PLAYER_BLUE } else { CARD_EDGE }))
-                    .bg(rgb(if capturing { 0x243044 } else { CARD }))
+                    .border_color(rgb(PLAYER_BLUE))
+                    .bg(rgb(0x243044))
                     .cursor_pointer()
-                    .child("Capture traffic")
+                    .child(flag_en())
+                    .child("English")
+                    .when(self.defaults.language == "en", |chip| chip.child(faint_default()))
                     .on_click(cx.listener(|desk, _, _, cx| {
-                        desk.toggle_capture();
+                        desk.edit_settings(|settings| settings.language = "en".into());
                         cx.notify();
                     })),
             )
+            .child(muted_line("More languages are not translated yet.".into()));
+        let language = self.section(Section::Language, None, language_body, cx);
+
+        // This computer's own picks, from its discovery record.
+        let computer = self.peer.parse().map(|mac| self.connection_controls(mac, cx));
+        let monitors = remote_caps.as_ref().map(|caps| {
+            let mut row = div().flex().flex_row().flex_wrap().gap_1().min_w_0();
+            for (index, m) in caps.monitors.iter().enumerate() {
+                let label = format!("{}: {}×{}", index + 1, m.width, m.height);
+                let label = if m.primary { format!("{label} · primary") } else { label };
+                row = row.child(backend_chip(
+                    SharedString::from(format!("remote-mon-{index}")),
+                    label,
+                    (!m.primary).then_some("not shared"),
+                    m.primary,
+                    m.primary,
+                ));
+            }
+            row
+        });
+        let mut details = remote_caps.as_ref().map(caps_details).unwrap_or_default();
+        if let Some(device) = self.selected_device() {
+            details.push(remote_hardware_line(device.video.as_deref()));
+            details.push(remote_backend_line(device.audio.as_deref()));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full()
+            .min_w_0()
+            .flex_none()
             .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
                     .w_full()
                     .min_w_0()
-                    .text_color(rgb(MUTED))
-                    .whitespace_normal()
-                    .child(
-                        "Writes ether.pcap and app.pcap for Wireshark. ether.pcap is the Ethernet frames. app.pcap is the picture, audio, and input on the session. This stays off until you turn it on, and it is not saved.",
-                    ),
+                    .child(muted_line(
+                        "Changes save at once and apply to an open view where that is safe.".into(),
+                    ))
+                    .child(reset_all),
             )
-            .when_some(connection, |panel, (hardware, choice, audio, tools)| {
-                panel
-                    .child(section_label("This connection"))
-                    .child(muted_line(hardware))
-                    .child(muted_line(choice))
-                    .child(muted_line(audio))
-                    .child(muted_line(tools))
-            })
-            .child(section_label("Audio"))
-            .child(audio)
+            .child(appearance)
+            .child(capture_section)
+            .child(sound)
+            .child(codecs)
+            .child(input)
+            .child(network)
+            .child(language)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .p_3()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(CARD_EDGE))
+                    .rounded_md()
+                    .child(div().font_weight(FontWeight::BOLD).child(format!("This host: {remote_name}")))
+                    .when(computer.is_none(), |col| {
+                        col.child(muted_line(
+                            "Select a computer to choose its picture, audio, and rate.".into(),
+                        ))
+                    })
+                    .when_some(monitors, |col, row| {
+                        col.child(section_label("Remote monitors"))
+                            .child(row)
+                            .child(muted_line(
+                                "The host shares its primary monitor. Picking another is not available yet.".into(),
+                            ))
+                    })
+                    .when(!details.is_empty(), |col| {
+                        let mut lines = div().flex().flex_col().w_full().min_w_0();
+                        for line in details.clone() {
+                            lines = lines.child(muted_line(line));
+                        }
+                        col.child(section_label("What it reported")).child(lines)
+                    })
+                    .when_some(computer, |col, controls| col.child(controls)),
+            )
     }
 }
 
@@ -1404,82 +3638,43 @@ impl Render for Desk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.link.reap();
         self.sync_taskbar(window, cx);
+        self.track_hosts();
+        self.settle_scrollbars(window);
         let status = self.status_line();
         let status_color = self.status_color();
         let host = self.host_card(cx);
         let connect = self.connect_card(window, cx);
-        let devices = self.device_section(cx);
-        let connection = self.connection_panel(cx);
-        let prefs_open = self.prefs_open;
-        let preferences = prefs_open.then(|| self.preferences(cx));
-        let nics = self.nic_row(cx);
+        let picker = self.host_picker(window, cx);
+        let settings_open = self.open.settings;
+        let settings = settings_open.then(|| self.settings_panel(cx));
+        let settings_summary = format!(
+            "{} · {} · {}",
+            self.settings.scale.label(),
+            self.video_pref.first().map(|pref| pref.name()).unwrap_or("no video"),
+            match self.peer.parse() {
+                Some(mac) if self.applied(mac).custom => format!("{} has its own picks", self.target_label()),
+                _ => "your defaults".into(),
+            }
+        );
+        self.follow_settings_scroll(window);
+        let details_open = self.open.details;
+        let nics = details_open.then(|| self.nic_row(cx));
         let nic_error = self.nic_error.clone();
+        let adapter = self.nic.clone().unwrap_or_else(|| "Auto".into());
+        let page_bar = self.scrollbar(Bar::Page, cx);
 
-        div()
-            .id("desk")
+        let content = div()
             .flex()
             .flex_col()
-            .size_full()
-            .overflow_y_scroll()
-            .overflow_x_hidden()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
-            .text_sm()
-            .p_4()
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .pt_3()
+            .pb_4()
+            .pl_4()
+            // The page scrollbar sits in this right margin, so it never covers content.
+            .pr(px(16. + BAR_W))
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .justify_between()
-                    .gap_3()
-                    .w_full()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("etherquic"),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .text_color(rgb(MUTED))
-                                    .whitespace_normal()
-                                    .child(
-                                        "Share this desktop, or open a remote one. The taskbar button is on only while hosting.",
-                                    ),
-                            ),
-                    )
-                    .child(prefs_button(
-                        prefs_open,
-                        cx.listener(|desk, _, _, cx| {
-                            desk.prefs_open = !desk.prefs_open;
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .when_some(preferences, |desk, panel| desk.child(panel))
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .text_color(rgb(status_color))
-                    .whitespace_normal()
-                    .child(status),
-            )
-            .child(this_pc_section(&self.share))
-            .child(devices)
-            .child(connection)
             .child(
                 div()
                     .flex()
@@ -1492,6 +3687,16 @@ impl Render for Desk {
                     .child(host)
                     .child(connect),
             )
+            .when_some(nic_error.clone(), |col, err| {
+                col.child(
+                    div()
+                        .w_full()
+                        .text_color(rgb(DANGER))
+                        .whitespace_normal()
+                        .child(err),
+                )
+            })
+            .child(picker)
             .child(
                 div()
                     .flex()
@@ -1499,20 +3704,673 @@ impl Render for Desk {
                     .gap_2()
                     .w_full()
                     .min_w_0()
-                    .child(section_label("Adapter"))
-                    .when_some(nic_error, |row, err| {
-                        row.child(
-                            div()
-                                .w_full()
-                                .text_color(rgb(DANGER))
-                                .whitespace_normal()
-                                .child(err),
+                    .flex_none()
+                    .child({
+                        let mark = Rc::clone(&self.settings_y);
+                        canvas(
+                            move |bounds, _, _| mark.set(f32::from(bounds.origin.y)),
+                            |_, _, _, _| {},
                         )
+                        .w_full()
+                        .h(px(0.))
                     })
-                    .child(nics),
+                    .child(disclosure(
+                        "settings-more",
+                        "Settings",
+                        settings_summary,
+                        settings_open,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.open.settings = !desk.open.settings;
+                            desk.confirm_reset = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .when_some(settings, |col, panel| col.child(panel)),
             )
-            .child(lane_row())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .child(disclosure(
+                        "details-more",
+                        "Details",
+                        format!("This PC, adapter ({adapter}), lanes"),
+                        details_open,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.open.details = !desk.open.details;
+                            cx.notify();
+                        }),
+                    ))
+                    .when(details_open, |col| {
+                        col.child(this_pc_section(&self.share))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .w_full()
+                                    .min_w_0()
+                                    .child(section_label("Adapter"))
+                                    .when_some(nics, |row, nics| row.child(nics)),
+                            )
+                            .child(lane_row())
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .w_full()
+                                    .min_w_0()
+                                    .child(section_label("Status"))
+                                    .child(muted_line(status.clone())),
+                            )
+                    }),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .text_sm()
+            .on_mouse_move(cx.listener(|desk, ev: &MouseMoveEvent, _, cx| {
+                desk.on_drag_move(ev, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|desk, _: &MouseUpEvent, _, cx| {
+                    if desk.drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|desk, _: &MouseUpEvent, _, cx| {
+                    if desk.drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            // Pinned: the title, preferences, and a status line of fixed height.
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .gap_1()
+                    .w_full()
+                    .min_w_0()
+                    .pt_4()
+                    .px_4()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(rgb(CARD_EDGE))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .w_full()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_baseline()
+                                    .gap_3()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xl()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("etherquic"),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_color(rgb(MUTED))
+                                            .child("Share this desktop, or open a remote one."),
+                                    ),
+                            )
+                            .child(prefs_button(
+                                settings_open,
+                                cx.listener(|desk, _, window, cx| {
+                                    // Open Settings and bring it into view; a second
+                                    // press closes it.
+                                    if desk.open.settings {
+                                        desk.open.settings = false;
+                                    } else {
+                                        desk.open.settings = true;
+                                        desk.scroll_to_settings = 2;
+                                        window.request_animation_frame();
+                                    }
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("status")
+                            .w_full()
+                            .min_w_0()
+                            .h(px(STATUS_H))
+                            .flex_none()
+                            .overflow_hidden()
+                            .text_color(rgb(status_color))
+                            .whitespace_normal()
+                            .line_clamp(2)
+                            .child(status),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("desk")
+                            .flex()
+                            .flex_col()
+                            .size_full()
+                            .overflow_y_scroll()
+                            .overflow_x_hidden()
+                            .track_scroll(&self.page_scroll)
+                            .child(content),
+                    )
+                    .child(page_bar),
+            )
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Panels {
+    host: bool,
+    connect: bool,
+    /// Latency, addresses, and codecs under each discovered host.
+    devices: bool,
+    /// The Settings sections and this computer's own picks.
+    settings: bool,
+    /// Every sound device, not only the first few.
+    all_devices: bool,
+    details: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Menu {
+    Video,
+    Audio,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostTab {
+    Saved,
+    Recent,
+    Discovered,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bar {
+    Page,
+    List,
+}
+
+#[derive(Clone, Copy)]
+struct Drag {
+    bar: Bar,
+    start_y: f32,
+    start: f32,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+fn viewport(handle: &ScrollHandle) -> f32 {
+    f32::from(handle.bounds().size.height)
+}
+
+fn max_scroll(handle: &ScrollHandle) -> f32 {
+    f32::from(handle.max_offset().height)
+}
+
+fn scrolled(handle: &ScrollHandle) -> f32 {
+    -f32::from(handle.offset().y)
+}
+
+fn presence_color(presence: Presence) -> u32 {
+    match presence {
+        Presence::Online => HOST_GREEN,
+        Presence::Seen(_) | Presence::Unseen => MUTED,
+    }
+}
+
+enum Edit {
+    Changed,
+    Submit,
+    Cancel,
+    Ignored,
+}
+
+const FIELD_MAX: usize = 128;
+
+/// One-line editing: type, Backspace, Ctrl+Backspace clears, Ctrl+V pastes,
+/// Enter submits, Escape cancels.
+fn edit_text(text: &mut String, ev: &KeyDownEvent, cx: &App) -> Edit {
+    let key = ev.keystroke.key.as_str();
+    let mods = &ev.keystroke.modifiers;
+    match key {
+        "enter" => return Edit::Submit,
+        "escape" => return Edit::Cancel,
+        "backspace" => {
+            if mods.control || mods.alt || mods.platform {
+                text.clear();
+            } else {
+                text.pop();
+            }
+            return Edit::Changed;
+        }
+        _ => {}
+    }
+    if (mods.control || mods.platform) && key == "v" {
+        if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            push_clean(text, &pasted);
+            return Edit::Changed;
+        }
+        return Edit::Ignored;
+    }
+    if mods.control || mods.alt || mods.platform {
+        return Edit::Ignored;
+    }
+    let typed = match ev.keystroke.key_char.as_deref() {
+        Some(chars) => chars.to_string(),
+        None if key == "space" => " ".into(),
+        None if key.chars().count() == 1 => key.to_string(),
+        None => return Edit::Ignored,
+    };
+    push_clean(text, &typed);
+    Edit::Changed
+}
+
+fn push_clean(text: &mut String, typed: &str) {
+    for ch in typed.chars() {
+        if text.chars().count() >= FIELD_MAX {
+            break;
+        }
+        if !ch.is_control() {
+            text.push(ch);
+        }
+    }
+}
+
+fn text_field(
+    id: &'static str,
+    focus: &FocusHandle,
+    focused: bool,
+    text: &str,
+    placeholder: &'static str,
+) -> Stateful<Div> {
+    let empty = text.is_empty();
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .min_w_0()
+        .h(px(30.))
+        .px_2()
+        .overflow_hidden()
+        .bg(rgb(BG))
+        .border_1()
+        .border_color(rgb(if focused { PLAYER_BLUE } else { CARD_EDGE }))
+        .rounded_sm()
+        .cursor_text()
+        .track_focus(focus)
+        .when(!empty, |field| {
+            field.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgb(TEXT))
+                    .child(text.to_string()),
+            )
+        })
+        .when(focused, |field| {
+            field.child(div().flex_none().w(px(1.)).h(px(16.)).bg(rgb(TEXT)))
+        })
+        .when(empty, |field| {
+            field.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgb(MUTED))
+                    .child(placeholder),
+            )
+        })
+}
+
+/// A section header that opens and closes what follows it.
+fn disclosure(
+    id: &'static str,
+    title: &'static str,
+    summary: String,
+    open: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .min_w_0()
+        .h(px(28.))
+        .cursor_pointer()
+        .child(chevron(open))
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(TEXT))
+                .child(title),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(rgb(MUTED))
+                .child(summary),
+        )
+        .on_click(on_click)
+}
+
+/// A small drawn triangle, so no font needs the glyph.
+fn chevron(open: bool) -> impl IntoElement {
+    // Bars of 2 px stepping down by 2 px on each side make a clean triangle.
+    let bars: [f32; 5] = [10., 8., 6., 4., 2.];
+    let shape = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(px(12.))
+        .h(px(12.));
+    if open {
+        let mut col = div().flex().flex_col().items_center();
+        for width in bars {
+            col = col.child(div().w(px(width)).h(px(1.)).bg(rgb(MUTED)));
+        }
+        shape.child(col)
+    } else {
+        let mut row = div().flex().flex_row().items_center();
+        for height in bars {
+            row = row.child(div().w(px(1.)).h(px(height)).bg(rgb(MUTED)));
+        }
+        shape.child(row)
+    }
+}
+
+fn small_chip(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    accent: Option<u32>,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let filled = accent.is_some();
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .h(px(26.))
+        .px_2()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(accent.unwrap_or(CARD_EDGE)))
+        .bg(rgb(accent.unwrap_or(CARD)))
+        .text_color(rgb(if filled { INK } else { TEXT }))
+        .when(filled, |chip| chip.font_weight(FontWeight::BOLD))
+        .when(enabled, |chip| chip.cursor_pointer())
+        .when(!enabled, |chip| chip.opacity(0.4).cursor_default())
+        .child(label)
+        .when(enabled, |chip| chip.on_click(on_click))
+}
+
+/// Save, or a disabled "Saved" once the host is in the Saved list.
+fn save_chip(
+    id: impl Into<gpui::ElementId>,
+    saved: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    small_chip(id, if saved { "Saved" } else { "Save" }, None, !saved, on_click)
+}
+
+fn tab_chip(
+    id: &'static str,
+    label: String,
+    on: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .h(px(28.))
+        .px_3()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { CARD }))
+        .text_color(rgb(if on { TEXT } else { MUTED }))
+        .when(on, |chip| chip.font_weight(FontWeight::BOLD))
+        .cursor_pointer()
+        .child(label)
+        .on_click(on_click)
+}
+
+/// One host: name, address, and what it has (monitors, inputs) on the left,
+/// status and actions on the right. Every row is the same height, so the list
+/// does not jump.
+#[allow(clippy::too_many_arguments)]
+fn host_row(
+    id: SharedString,
+    lead: Option<AnyElement>,
+    title: impl IntoElement,
+    address: String,
+    summary: String,
+    status: String,
+    status_color: u32,
+    selected: bool,
+    actions: impl IntoElement,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    // The text is the only child in the flow and spans the row, with room kept
+    // at both ends; the picture, status, and buttons sit over that room, so no
+    // row can move another. Each line wraps inside a box one line high and is
+    // clipped there. A no-wrap line is measured once by this GPUI, at whatever
+    // width the first pass offered, and could keep that size.
+    const PAD: f32 = 12.;
+    const GAP: f32 = 12.;
+    const STATUS_W: f32 = 132.;
+    let left = if lead.is_some() { THUMB_W + GAP } else { 0. };
+    let right = STATUS_W + GAP + ACTIONS_W + GAP;
+    let line = |text: String, small: bool, color: u32| {
+        div()
+            .w_full()
+            .min_w_0()
+            .h(px(if small { 16. } else { 18. }))
+            .line_height(px(if small { 16. } else { 18. }))
+            .overflow_hidden()
+            .whitespace_normal()
+            .when(small, |line| line.text_xs())
+            .text_color(rgb(color))
+            .child(text)
+    };
+    div()
+        .id(id)
+        .relative()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .w_full()
+        .min_w_0()
+        .h(px(HOST_ROW_H))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(if selected { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if selected { 0x1f2736 } else { CARD }))
+        .cursor_pointer()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .pl(px(PAD + left))
+                .pr(px(PAD + right))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .h(px(20.))
+                        .overflow_hidden()
+                        .child(title),
+                )
+                .child(line(address, true, MUTED))
+                .child(line(summary, true, TEXT)),
+        )
+        .when_some(lead, |row, lead| {
+            row.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(PAD))
+                    .flex()
+                    .items_center()
+                    .child(lead),
+            )
+        })
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(PAD))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(GAP))
+                .child(
+                    div()
+                        .w(px(STATUS_W))
+                        .h(px(32.))
+                        .line_height(px(16.))
+                        .overflow_hidden()
+                        .whitespace_normal()
+                        .text_xs()
+                        .text_color(rgb(status_color))
+                        .child(status),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .w(px(ACTIONS_W))
+                        .child(actions),
+                ),
+        )
+        .on_click(on_click)
+}
+
+/// Monitors and inputs in a few words. An older host sends no details.
+fn row_summary(caps: Option<&etherquic::discover::Capabilities>) -> String {
+    match caps.map(|caps| (caps, caps_summary(caps))) {
+        Some((caps, summary)) if caps.monitors.len() > 1 => {
+            let sizes: Vec<String> = caps
+                .monitors
+                .iter()
+                .map(|m| format!("{}×{}", m.width, m.height))
+                .collect();
+            format!("{summary} · {}", sizes.join(" + "))
+        }
+        Some((_, summary)) if !summary.is_empty() => summary,
+        Some(_) => "No monitors reported".into(),
+        None => "No details from this host (older version)".into(),
+    }
+}
+
+/// A host's name in a row: bold, one line, clipped.
+fn row_title(name: String) -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .h(px(20.))
+        .line_height(px(20.))
+        .overflow_hidden()
+        .whitespace_normal()
+        .font_weight(FontWeight::BOLD)
+        .child(name)
+}
+
+/// The fixed box a discovery thumbnail sits in, so rows line up whether or not
+/// a host sent one.
+fn thumb_slot(picture: Option<Arc<RenderImage>>) -> AnyElement {
+    let slot = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(px(THUMB_W))
+        .h(px(THUMB_H))
+        .rounded_sm()
+        .overflow_hidden()
+        .bg(rgb(BG))
+        .border_1()
+        .border_color(rgb(CARD_EDGE));
+    match picture {
+        Some(picture) => slot
+            .child(
+                img(ImageSource::Render(picture))
+                    .w(px(THUMB_W - 2.))
+                    .h(px(THUMB_H - 2.))
+                    .object_fit(ObjectFit::Contain),
+            )
+            .into_any_element(),
+        None => slot.into_any_element(),
+    }
+}
+
+/// RGBA from the decoder into the BGRA frame the renderer takes.
+fn render_image(thumb: etherquic_ui::Thumb) -> Option<Arc<RenderImage>> {
+    let mut bgra = thumb.rgba;
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(thumb.width, thumb.height, bgra)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
 fn this_pc_section(share: &Share) -> impl IntoElement {
@@ -1881,58 +4739,16 @@ fn slider_track(knob_at: gpui::Pixels) -> impl IntoElement {
         .child(div().flex_1().h(px(2.)).bg(rgb(MUTED)))
 }
 
-fn device_card(
-    id: impl Into<gpui::ElementId>,
-    device: &Found,
-    selection: &str,
-    on: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let title = if device.name.trim().is_empty() {
-        format_mac(device.l2_mac)
-    } else {
-        device.name.clone()
-    };
-    div()
-        .id(id)
-        .flex()
-        .flex_col()
-        .gap_1()
-        .w_full()
-        .min_w_0()
-        .p_3()
-        .overflow_hidden()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
-        .bg(rgb(CARD))
-        .cursor_pointer()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .w_full()
-                .min_w_0()
-                .child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .font_weight(FontWeight::BOLD)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(rgb(HOST_GREEN))
-                        .font_weight(FontWeight::BOLD)
-                        .child(ms(device.stats.avg_ms)),
-                ),
-        )
-        .child(muted_line(l2_line(device)))
+/// Addresses, codecs, and latency of one discovered host, under its row.
+fn device_details(device: &Found, selection: &str, caps: &[String]) -> impl IntoElement {
+    let mut col = div().flex().flex_col().gap_1().w_full().min_w_0();
+    for line in caps {
+        col = col.child(div().w_full().min_w_0().whitespace_normal().child(line.clone()));
+    }
+    if device.key != device.l2_mac {
+        col = col.child(muted_line(format!("Adapter {}", format_mac(device.key))));
+    }
+    col.child(muted_line(l2_line(device)))
         .child(muted_line(format!("L3 {}", l3_line(device))))
         .child(
             div()
@@ -1966,7 +4782,6 @@ fn device_card(
                 )
                 .child(sparkline(&device.l2_mac, &device.samples_ms)),
         )
-        .on_click(on_click)
 }
 
 fn muted_line(text: String) -> impl IntoElement {
@@ -2131,5 +4946,260 @@ fn lane_row() -> impl IntoElement {
                 .text_color(rgb(MUTED))
                 .whitespace_normal()
                 .child("A higher priority is sent first."),
+        )
+}
+
+/// A backend or device choice. Greyed ones say why and do nothing.
+fn backend_chip(
+    id: SharedString,
+    label: impl Into<SharedString>,
+    note: Option<&'static str>,
+    on: bool,
+    enabled: bool,
+) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    let text = match note {
+        Some(note) => format!("{label} · {note}"),
+        None => label.to_string(),
+    };
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .h(px(24.))
+        .px_2()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { BG }))
+        .text_xs()
+        .text_color(rgb(if on { TEXT } else { MUTED }))
+        .when(!enabled, |chip| chip.opacity(0.45))
+        .child(text)
+}
+
+/// One sound device in a column. The name is clipped to the column.
+fn device_chip(
+    id: SharedString,
+    label: String,
+    on: bool,
+    is_default: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .w_full()
+        .min_w_0()
+        .h(px(26.))
+        .px_2()
+        .items_center()
+        .overflow_hidden()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { BG }))
+        .text_xs()
+        .text_color(rgb(if on { TEXT } else { MUTED }))
+        .when(!enabled, |chip| chip.opacity(0.45))
+        .when(enabled, |chip| chip.cursor_pointer().on_click(on_click))
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(16.))
+                .line_height(px(16.))
+                .overflow_hidden()
+                .whitespace_normal()
+                .child(label),
+        )
+        .when(is_default, |chip| chip.child(faint_default()))
+}
+
+/// The faint "default" mark on the option the user's defaults pick.
+fn faint_default() -> impl IntoElement {
+    div()
+        .flex_none()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .opacity(0.6)
+        .child("default")
+}
+
+/// A choice with the faint "default" mark beside it when it is the default.
+fn with_default(chip: impl IntoElement, is_default: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .child(chip)
+        .when(is_default, |row| row.child(faint_default()))
+}
+
+/// A remote device: shown, not picked here. The first is that computer's default.
+fn info_chip(label: String, first: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .w_full()
+        .min_w_0()
+        .h(px(26.))
+        .px_2()
+        .items_center()
+        .overflow_hidden()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(CARD_EDGE))
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .opacity(0.7)
+        .child(
+            div()
+                .w_full()
+                .h(px(16.))
+                .line_height(px(16.))
+                .overflow_hidden()
+                .whitespace_normal()
+                .child(if first { format!("{label} (default)") } else { label }),
+        )
+}
+
+fn two_columns(left: impl IntoElement, right: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_3()
+        .w_full()
+        .min_w_0()
+        .child(div().flex_1().min_w_0().child(left))
+        .child(div().flex_1().min_w_0().child(right))
+}
+
+fn column(title: &'static str, body: impl IntoElement) -> impl IntoElement {
+    column_owned(title.to_string(), body)
+}
+
+fn column_owned(title: String, body: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w_full()
+        .min_w_0()
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .h(px(16.))
+                .line_height(px(16.))
+                .overflow_hidden()
+                .whitespace_normal()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(title),
+        )
+        .child(body)
+}
+
+/// A full-width on/off row.
+fn toggle_row(
+    id: &'static str,
+    label: &'static str,
+    on: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .w_full()
+        .min_w_0()
+        .h(px(32.))
+        .px_2()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { CARD }))
+        .cursor_pointer()
+        .child(label)
+        .on_click(on_click)
+}
+
+/// A compact on/off chip with a check box.
+fn toggle_chip(
+    id: &'static str,
+    label: &'static str,
+    on: bool,
+    default_on: Option<bool>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .h(px(28.))
+        .px_2()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { CARD }))
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(12.))
+                .h(px(12.))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if on { PLAYER_BLUE } else { MUTED }))
+                .when(on, |box_| box_.bg(rgb(PLAYER_BLUE))),
+        )
+        .child(label)
+        .when_some(default_on, |chip, default_on| {
+            chip.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .opacity(0.6)
+                    .child(if default_on { "default on" } else { "default off" }),
+            )
+        })
+        .on_click(on_click)
+}
+
+/// A small drawn English flag, so no emoji font is needed.
+fn flag_en() -> impl IntoElement {
+    let mut stripes = div().flex().flex_col().w(px(24.)).h(px(14.));
+    for index in 0..7 {
+        stripes = stripes.child(
+            div()
+                .w_full()
+                .h(px(2.))
+                .bg(rgb(if index % 2 == 0 { 0xb22234 } else { 0xffffff })),
+        );
+    }
+    div()
+        .relative()
+        .flex_none()
+        .w(px(24.))
+        .h(px(14.))
+        .overflow_hidden()
+        .rounded_sm()
+        .child(stripes)
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(10.))
+                .h(px(8.))
+                .bg(rgb(0x3c3b6e)),
         )
 }

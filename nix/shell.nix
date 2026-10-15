@@ -39,6 +39,8 @@ pkgs.mkShell {
     pkgs.rustPlatform.bindgenHook
     pkgs.ffmpeg
     pkgs.gst_all_1.gstreamer
+    # cjxl encodes the discovery thumbnail a host sends.
+    pkgs.libjxl
   ];
 
   buildInputs = libs;

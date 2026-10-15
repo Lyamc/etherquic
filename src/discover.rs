@@ -7,14 +7,38 @@
 //!
 //! Discovery uses service [`SERVICE`], not the play service, so the QUIC
 //! socket never sees these frames.
+//!
+//! The same announce and offer bytes also travel as UDP datagrams on port
+//! [`UDP_PORT`] (IPv4 broadcast, IPv6 all-nodes multicast), so a player that
+//! cannot open a raw socket still finds hosts.
+//!
+//! ## Extended offers (version 3)
+//!
+//! A player that understands more sets [`EXT_MARK`] in the top byte of the
+//! announce id. The announce itself is unchanged, so an older host still
+//! answers it with a version-1 or version-2 offer. A newer host answers a
+//! marked announce with a version-3 offer: the version-2 body, the L2 driver
+//! byte (always present, `0` when unknown), then type-length-value records:
+//!
+//! ```text
+//! type u8 | length u16 BE | value
+//! ```
+//!
+//! [`TLV_CAPS`] carries [`Capabilities`] and [`TLV_THUMBNAIL`] a JPEG XL
+//! desktop thumbnail sized to the room left in the frame. Unknown types are
+//! skipped, so later records do not break this reader. An unmarked announce
+//! (an older player) always gets the old offer, which that player accepts.
+//!
+//! Every offer fits one frame: [`L2_PAYLOAD_LIMIT`] on Ethernet, and
+//! [`UDP4_PAYLOAD_LIMIT`] or [`UDP6_PAYLOAD_LIMIT`] for UDP.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::frame::{Frame, DEFAULT_ETHER_TYPE};
+use crate::frame::{Frame, DEFAULT_ETHER_TYPE, SERVICE_HEADER_LEN};
 use crate::pcap_link::{self, InterfaceInfo};
 use crate::Mac;
 
@@ -25,6 +49,30 @@ const MAGIC: &[u8; 4] = b"EQDS";
 const VERSION: u8 = 1;
 /// Offer that appends the host's codec hardware. Announces stay at [`VERSION`].
 const VERSION_CODECS: u8 = 2;
+/// Offer that adds TLV records after the version-2 body. Sent only to a marked announce.
+const VERSION_EXT: u8 = 3;
+/// Top byte of an announce id from a player that reads version-3 offers.
+pub const EXT_MARK: u32 = 0xE3 << 24;
+const MARK_MASK: u32 = 0xFF << 24;
+
+/// UDP port for discovery datagrams. Same number as the L2 service.
+pub const UDP_PORT: u16 = SERVICE;
+/// Ethernet MTU the offer must fit, not counting the 14-byte Ethernet header.
+pub const MTU: usize = 1500;
+/// Discovery payload room in one L2 frame: the MTU minus the service header.
+pub const L2_PAYLOAD_LIMIT: usize = MTU - SERVICE_HEADER_LEN;
+/// UDP payload room in one unfragmented IPv4 packet (20-byte IP, 8-byte UDP header).
+pub const UDP4_PAYLOAD_LIMIT: usize = MTU - 20 - 8;
+/// UDP payload room in one IPv6 packet (40-byte IP, 8-byte UDP header).
+pub const UDP6_PAYLOAD_LIMIT: usize = MTU - 40 - 8;
+/// Bytes before each TLV value.
+pub const TLV_HEADER: usize = 3;
+/// Capabilities record.
+pub const TLV_CAPS: u8 = 1;
+/// JPEG XL thumbnail record (a bare codestream).
+pub const TLV_THUMBNAIL: u8 = 2;
+/// Below this a thumbnail is not worth sending.
+pub const MIN_THUMBNAIL: usize = 64;
 const ANNOUNCE: u8 = 1;
 const OFFER: u8 = 2;
 const HEADER: usize = 10;
@@ -122,6 +170,264 @@ pub struct Found {
     /// Milliseconds, in probe order.
     pub samples_ms: Vec<f32>,
     pub stats: Stats,
+    /// Tells two hosts apart. Every host announces the same identity
+    /// [`Self::l2_mac`], so this is the answering adapter's own MAC when known.
+    pub key: Mac,
+    /// From a version-3 offer. `None` for an older host.
+    pub caps: Option<Capabilities>,
+    /// JPEG XL codestream from a version-3 offer.
+    pub thumbnail: Option<Vec<u8>>,
+    /// Answered over raw Ethernet.
+    pub via_l2: bool,
+    /// Answered over UDP.
+    pub via_udp: bool,
+}
+
+/// Monitor on a version-3 offer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MonitorInfo {
+    pub width: u16,
+    pub height: u16,
+    /// Hundredths of a hertz. `0` when unknown.
+    pub refresh_centihz: u16,
+    pub x: i16,
+    pub y: i16,
+    pub primary: bool,
+}
+
+impl MonitorInfo {
+    pub fn refresh_hz(&self) -> f32 {
+        self.refresh_centihz as f32 / 100.0
+    }
+}
+
+/// Game controller on a version-3 offer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PadInfo {
+    /// [`PAD_API_XINPUT`], [`PAD_API_DINPUT`], [`PAD_API_WGI`], [`PAD_API_EVDEV`], or `0`.
+    pub api: u8,
+    /// [`PAD_KIND_GAMEPAD`], [`PAD_KIND_WHEEL`], [`PAD_KIND_STICK`], or `0`.
+    pub kind: u8,
+    pub name: String,
+}
+
+pub const OS_WINDOWS: u8 = 1;
+pub const OS_LINUX: u8 = 2;
+pub const OS_MACOS: u8 = 3;
+
+pub const INPUT_KEYBOARD: u16 = 1 << 0;
+pub const INPUT_MOUSE: u16 = 1 << 1;
+pub const INPUT_TOUCH: u16 = 1 << 2;
+pub const INPUT_PEN: u16 = 1 << 3;
+
+/// The host can create a virtual gamepad for the player.
+pub const VPAD_NONE: u8 = 0;
+pub const VPAD_VIGEM: u8 = 1;
+pub const VPAD_UINPUT: u8 = 2;
+
+pub const PAD_API_XINPUT: u8 = 1;
+pub const PAD_API_DINPUT: u8 = 2;
+pub const PAD_API_WGI: u8 = 3;
+pub const PAD_API_EVDEV: u8 = 4;
+pub const PAD_KIND_GAMEPAD: u8 = 1;
+pub const PAD_KIND_WHEEL: u8 = 2;
+pub const PAD_KIND_STICK: u8 = 3;
+
+/// Version of the capabilities record. Fields are only ever appended; a
+/// reader keeps what it knows and skips the rest. A layout that cannot be
+/// read that way gets a new TLV type instead.
+pub const CAPS_VERSION: u8 = 1;
+const MAX_OS_LABEL: usize = 32;
+const MAX_HOSTNAME: usize = 63;
+const MAX_MONITORS: usize = 16;
+const MAX_PADS: usize = 8;
+const MAX_PAD_NAME: usize = 24;
+const MAX_AUDIO_DEVICES: usize = 4;
+const MAX_AUDIO_NAME: usize = 32;
+
+/// What the host has: displays, inputs, and who it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub os: u8,
+    pub os_label: String,
+    /// Full host name. The offer's own name is cut at 32 bytes.
+    pub hostname: String,
+    /// Burned-in MAC of the adapter that answered, so two hosts stay apart.
+    pub nic_mac: Option<Mac>,
+    pub monitors: Vec<MonitorInfo>,
+    /// `INPUT_*` bits.
+    pub inputs: u16,
+    /// `VPAD_*`.
+    pub virtual_pad: u8,
+    pub pads: Vec<PadInfo>,
+    /// Sound devices, default first. Trailing fields: an older host leaves
+    /// them out and an older player stops reading before them.
+    pub audio_outputs: Vec<String>,
+    pub audio_inputs: Vec<String>,
+}
+
+impl Capabilities {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![CAPS_VERSION, self.os];
+        push_str(&mut out, &self.os_label, MAX_OS_LABEL);
+        push_str(&mut out, &self.hostname, MAX_HOSTNAME);
+        match self.nic_mac {
+            Some(mac) => {
+                out.push(1);
+                out.extend(mac);
+            }
+            None => out.push(0),
+        }
+        let monitors = &self.monitors[..self.monitors.len().min(MAX_MONITORS)];
+        out.push(monitors.len() as u8);
+        for monitor in monitors {
+            out.extend(monitor.width.to_be_bytes());
+            out.extend(monitor.height.to_be_bytes());
+            out.extend(monitor.refresh_centihz.to_be_bytes());
+            out.extend(monitor.x.to_be_bytes());
+            out.extend(monitor.y.to_be_bytes());
+            out.push(u8::from(monitor.primary));
+        }
+        out.extend(self.inputs.to_be_bytes());
+        out.push(self.virtual_pad);
+        let pads = &self.pads[..self.pads.len().min(MAX_PADS)];
+        out.push(pads.len() as u8);
+        for pad in pads {
+            out.push(pad.api);
+            out.push(pad.kind);
+            push_str(&mut out, &pad.name, MAX_PAD_NAME);
+        }
+        for list in [&self.audio_outputs, &self.audio_inputs] {
+            let list = &list[..list.len().min(MAX_AUDIO_DEVICES)];
+            out.push(list.len() as u8);
+            for name in list {
+                push_str(&mut out, name, MAX_AUDIO_NAME);
+            }
+        }
+        out
+    }
+
+    /// `None` when a known field is cut short. Bytes after the known fields are ignored.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let mut rest = bytes;
+        let version = take_u8(&mut rest)?;
+        if version == 0 {
+            return None;
+        }
+        let os = take_u8(&mut rest)?;
+        let os_label = take_str(&mut rest)?;
+        let hostname = take_str(&mut rest)?;
+        let nic_mac = match take_u8(&mut rest)? {
+            0 => None,
+            _ => Some(take(&mut rest, 6)?.try_into().ok()?),
+        };
+        let count = take_u8(&mut rest)? as usize;
+        if count > MAX_MONITORS {
+            return None;
+        }
+        let mut monitors = Vec::with_capacity(count);
+        for _ in 0..count {
+            let raw = take(&mut rest, 11)?;
+            monitors.push(MonitorInfo {
+                width: u16::from_be_bytes([raw[0], raw[1]]),
+                height: u16::from_be_bytes([raw[2], raw[3]]),
+                refresh_centihz: u16::from_be_bytes([raw[4], raw[5]]),
+                x: i16::from_be_bytes([raw[6], raw[7]]),
+                y: i16::from_be_bytes([raw[8], raw[9]]),
+                primary: raw[10] & 1 != 0,
+            });
+        }
+        let inputs = u16::from_be_bytes(take(&mut rest, 2)?.try_into().ok()?);
+        let virtual_pad = take_u8(&mut rest)?;
+        let count = take_u8(&mut rest)? as usize;
+        if count > MAX_PADS {
+            return None;
+        }
+        let mut pads = Vec::with_capacity(count);
+        for _ in 0..count {
+            let api = take_u8(&mut rest)?;
+            let kind = take_u8(&mut rest)?;
+            let name = take_str(&mut rest)?;
+            pads.push(PadInfo { api, kind, name });
+        }
+        // Optional: absent from an older host. A cut list is dropped, not half read.
+        let mut audio = [Vec::new(), Vec::new()];
+        for list in &mut audio {
+            let Some(count) = take_u8(&mut rest) else {
+                break;
+            };
+            let mut names = Vec::new();
+            for _ in 0..usize::from(count).min(MAX_AUDIO_DEVICES) {
+                match take_str(&mut rest) {
+                    Some(name) => names.push(name),
+                    None => break,
+                }
+            }
+            if names.len() != usize::from(count).min(MAX_AUDIO_DEVICES) {
+                break;
+            }
+            *list = names;
+        }
+        let [audio_outputs, audio_inputs] = audio;
+        Some(Self {
+            os,
+            os_label,
+            hostname,
+            nic_mac,
+            monitors,
+            inputs,
+            virtual_pad,
+            pads,
+            audio_outputs,
+            audio_inputs,
+        })
+    }
+}
+
+fn push_str(out: &mut Vec<u8>, text: &str, max: usize) {
+    let bytes = clip_to(text, max);
+    out.push(bytes.len() as u8);
+    out.extend(bytes);
+}
+
+fn take_u8(rest: &mut &[u8]) -> Option<u8> {
+    Some(take(rest, 1)?[0])
+}
+
+fn take_str(rest: &mut &[u8]) -> Option<String> {
+    let len = take_u8(rest)? as usize;
+    let bytes = take(rest, len)?;
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// What a host adds to a version-3 offer. Called for each reply, so both
+/// must answer from a cache.
+pub trait OfferExtras: Send + Sync {
+    fn capabilities(&self) -> Option<Capabilities>;
+    /// A codestream of at most `budget` bytes, or `None`.
+    fn thumbnail(&self, budget: usize) -> Option<Vec<u8>>;
+}
+
+/// No capabilities and no picture. A version-3 offer still carries the driver byte.
+pub struct NoExtras;
+
+impl OfferExtras for NoExtras {
+    fn capabilities(&self) -> Option<Capabilities> {
+        None
+    }
+    fn thumbnail(&self, _budget: usize) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// Room for the thumbnail value once `used` payload bytes and its TLV header
+/// are counted. `None` when less than [`MIN_THUMBNAIL`] is left.
+pub fn thumbnail_budget(limit: usize, used: usize) -> Option<usize> {
+    limit
+        .checked_sub(used)?
+        .checked_sub(TLV_HEADER)
+        .filter(|room| *room >= MIN_THUMBNAIL)
+        .map(|room| room.min(u16::MAX as usize))
 }
 
 /// Latency summary for one burst. Standard deviation is over the samples (divide by n).
@@ -188,16 +494,54 @@ pub fn is_discovery(frame: &Frame) -> bool {
     frame.dst_service == SERVICE || frame.src_service == SERVICE
 }
 
+/// One discovery burst over every transport that opened.
+#[derive(Clone, Debug, Default)]
+pub struct Burst {
+    pub found: Vec<Found>,
+    /// Raw Ethernet could not be used, for example without `CAP_NET_RAW`.
+    pub l2_error: Option<String>,
+    pub udp_error: Option<String>,
+}
+
 /// Broadcast a burst and collect hosts. `generation` cancels the burst when it changes.
+/// Fails only when no host answered and raw Ethernet could not be opened.
 pub fn discover(
     nic: Option<&str>,
     generation: &AtomicU64,
     expected: u64,
 ) -> Result<Vec<Found>, String> {
-    let info = pcap_link::interface_info(nic).map_err(|err| err.to_string())?;
-    let src = info.mac.unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x0d]);
-    let mut link =
-        pcap_link::open(Some(&info.name), DEFAULT_ETHER_TYPE).map_err(|err| err.to_string())?;
+    let burst = discover_burst(nic, generation, expected);
+    match burst.l2_error {
+        Some(err) if burst.found.is_empty() => Err(err),
+        _ => Ok(burst.found),
+    }
+}
+
+/// Probe over raw Ethernet and UDP at once. Each transport that fails is reported, not fatal.
+pub fn discover_burst(nic: Option<&str>, generation: &AtomicU64, expected: u64) -> Burst {
+    let mut burst = Burst::default();
+    let info = pcap_link::interface_info(nic).map_err(|err| err.to_string());
+    let mut l2 = match &info {
+        Ok(info) => {
+            let src = info.mac.unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x0d]);
+            match pcap_link::open(Some(&info.name), DEFAULT_ETHER_TYPE) {
+                Ok(link) => Some((link, src)),
+                Err(err) => {
+                    burst.l2_error = Some(err.to_string());
+                    None
+                }
+            }
+        }
+        Err(err) => {
+            burst.l2_error = Some(err.clone());
+            None
+        }
+    };
+    let scope = nic.map(ipv6_scope).unwrap_or(0);
+    let udp = UdpProbe::open(scope);
+    if udp.is_none() {
+        burst.udp_error = Some("no UDP socket for discovery".into());
+    }
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_millis())
@@ -208,22 +552,40 @@ pub fn discover(
         if generation.load(Ordering::SeqCst) != expected {
             break;
         }
-        let id = base.wrapping_add(index);
-        let frame = announce_frame(src, id);
-        link.send(&frame.encode()).map_err(|err| err.to_string())?;
+        let id = EXT_MARK | (base.wrapping_add(index) & !MARK_MASK);
+        if let Some((link, src)) = l2.as_mut() {
+            if let Err(err) = link.send(&announce_frame(*src, id).encode()) {
+                burst.l2_error = Some(err.to_string());
+                l2 = None;
+            }
+        }
+        if let Some(udp) = &udp {
+            udp.send(&encode_header(VERSION, ANNOUNCE, id));
+        }
         pending.insert(id, Instant::now());
-        drain(&mut link, &pending, &mut acc, GAP, generation, expected);
+        drain(&mut l2, &udp, &pending, &mut acc, GAP, generation, expected);
     }
     if generation.load(Ordering::SeqCst) == expected {
-        drain(&mut link, &pending, &mut acc, TAIL, generation, expected);
+        drain(&mut l2, &udp, &pending, &mut acc, TAIL, generation, expected);
     }
     let mut found: Vec<Found> = acc.into_values().map(Acc::finish).collect();
-    found.sort_by(|a, b| a.name.cmp(&b.name).then(a.l2_mac.cmp(&b.l2_mac)));
-    Ok(found)
+    found.sort_by(|a, b| a.name.cmp(&b.name).then(a.key.cmp(&b.key)));
+    burst.found = found;
+    burst
 }
 
 /// Answer announces until `stop` is set. One reply per announce.
 pub fn serve(nic: Option<&str>, card: &HostCard, stop: &AtomicBool) -> Result<(), String> {
+    serve_with(nic, card, &NoExtras, stop)
+}
+
+/// [`serve`], with capabilities and a thumbnail for a player that asks for them.
+pub fn serve_with(
+    nic: Option<&str>,
+    card: &HostCard,
+    extras: &dyn OfferExtras,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     let info = pcap_link::interface_info(nic).map_err(|err| err.to_string())?;
     let src = info.mac.unwrap_or(card.l2_mac);
     let mut link =
@@ -233,7 +595,9 @@ pub fn serve(nic: Option<&str>, card: &HostCard, stop: &AtomicBool) -> Result<()
             Ok(Some(raw)) => {
                 if let Some(id_dst) = announce_for_us(&raw, src) {
                     let (id, dst) = id_dst;
-                    let frame = offer_frame(src, dst, id, card, &info);
+                    let payload =
+                        offer_payload(id, card, &info, extras, L2_PAYLOAD_LIMIT);
+                    let frame = offer_frame_with(src, dst, payload);
                     if let Err(err) = link.send(&frame.encode()) {
                         eprintln!("discovery reply: {err}");
                     }
@@ -252,7 +616,139 @@ pub fn serve(nic: Option<&str>, card: &HostCard, stop: &AtomicBool) -> Result<()
     Ok(())
 }
 
+/// Answer UDP announces on [`UDP_PORT`] until `stop` is set. Needs no raw socket.
+pub fn serve_udp(
+    nic: Option<&str>,
+    card: &HostCard,
+    extras: &dyn OfferExtras,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let info = pcap_link::interface_info(nic).unwrap_or_else(|_| InterfaceInfo {
+        name: nic.unwrap_or_default().to_string(),
+        mac: None,
+        ipv4: Vec::new(),
+        ipv6: Vec::new(),
+    });
+    // Bind IPv6 first: on Linux that socket is dual-stack and the IPv4 bind
+    // then fails, which is fine. On Windows it is IPv6-only and both bind.
+    let mut sockets = Vec::new();
+    let mut last_err = String::new();
+    for addr in [
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, UDP_PORT)),
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, UDP_PORT)),
+    ] {
+        match UdpSocket::bind(addr) {
+            Ok(socket) => {
+                if socket.set_read_timeout(Some(Duration::from_millis(50))).is_ok() {
+                    sockets.push(socket);
+                }
+            }
+            Err(err) => last_err = format!("bind {addr}: {err}"),
+        }
+    }
+    if sockets.is_empty() {
+        return Err(last_err);
+    }
+    if let Some(v6) = sockets.first() {
+        let scope = ipv6_scope(&info.name);
+        let _ = v6.join_multicast_v6(&ALL_NODES, scope);
+    }
+    let mut buf = [0u8; 2048];
+    while !stop.load(Ordering::SeqCst) {
+        for socket in &sockets {
+            let Ok((len, from)) = socket.recv_from(&mut buf) else {
+                continue;
+            };
+            let Some(id) = decode_announce(&buf[..len]) else {
+                continue;
+            };
+            let limit = udp_limit(&from);
+            let payload = offer_payload(id, card, &info, extras, limit);
+            if let Err(err) = socket.send_to(&payload, from) {
+                eprintln!("discovery reply over UDP to {from}: {err}");
+            }
+        }
+    }
+    Ok(())
+}
+
+const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// Payload room for a reply to `peer`. An IPv4-mapped peer is IPv4 on the wire.
+pub fn udp_limit(peer: &SocketAddr) -> usize {
+    match peer.ip() {
+        IpAddr::V4(_) => UDP4_PAYLOAD_LIMIT,
+        IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => UDP4_PAYLOAD_LIMIT,
+        IpAddr::V6(_) => UDP6_PAYLOAD_LIMIT,
+    }
+}
+
+/// Interface index for IPv6 multicast. `0` lets the system choose.
+fn ipv6_scope(name: &str) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        0
+    }
+}
+
+/// Player side UDP sockets: IPv4 broadcast and IPv6 all-nodes multicast.
+struct UdpProbe {
+    v4: Option<UdpSocket>,
+    v6: Option<UdpSocket>,
+    scope: u32,
+}
+
+impl UdpProbe {
+    fn open(scope: u32) -> Option<Self> {
+        let v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok().and_then(|socket| {
+            socket.set_broadcast(true).ok()?;
+            socket.set_nonblocking(true).ok()?;
+            Some(socket)
+        });
+        let v6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok().and_then(|socket| {
+            socket.set_nonblocking(true).ok()?;
+            Some(socket)
+        });
+        if v4.is_none() && v6.is_none() {
+            return None;
+        }
+        Some(Self { v4, v6, scope })
+    }
+
+    fn send(&self, payload: &[u8]) {
+        if let Some(socket) = &self.v4 {
+            let _ = socket.send_to(payload, (Ipv4Addr::BROADCAST, UDP_PORT));
+        }
+        if let Some(socket) = &self.v6 {
+            let to = SocketAddrV6::new(ALL_NODES, UDP_PORT, 0, self.scope);
+            let _ = socket.send_to(payload, to);
+        }
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        for socket in [&self.v4, &self.v6].into_iter().flatten() {
+            if let Ok(got) = socket.recv_from(buf) {
+                return Some(got);
+            }
+        }
+        None
+    }
+}
+
 struct Acc {
+    key: Mac,
+    caps: Option<Capabilities>,
+    thumbnail: Option<Vec<u8>>,
+    via_l2: bool,
+    via_udp: bool,
     name: String,
     l2_mac: Mac,
     l2_service: u16,
@@ -282,12 +778,18 @@ impl Acc {
             l2_backend: self.l2_backend,
             samples_ms,
             stats,
+            key: self.key,
+            caps: self.caps,
+            thumbnail: self.thumbnail,
+            via_l2: self.via_l2,
+            via_udp: self.via_udp,
         }
     }
 }
 
 fn drain(
-    link: &mut pcap_link::Link,
+    l2: &mut Option<(pcap_link::Link, Mac)>,
+    udp: &Option<UdpProbe>,
     pending: &HashMap<u32, Instant>,
     acc: &mut HashMap<Mac, Acc>,
     budget: Duration,
@@ -295,27 +797,86 @@ fn drain(
     expected: u64,
 ) {
     let deadline = Instant::now() + budget;
+    let mut buf = [0u8; 2048];
     while Instant::now() < deadline {
         if generation.load(Ordering::SeqCst) != expected {
             return;
         }
-        match link.recv() {
-            Ok(Some(raw)) => note_offer(&raw, pending, acc),
-            Ok(None) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => thread::sleep(Duration::from_millis(5)),
+        let mut idle = true;
+        if let Some((link, _)) = l2.as_mut() {
+            if let Ok(Some(raw)) = link.recv() {
+                idle = false;
+                if let Some((id, body, mac, src)) = decode_offer_frame(&raw) {
+                    note_offer(id, body, mac, Heard::L2(src), pending, acc);
+                }
+            }
+        }
+        if let Some(udp) = udp {
+            while let Some((len, from)) = udp.recv(&mut buf) {
+                idle = false;
+                if let Some((id, body)) = decode_offer(&buf[..len]) {
+                    if let Some(mac) = body_mac(&buf[..len]) {
+                        note_offer(id, body, mac, Heard::Udp(from), pending, acc);
+                    }
+                }
+            }
+        }
+        if idle {
+            thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
-fn note_offer(raw: &[u8], pending: &HashMap<u32, Instant>, acc: &mut HashMap<Mac, Acc>) {
-    let Some((id, info, mac)) = decode_offer_frame(raw) else {
-        return;
-    };
+enum Heard {
+    L2(Mac),
+    Udp(SocketAddr),
+}
+
+/// Which host this is. A version-3 offer names its adapter; otherwise the
+/// Ethernet source tells hosts apart, and over UDP the address does.
+fn host_key(body: &OfferBody, heard: &Heard, mac: Mac) -> Mac {
+    if let Some(nic) = body.caps.as_ref().and_then(|caps| caps.nic_mac) {
+        return nic;
+    }
+    match heard {
+        Heard::L2(src) => *src,
+        Heard::Udp(from) => {
+            let mut key = [0x06, 0, 0, 0, 0, 0];
+            let octets = match from.ip() {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            for (index, byte) in octets.iter().enumerate() {
+                key[1 + index % 5] ^= byte;
+            }
+            if key == [0x06, 0, 0, 0, 0, 0] {
+                mac
+            } else {
+                key
+            }
+        }
+    }
+}
+
+fn note_offer(
+    id: u32,
+    info: OfferBody,
+    mac: Mac,
+    heard: Heard,
+    pending: &HashMap<u32, Instant>,
+    acc: &mut HashMap<Mac, Acc>,
+) {
     let Some(sent) = pending.get(&id) else {
         return;
     };
     let ms = sent.elapsed().as_secs_f32() * 1000.0;
-    let row = acc.entry(mac).or_insert_with(|| Acc {
+    let key = host_key(&info, &heard, mac);
+    let row = acc.entry(key).or_insert_with(|| Acc {
+        key,
+        caps: None,
+        thumbnail: None,
+        via_l2: false,
+        via_udp: false,
         name: info.name.clone(),
         l2_mac: mac,
         l2_service: info.l2_service,
@@ -327,15 +888,34 @@ fn note_offer(raw: &[u8], pending: &HashMap<u32, Instant>, acc: &mut HashMap<Mac
         l2_backend: info.l2_backend,
         samples: Vec::new(),
     });
+    match heard {
+        Heard::L2(_) => row.via_l2 = true,
+        Heard::Udp(_) => row.via_udp = true,
+    }
     row.name = info.name;
+    row.l2_mac = mac;
     row.l2_service = info.l2_service;
     row.l3_port = info.l3_port;
     row.ipv4 = info.ipv4;
     row.ipv6 = info.ipv6;
     row.video = info.video;
     row.audio = info.audio;
-    row.l2_backend = info.l2_backend;
-    row.samples.push((id, ms));
+    if info.l2_backend != 0 || row.l2_backend == 0 {
+        row.l2_backend = info.l2_backend;
+    }
+    if info.caps.is_some() {
+        row.caps = info.caps;
+    }
+    // Keep the larger picture: the L2 and UDP replies may differ in room.
+    if let Some(thumb) = info.thumbnail {
+        if row.thumbnail.as_ref().is_none_or(|old| old.len() < thumb.len()) {
+            row.thumbnail = Some(thumb);
+        }
+    }
+    // The same probe id answered over two transports is one sample.
+    if !row.samples.iter().any(|(seen, _)| *seen == id) {
+        row.samples.push((id, ms));
+    }
 }
 
 struct OfferBody {
@@ -347,6 +927,8 @@ struct OfferBody {
     video: Option<Vec<AnnouncedCodec>>,
     audio: Option<Vec<AnnouncedCodec>>,
     l2_backend: u8,
+    caps: Option<Capabilities>,
+    thumbnail: Option<Vec<u8>>,
 }
 
 fn announce_frame(src: Mac, id: u32) -> Frame {
@@ -360,10 +942,25 @@ fn announce_frame(src: Mac, id: u32) -> Frame {
     }
 }
 
-fn offer_frame(src: Mac, dst: Mac, id: u32, card: &HostCard, info: &InterfaceInfo) -> Frame {
+/// The offer an unmarked (older) announce gets, byte for byte what older hosts sent.
+fn legacy_payload(id: u32, card: &HostCard, info: &InterfaceInfo) -> Vec<u8> {
     let codecs = card.video.is_some() || card.audio.is_some();
     let version = if codecs { VERSION_CODECS } else { VERSION };
     let mut payload = encode_header(version, OFFER, id);
+    write_body(&mut payload, card, info);
+    if codecs {
+        write_codecs(&mut payload, card.video.as_deref().unwrap_or(&[]));
+        write_codecs(&mut payload, card.audio.as_deref().unwrap_or(&[]));
+        // One byte, only when the host knows its driver. A missing byte is
+        // still a version-2 offer, so an older host keeps answering.
+        if card.l2_backend != 0 {
+            payload.push(card.l2_backend);
+        }
+    }
+    payload
+}
+
+fn write_body(payload: &mut Vec<u8>, card: &HostCard, info: &InterfaceInfo) {
     payload.extend(card.l2_mac);
     payload.extend(card.l2_service.to_be_bytes());
     payload.extend(card.l3_port.to_be_bytes());
@@ -380,15 +977,63 @@ fn offer_frame(src: Mac, dst: Mac, id: u32, card: &HostCard, info: &InterfaceInf
     for ip in v6 {
         payload.extend(ip.octets());
     }
-    if codecs {
-        write_codecs(&mut payload, card.video.as_deref().unwrap_or(&[]));
-        write_codecs(&mut payload, card.audio.as_deref().unwrap_or(&[]));
-        // One byte, only when the host knows its driver. A missing byte is
-        // still a version-2 offer, so an older host keeps answering.
-        if card.l2_backend != 0 {
-            payload.push(card.l2_backend);
+}
+
+/// The reply to announce `id`, never longer than `limit`. A marked announce
+/// gets a version-3 offer: capabilities when they fit, then a thumbnail in
+/// whatever room is left, or none.
+pub fn offer_payload(
+    id: u32,
+    card: &HostCard,
+    info: &InterfaceInfo,
+    extras: &dyn OfferExtras,
+    limit: usize,
+) -> Vec<u8> {
+    if id & MARK_MASK != EXT_MARK {
+        return legacy_payload(id, card, info);
+    }
+    let mut payload = encode_header(VERSION_EXT, OFFER, id);
+    write_body(&mut payload, card, info);
+    write_codecs(&mut payload, card.video.as_deref().unwrap_or(&[]));
+    write_codecs(&mut payload, card.audio.as_deref().unwrap_or(&[]));
+    payload.push(card.l2_backend);
+    if payload.len() > limit {
+        // Cannot happen with the field caps above; an older offer still fits.
+        return legacy_payload(id, card, info);
+    }
+    if let Some(caps) = extras.capabilities() {
+        let mut caps = caps;
+        if caps.nic_mac.is_none() {
+            caps.nic_mac = info.mac;
+        }
+        let record = caps.encode();
+        if payload.len() + TLV_HEADER + record.len() <= limit {
+            push_tlv(&mut payload, TLV_CAPS, &record);
         }
     }
+    if let Some(budget) = thumbnail_budget(limit, payload.len()) {
+        if let Some(thumb) = extras.thumbnail(budget) {
+            if !thumb.is_empty() && thumb.len() <= budget {
+                push_tlv(&mut payload, TLV_THUMBNAIL, &thumb);
+            }
+        }
+    }
+    debug_assert!(payload.len() <= limit);
+    payload
+}
+
+fn push_tlv(payload: &mut Vec<u8>, kind: u8, value: &[u8]) {
+    payload.push(kind);
+    payload.extend((value.len() as u16).to_be_bytes());
+    payload.extend(value);
+}
+
+#[cfg(test)]
+fn offer_frame(src: Mac, dst: Mac, id: u32, card: &HostCard, info: &InterfaceInfo) -> Frame {
+    offer_frame_with(src, dst, legacy_payload(id, card, info))
+}
+
+fn offer_frame_with(src: Mac, dst: Mac, payload: Vec<u8>) -> Frame {
     Frame {
         dst,
         src,
@@ -411,7 +1056,7 @@ fn announce_for_us(raw: &[u8], ether_src: Mac) -> Option<(u32, Mac)> {
     Some((id, frame.src))
 }
 
-fn decode_offer_frame(raw: &[u8]) -> Option<(u32, OfferBody, Mac)> {
+fn decode_offer_frame(raw: &[u8]) -> Option<(u32, OfferBody, Mac, Mac)> {
     let frame = Frame::decode(raw).ok()?;
     if !is_discovery(&frame) {
         return None;
@@ -421,7 +1066,7 @@ fn decode_offer_frame(raw: &[u8]) -> Option<(u32, OfferBody, Mac)> {
         return None;
     }
     let mac = body_mac(&frame.payload)?;
-    Some((id, body, mac))
+    Some((id, body, mac, frame.src))
 }
 
 fn body_mac(payload: &[u8]) -> Option<Mac> {
@@ -508,7 +1153,7 @@ fn decode_announce(payload: &[u8]) -> Option<u32> {
 
 fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
     let (version, kind, id, mut rest) = split_header(payload)?;
-    if kind != OFFER || (version != VERSION && version != VERSION_CODECS) {
+    if kind != OFFER || !matches!(version, VERSION | VERSION_CODECS | VERSION_EXT) {
         return None;
     }
     let mac_bytes = take(&mut rest, 6)?;
@@ -544,12 +1189,14 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
         let octets: [u8; 16] = take(&mut rest, 16)?.try_into().ok()?;
         ipv6.push(Ipv6Addr::from(octets));
     }
+    let mut caps = None;
+    let mut thumbnail = None;
     let (video, audio, l2_backend) = if version == VERSION {
         if !rest.is_empty() {
             return None;
         }
         (None, None, 0)
-    } else {
+    } else if version == VERSION_CODECS {
         let video = read_codecs(&mut rest)?;
         let audio = read_codecs(&mut rest)?;
         let l2_backend = match rest.len() {
@@ -557,6 +1204,25 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
             1 => rest[0],
             _ => return None,
         };
+        (Some(video), Some(audio), l2_backend)
+    } else {
+        let video = read_codecs(&mut rest)?;
+        let audio = read_codecs(&mut rest)?;
+        let l2_backend = take_u8(&mut rest)?;
+        // A record cut short ends the list; what came before still counts.
+        while rest.len() >= TLV_HEADER {
+            let kind = rest[0];
+            let len = u16::from_be_bytes([rest[1], rest[2]]) as usize;
+            rest = &rest[TLV_HEADER..];
+            let Some(value) = take(&mut rest, len) else {
+                break;
+            };
+            match kind {
+                TLV_CAPS => caps = Capabilities::parse(value),
+                TLV_THUMBNAIL => thumbnail = Some(value.to_vec()),
+                _ => {}
+            }
+        }
         (Some(video), Some(audio), l2_backend)
     };
     Some((
@@ -570,6 +1236,8 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
             video,
             audio,
             l2_backend,
+            caps,
+            thumbnail,
         },
     ))
 }
@@ -579,7 +1247,7 @@ fn split_header(payload: &[u8]) -> Option<(u8, u8, u32, &[u8])> {
         return None;
     }
     let version = payload[4];
-    if version != VERSION && version != VERSION_CODECS {
+    if !matches!(version, VERSION | VERSION_CODECS | VERSION_EXT) {
         return None;
     }
     let id = u32::from_be_bytes(payload[6..10].try_into().ok()?);
@@ -596,8 +1264,12 @@ fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
 }
 
 fn clip_name(name: &str) -> &[u8] {
+    clip_to(name, MAX_NAME)
+}
+
+fn clip_to(name: &str, max: usize) -> &[u8] {
     let bytes = name.as_bytes();
-    let mut end = bytes.len().min(MAX_NAME);
+    let mut end = bytes.len().min(max);
     while end > 0 && !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -646,7 +1318,7 @@ mod tests {
             &card(),
             &info(),
         );
-        let (id, body, mac) = decode_offer_frame(&offer.encode()).unwrap();
+        let (id, body, mac, _) = decode_offer_frame(&offer.encode()).unwrap();
         assert_eq!(id, 0x11);
         assert_eq!(mac, card().l2_mac);
         assert_eq!(body.name, "etherquic");
@@ -689,7 +1361,7 @@ mod tests {
             &announced,
             &info(),
         );
-        let (id, body, _) = decode_offer_frame(&offer.encode()).unwrap();
+        let (id, body, _, _) = decode_offer_frame(&offer.encode()).unwrap();
         assert_eq!(id, 7);
         let video = body.video.unwrap();
         assert_eq!(video.len(), 1);
@@ -713,7 +1385,7 @@ mod tests {
         announced.audio = Some(vec![]);
         announced.l2_backend = L2_NPCAP;
         let offer = offer_frame([1; 6], [2; 6], 9, &announced, &info());
-        let (_, body, _) = decode_offer_frame(&offer.encode()).unwrap();
+        let (_, body, _, _) = decode_offer_frame(&offer.encode()).unwrap();
         assert_eq!(body.l2_backend, L2_NPCAP);
         assert_eq!(l2_backend_label(body.l2_backend), "npcap");
         assert_eq!(l2_backend_label(L2_LIBPCAP), "libpcap");
@@ -722,7 +1394,7 @@ mod tests {
 
         announced.l2_backend = 0;
         let plain = offer_frame([1; 6], [2; 6], 9, &announced, &info());
-        let (_, body, _) = decode_offer_frame(&plain.encode()).unwrap();
+        let (_, body, _, _) = decode_offer_frame(&plain.encode()).unwrap();
         assert_eq!(body.l2_backend, 0);
 
         let mut extra = offer.payload;
@@ -737,6 +1409,327 @@ mod tests {
         let mut offer = offer_frame([1; 6], [2; 6], 3, &card(), &info()).payload;
         offer.pop();
         assert!(decode_offer(&offer).is_none());
+    }
+
+    fn full_caps() -> Capabilities {
+        Capabilities {
+            os: OS_WINDOWS,
+            os_label: "Windows 11 Pro 24H2 build 26100.4652 extra".into(),
+            hostname: "a-very-long-host-name-that-goes-on-and-on-and-on-past-the-limit-xyz".into(),
+            nic_mac: Some([0x04, 0x7c, 0x16, 0xe4, 0x72, 0x24]),
+            monitors: (0..20)
+                .map(|i| MonitorInfo {
+                    width: 3840,
+                    height: 2160,
+                    refresh_centihz: 14400,
+                    x: (i * 3840) as i16,
+                    y: -1080,
+                    primary: i == 0,
+                })
+                .collect(),
+            inputs: INPUT_KEYBOARD | INPUT_MOUSE | INPUT_TOUCH | INPUT_PEN,
+            virtual_pad: VPAD_VIGEM,
+            pads: (0..12)
+                .map(|_| PadInfo {
+                    api: PAD_API_XINPUT,
+                    kind: PAD_KIND_GAMEPAD,
+                    name: "Controller (Xbox One For Windows) with a long name".into(),
+                })
+                .collect(),
+            audio_outputs: (0..6).map(|i| format!("Speakers {i} (High Definition Audio Device)")).collect(),
+            audio_inputs: vec!["Microphone".into()],
+        }
+    }
+
+    struct Fixed {
+        caps: Option<Capabilities>,
+        /// Thumbnail length to hand back: `budget` minus this.
+        short_by: Option<isize>,
+    }
+
+    impl OfferExtras for Fixed {
+        fn capabilities(&self) -> Option<Capabilities> {
+            self.caps.clone()
+        }
+        fn thumbnail(&self, budget: usize) -> Option<Vec<u8>> {
+            let len = budget as isize - self.short_by?;
+            (len > 0).then(|| vec![0xff; len as usize])
+        }
+    }
+
+    fn big_info() -> InterfaceInfo {
+        InterfaceInfo {
+            name: "enp4s0".into(),
+            mac: Some([0x04, 0x7c, 0x16, 0xe4, 0x72, 0x24]),
+            ipv4: (1..=9).map(|n| Ipv4Addr::new(10, 0, 0, n)).collect(),
+            ipv6: (1..=9u16)
+                .map(|n| Ipv6Addr::new(0x2604, 0x3d09, 0, 0, 0, 0, 0, n))
+                .collect(),
+        }
+    }
+
+    fn big_card() -> HostCard {
+        let codec = AnnouncedCodec {
+            id: VIDEO_AV1,
+            hardware_encode: true,
+            hardware_decode: true,
+            cpu: true,
+            gpu: true,
+            libopus: true,
+            ffmpeg: true,
+            gstreamer: true,
+        };
+        HostCard {
+            name: "x".repeat(200),
+            video: Some(vec![codec; 20]),
+            audio: Some(vec![codec; 20]),
+            l2_backend: L2_NPCAP,
+            ..card()
+        }
+    }
+
+    #[test]
+    fn capabilities_round_trip_and_clip() {
+        let caps = full_caps();
+        let parsed = Capabilities::parse(&caps.encode()).unwrap();
+        assert_eq!(parsed.os, OS_WINDOWS);
+        assert_eq!(parsed.os_label.len(), MAX_OS_LABEL);
+        assert_eq!(parsed.hostname.len(), MAX_HOSTNAME);
+        assert_eq!(parsed.nic_mac, caps.nic_mac);
+        assert_eq!(parsed.monitors.len(), MAX_MONITORS);
+        assert_eq!(parsed.monitors[0], caps.monitors[0]);
+        assert_eq!(parsed.monitors[1].x, 3840);
+        assert_eq!(parsed.monitors[1].y, -1080);
+        assert_eq!(parsed.inputs, caps.inputs);
+        assert_eq!(parsed.virtual_pad, VPAD_VIGEM);
+        assert_eq!(parsed.pads.len(), MAX_PADS);
+        assert_eq!(parsed.pads[0].name.len(), MAX_PAD_NAME);
+
+        let small = Capabilities {
+            hostname: "hyte".into(),
+            monitors: vec![MonitorInfo {
+                width: 2560,
+                height: 1440,
+                refresh_centihz: 16500,
+                x: 0,
+                y: 0,
+                primary: true,
+            }],
+            ..Capabilities::default()
+        };
+        assert_eq!(Capabilities::parse(&small.encode()), Some(small.clone()));
+        assert_eq!(small.monitors[0].refresh_hz(), 165.0);
+    }
+
+    #[test]
+    fn audio_devices_are_optional_trailing_fields() {
+        let caps = full_caps();
+        let bytes = caps.encode();
+        let parsed = Capabilities::parse(&bytes).unwrap();
+        assert_eq!(parsed.audio_outputs.len(), MAX_AUDIO_DEVICES);
+        assert_eq!(parsed.audio_outputs[0].len(), MAX_AUDIO_NAME);
+        assert_eq!(parsed.audio_inputs, vec!["Microphone".to_string()]);
+        // An older host stops after the controllers: no devices, still parsed.
+        let older = Capabilities {
+            audio_outputs: Vec::new(),
+            audio_inputs: Vec::new(),
+            ..caps.clone()
+        }
+        .encode();
+        let older = &older[..older.len() - 2];
+        let parsed = Capabilities::parse(older).unwrap();
+        assert!(parsed.audio_outputs.is_empty() && parsed.audio_inputs.is_empty());
+        assert_eq!(parsed.pads.len(), MAX_PADS);
+        // Cut inside the device names: the controllers survive, the cut list does not.
+        let cut = &bytes[..bytes.len() - 5];
+        let parsed = Capabilities::parse(cut).unwrap();
+        assert_eq!(parsed.pads.len(), MAX_PADS);
+        assert!(parsed.audio_inputs.is_empty());
+    }
+
+    #[test]
+    fn capabilities_from_a_newer_host_keep_known_fields() {
+        let caps = full_caps();
+        let mut newer = caps.encode();
+        newer[0] = CAPS_VERSION + 4;
+        newer.extend([0xde, 0xad, 0xbe, 0xef]);
+        let parsed = Capabilities::parse(&newer).unwrap();
+        assert_eq!(parsed.hostname, Capabilities::parse(&caps.encode()).unwrap().hostname);
+        assert_eq!(parsed.pads.len(), MAX_PADS);
+        // A cut inside a required field is rejected, not half read.
+        let core = Capabilities {
+            audio_outputs: Vec::new(),
+            audio_inputs: Vec::new(),
+            ..caps.clone()
+        }
+        .encode();
+        let core = &core[..core.len() - 2];
+        for cut in [0, 1, 5, core.len() / 2, core.len() - 1] {
+            assert!(Capabilities::parse(&core[..cut]).is_none(), "cut {cut}");
+        }
+        assert!(Capabilities::parse(&[0]).is_none());
+    }
+
+    #[test]
+    fn an_older_player_gets_the_older_offer() {
+        let extras = Fixed {
+            caps: Some(full_caps()),
+            short_by: Some(0),
+        };
+        let mut announced = card();
+        announced.video = Some(vec![]);
+        announced.audio = Some(vec![]);
+        announced.l2_backend = L2_LIBPCAP;
+        // Ids from an older player never carry the mark.
+        let payload = offer_payload(0x0000_03e7, &announced, &info(), &extras, L2_PAYLOAD_LIMIT);
+        assert_eq!(payload[4], VERSION_CODECS);
+        // Byte for byte what an older host sends: header, body, codecs, driver byte.
+        let mut expected = encode_header(VERSION_CODECS, OFFER, 0x3e7);
+        expected.extend(announced.l2_mac);
+        expected.extend(4433u16.to_be_bytes());
+        expected.extend(4433u16.to_be_bytes());
+        expected.push(9);
+        expected.extend(b"etherquic");
+        expected.extend([1, 192, 168, 0, 58, 1]);
+        expected.extend("fe80::1".parse::<Ipv6Addr>().unwrap().octets());
+        expected.extend([0, 0, L2_LIBPCAP]);
+        assert_eq!(payload, expected);
+        // A version-1 card still gets version 1.
+        let v1 = offer_payload(7, &card(), &info(), &extras, L2_PAYLOAD_LIMIT);
+        assert_eq!(v1[4], VERSION);
+        assert_eq!(v1, legacy_payload(7, &card(), &info()));
+    }
+
+    /// What an older player does with an offer: versions 1 and 2 only, and
+    /// nothing after the driver byte.
+    fn older_player_accepts(payload: &[u8]) -> bool {
+        if payload.len() < HEADER || &payload[..4] != MAGIC {
+            return false;
+        }
+        matches!(payload[4], VERSION | VERSION_CODECS) && decode_offer(payload).is_some()
+    }
+
+    #[test]
+    fn version_three_is_ignored_by_older_players_and_read_by_newer_ones() {
+        let extras = Fixed {
+            caps: Some(full_caps()),
+            short_by: Some(0),
+        };
+        let id = EXT_MARK | 42;
+        let payload = offer_payload(id, &card(), &info(), &extras, L2_PAYLOAD_LIMIT);
+        assert_eq!(payload[4], VERSION_EXT);
+        assert!(!older_player_accepts(&payload));
+        let (got, body) = decode_offer(&payload).unwrap();
+        assert_eq!(got, id);
+        assert_eq!(body.name, "etherquic");
+        assert_eq!(body.video, Some(vec![]));
+        let caps = body.caps.unwrap();
+        assert_eq!(caps.nic_mac, full_caps().nic_mac);
+        assert_eq!(caps.monitors.len(), MAX_MONITORS);
+        assert!(body.thumbnail.is_some());
+        // A newer player still reads an older host's offer, without extras.
+        let old = legacy_payload(5, &card(), &info());
+        let (_, body) = decode_offer(&old).unwrap();
+        assert!(body.caps.is_none() && body.thumbnail.is_none());
+        // The adapter MAC is filled in when the host did not say.
+        let anon = Fixed {
+            caps: Some(Capabilities::default()),
+            short_by: None,
+        };
+        let payload = offer_payload(id, &card(), &info(), &anon, L2_PAYLOAD_LIMIT);
+        let (_, body) = decode_offer(&payload).unwrap();
+        assert_eq!(body.caps.unwrap().nic_mac, info().mac);
+    }
+
+    #[test]
+    fn unknown_and_cut_records_are_skipped() {
+        let mut payload = encode_header(VERSION_EXT, OFFER, EXT_MARK | 1);
+        write_body(&mut payload, &card(), &info());
+        payload.extend([0, 0, L2_NPCAP]);
+        push_tlv(&mut payload, 0x7f, b"from the future");
+        let caps = Capabilities {
+            hostname: "box".into(),
+            ..Capabilities::default()
+        };
+        push_tlv(&mut payload, TLV_CAPS, &caps.encode());
+        // A thumbnail record that claims more than arrived.
+        payload.extend([TLV_THUMBNAIL, 0x05, 0x00, 1, 2, 3]);
+        let (_, body) = decode_offer(&payload).unwrap();
+        assert_eq!(body.l2_backend, L2_NPCAP);
+        assert_eq!(body.caps.unwrap().hostname, "box");
+        assert!(body.thumbnail.is_none());
+        // A version-3 offer without its driver byte is malformed.
+        let mut short = encode_header(VERSION_EXT, OFFER, 1);
+        write_body(&mut short, &card(), &info());
+        short.extend([0, 0]);
+        assert!(decode_offer(&short).is_none());
+    }
+
+    #[test]
+    fn budget_math() {
+        assert_eq!(L2_PAYLOAD_LIMIT, 1494);
+        assert_eq!(UDP4_PAYLOAD_LIMIT, 1472);
+        assert_eq!(UDP6_PAYLOAD_LIMIT, 1452);
+        assert_eq!(thumbnail_budget(1494, 200), Some(1291));
+        assert_eq!(thumbnail_budget(1494, 1494), None);
+        assert_eq!(thumbnail_budget(1494, 1494 - TLV_HEADER - MIN_THUMBNAIL), Some(MIN_THUMBNAIL));
+        assert_eq!(thumbnail_budget(1494, 1494 - TLV_HEADER - MIN_THUMBNAIL + 1), None);
+        assert_eq!(thumbnail_budget(100, 5000), None);
+        assert_eq!(udp_limit(&"10.0.0.1:4440".parse().unwrap()), UDP4_PAYLOAD_LIMIT);
+        assert_eq!(udp_limit(&"[::ffff:10.0.0.1]:4440".parse().unwrap()), UDP4_PAYLOAD_LIMIT);
+        assert_eq!(udp_limit(&"[fe80::1]:4440".parse().unwrap()), UDP6_PAYLOAD_LIMIT);
+    }
+
+    #[test]
+    fn offers_never_exceed_the_frame() {
+        let limits = [L2_PAYLOAD_LIMIT, UDP4_PAYLOAD_LIMIT, UDP6_PAYLOAD_LIMIT, 600, 200];
+        let shapes = [
+            (card(), info()),
+            (big_card(), big_info()),
+        ];
+        // A thumbnail exactly as big as asked, one byte over, and none.
+        for short_by in [Some(0), Some(-1), Some(10), None] {
+            for caps in [None, Some(full_caps())] {
+                let extras = Fixed {
+                    caps: caps.clone(),
+                    short_by,
+                };
+                for (card, info) in &shapes {
+                    for limit in limits {
+                        let payload = offer_payload(EXT_MARK | 9, card, info, &extras, limit);
+                        assert!(payload.len() <= limit, "{} > {limit}", payload.len());
+                        let frame = offer_frame_with([1; 6], [2; 6], payload.clone()).encode();
+                        assert!(frame.len() <= crate::frame::ETHER_HEADER_LEN + MTU);
+                        let (_, body) = decode_offer(&payload).expect("still decodes");
+                        if short_by == Some(0) && limit == L2_PAYLOAD_LIMIT {
+                            // The picture fills the frame exactly.
+                            assert_eq!(payload.len(), limit);
+                            assert!(body.thumbnail.is_some());
+                        }
+                        if short_by == Some(-1) {
+                            assert!(body.thumbnail.is_none(), "oversized picture sent");
+                        }
+                    }
+                }
+            }
+        }
+        // With no room left, the offer still goes out with no picture.
+        let extras = Fixed {
+            caps: Some(full_caps()),
+            short_by: Some(0),
+        };
+        let payload = offer_payload(EXT_MARK, &big_card(), &big_info(), &extras, 200);
+        let (_, body) = decode_offer(&payload).unwrap();
+        assert!(body.thumbnail.is_none());
+        assert!(body.caps.is_none(), "caps did not fit in 200 bytes");
+    }
+
+    #[test]
+    fn marked_announce_is_still_an_announce() {
+        let announce = announce_frame([0xd8, 0x5e, 0xd3, 0x88, 0x5e, 0x0e], EXT_MARK | 5);
+        let bytes = announce.encode();
+        // An older host reads the id and answers it like any other.
+        assert_eq!(decode_announce(&Frame::decode(&bytes).unwrap().payload), Some(EXT_MARK | 5));
     }
 
     #[test]

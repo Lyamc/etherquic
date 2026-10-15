@@ -21,6 +21,8 @@ pub struct Connect {
     pub local_mac: [u8; 6],
     pub peer_mac: [u8; 6],
     pub service_id: u16,
+    /// Dial the host over UDP instead of raw Ethernet.
+    pub udp: Option<std::net::SocketAddr>,
 }
 
 pub enum Command {
@@ -77,6 +79,7 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
     let mut local_mac = CLIENT_MAC;
     let mut peer_mac = None;
     let mut service_id = SERVICE_ID;
+    let mut udp = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -86,15 +89,21 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
             }
             "--peer-mac" => peer_mac = Some(mac(need(args, &mut i, "--peer-mac")?)?),
             "--service-id" => service_id = number(need(args, &mut i, "--service-id")?)?,
+            "--udp" => udp = Some(number(need(args, &mut i, "--udp")?)?),
             other => return Err(format!("unknown arg {other}\n{}", usage())),
         }
     }
-    let peer_mac = peer_mac.ok_or_else(|| format!("missing --peer-mac\n{}", usage()))?;
+    let peer_mac = match (peer_mac, udp) {
+        (Some(mac), _) => mac,
+        (None, Some(_)) => HOST_MAC,
+        (None, None) => return Err(format!("missing --peer-mac or --udp\n{}", usage())),
+    };
     Ok(Command::Connect(Connect {
         nic,
         local_mac,
         peer_mac,
         service_id,
+        udp,
     }))
 }
 
@@ -137,6 +146,7 @@ fn usage() -> String {
     "\
 etherquic-play host [--nic IFACE] [--local-mac MAC] [--service-id 4433] [--max-width 1280] [--fps 10]
 etherquic-play connect --peer-mac MAC [--nic IFACE] [--local-mac MAC] [--service-id 4433]
+etherquic-play connect --udp IP:PORT
 
 host shares this desktop, its audio, and takes keyboard, mouse, and gamepad from one player.
 connect opens the view. The player window has to be focused to send the keyboard and the mouse. Gamepads send while that view is open.

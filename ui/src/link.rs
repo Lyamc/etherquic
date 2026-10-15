@@ -238,6 +238,20 @@ fn announced_media(
     }
 }
 
+/// Capabilities and a desktop thumbnail for version-3 offers, refreshed in
+/// the background until `stop` is set.
+fn discovery_extras(stop: Arc<AtomicBool>) -> Arc<dyn etherquic::discover::OfferExtras> {
+    #[cfg(feature = "ui")]
+    {
+        etherquic_play::hostinfo::host_extras(stop)
+    }
+    #[cfg(not(feature = "ui"))]
+    {
+        let _ = stop;
+        Arc::new(etherquic::discover::NoExtras)
+    }
+}
+
 fn host_thread(
     net: Arc<L2Net>,
     cert: PathBuf,
@@ -253,6 +267,9 @@ fn host_thread(
     let discovery_stop = Arc::new(AtomicBool::new(false));
     let discovery_flag = Arc::clone(&discovery_stop);
     let l2_backend = net.l2_backend();
+    // Probed before this host binds, so it names the port the listeners take
+    // (the next free one when another program holds the service number).
+    let l3_port = etherquic::udp_port_for(PLAY_SERVICE_ID);
     let discovery = std::thread::Builder::new()
         .name("etherquic-announce".into())
         .spawn(move || {
@@ -261,13 +278,38 @@ fn host_thread(
                 name: crate::share::machine_name(),
                 l2_mac: HOST_MAC,
                 l2_service: PLAY_SERVICE_ID,
-                l3_port: PLAY_SERVICE_ID,
+                l3_port,
                 video,
                 audio,
                 l2_backend,
             };
-            if let Err(err) = etherquic::discover::serve(nic.as_deref(), &card, &discovery_flag) {
+            let extras = discovery_extras(Arc::clone(&discovery_flag));
+            // UDP answers too, so a player without raw Ethernet still finds this host.
+            let udp = {
+                let (card, extras, flag, nic) = (
+                    card.clone(),
+                    Arc::clone(&extras),
+                    Arc::clone(&discovery_flag),
+                    nic.clone(),
+                );
+                std::thread::Builder::new()
+                    .name("etherquic-announce-udp".into())
+                    .spawn(move || {
+                        if let Err(err) =
+                            etherquic::discover::serve_udp(nic.as_deref(), &card, &*extras, &flag)
+                        {
+                            eprintln!("discovery over UDP: {err}");
+                        }
+                    })
+                    .ok()
+            };
+            if let Err(err) =
+                etherquic::discover::serve_with(nic.as_deref(), &card, &*extras, &discovery_flag)
+            {
                 eprintln!("discovery: {err}");
+            }
+            if let Some(handle) = udp {
+                let _ = handle.join();
             }
         })
         .ok();
@@ -282,6 +324,7 @@ fn host_thread(
             fps: fps.max(1),
             cert,
             key,
+            audio_device: host_audio_device(),
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             etherquic_play::host_desktop(
@@ -388,6 +431,33 @@ fn host_thread(
     }
 }
 
+/// What an open view reads every frame. Settings change it while the view runs.
+#[cfg(feature = "ui")]
+pub fn live_view() -> etherquic_play::LiveView {
+    static VIEW: std::sync::OnceLock<etherquic_play::LiveView> = std::sync::OnceLock::new();
+    Arc::clone(VIEW.get_or_init(|| etherquic_play::live(etherquic_play::ViewOptions::default())))
+}
+
+#[cfg(feature = "ui")]
+static HOST_AUDIO: Mutex<Option<String>> = Mutex::new(None);
+
+/// Desktop audio source the next shared session opens. `None` picks one.
+#[cfg(feature = "ui")]
+pub fn set_host_audio_device(name: Option<String>) {
+    match HOST_AUDIO.lock() {
+        Ok(mut guard) => *guard = name,
+        Err(poisoned) => *poisoned.into_inner() = name,
+    }
+}
+
+#[cfg(feature = "ui")]
+fn host_audio_device() -> Option<String> {
+    match HOST_AUDIO.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 fn client_thread(
     net: Option<Arc<L2Net>>,
     peer: [u8; 6],
@@ -432,6 +502,7 @@ fn open_view(
         service_id: PLAY_SERVICE_ID,
         trace_input,
         udp,
+        view: live_view(),
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         etherquic_play::connect_view(net, session, Arc::clone(&stop), report)

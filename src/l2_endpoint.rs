@@ -349,12 +349,39 @@ impl PacketIo {
     }
 }
 
+static L2_PREFERENCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Driver the next [`L2Net::open`] uses: 0 picks Membrane when its driver is
+/// installed and pcap otherwise, [`crate::discover::L2_MEMBRANE`] needs
+/// Membrane, and [`crate::discover::L2_NPCAP`] or
+/// [`crate::discover::L2_LIBPCAP`] skips it. Off Windows there is only pcap.
+pub fn set_l2_preference(driver: u8) {
+    L2_PREFERENCE.store(driver, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn l2_preference() -> u8 {
+    L2_PREFERENCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn open_packet_io(nic: Option<&str>, ethertype: u16) -> Result<PacketIo, EndpointError> {
     #[cfg(windows)]
-    if let Some(ndis) =
-        crate::ndis_link::NdisLink::try_open().map_err(|e| EndpointError::Other(e.to_string()))?
     {
-        return Ok(PacketIo::Ndis(ndis));
+        let wanted = l2_preference();
+        let pcap_only =
+            wanted == crate::discover::L2_NPCAP || wanted == crate::discover::L2_LIBPCAP;
+        if !pcap_only {
+            match crate::ndis_link::NdisLink::try_open()
+                .map_err(|e| EndpointError::Other(e.to_string()))?
+            {
+                Some(ndis) => return Ok(PacketIo::Ndis(ndis)),
+                None if wanted == crate::discover::L2_MEMBRANE => {
+                    return Err(EndpointError::Other(
+                        "the Membrane driver is not installed; pick Automatic or Npcap".into(),
+                    ))
+                }
+                None => {}
+            }
+        }
     }
     let link = pcap_link::open(nic, ethertype).map_err(|e| EndpointError::Other(e.to_string()))?;
     Ok(PacketIo::Pcap(link))
