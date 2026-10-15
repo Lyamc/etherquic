@@ -27,7 +27,7 @@ use crate::link::{self, Pipe};
 use crate::proto::{self, fit_rgba, AudioChunk, Message};
 
 const MAX_WIDTH: u32 = 1280;
-const FPS: u32 = 10;
+const FPS: u32 = proto::CAPTURE_FPS;
 
 struct Screen {
     width: AtomicU32,
@@ -142,12 +142,9 @@ fn capture_loop(
             logged_desktop = capture.desktop().to_string();
         }
         match result {
-            Ok((jpeg, width, height)) => {
+            Ok((raw, width, height)) => {
                 if logged != Some((width, height)) {
-                    note(
-                        &notes,
-                        format!("frame {width}x{height} jpeg {} bytes", jpeg.len()),
-                    );
+                    note(&notes, format!("frame {width}x{height} raw {} bytes", raw.len()));
                     logged = Some((width, height));
                 }
                 if repeats > 1 {
@@ -155,7 +152,7 @@ fn capture_loop(
                 }
                 last_error.clear();
                 repeats = 0;
-                publish_frame(&frames, jpeg);
+                publish_frame(&frames, raw);
             }
             Err(error) => {
                 // One line per new error, then one a minute. A headless idle
@@ -195,8 +192,7 @@ fn one_frame(
     screen.width.store(width.max(1), Ordering::Relaxed);
     screen.height.store(height.max(1), Ordering::Relaxed);
     let picture = fit_rgba(&rgba, width, height, MAX_WIDTH)?;
-    let jpeg = proto::encode_jpeg(&picture, 40)?;
-    Ok((jpeg, picture.width, picture.height))
+    Ok((picture.raw_payload(), picture.width, picture.height))
 }
 
 /// Silence the loopback owes the player after `gap` with no packet.
@@ -333,13 +329,13 @@ fn write_loop(
                 return;
             }
         }
-        let jpeg = frames
+        let raw = frames
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take();
-        if let Some(jpeg) = jpeg {
+        if let Some(raw) = raw {
             progress = true;
-            if pipe.write_message(&Message::Jpeg(jpeg), stop).is_err() {
+            if pipe.write_message(&Message::Raw(raw), stop).is_err() {
                 failed.store(true, Ordering::SeqCst);
                 return;
             }

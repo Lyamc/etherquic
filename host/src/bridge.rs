@@ -12,14 +12,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use etherquic_input::{encode, Event};
-use tokio::sync::{mpsc, watch};
+use etherquic_media::host::FrameSlot;
+use tokio::sync::mpsc;
 
 use crate::link::{self, Pipe};
-use crate::proto::{AudioChunk, Message};
+use crate::proto::{AudioChunk, Message, Rgb};
 use crate::run::Log;
 
 struct Outbound {
-    video: watch::Sender<Vec<u8>>,
+    video: FrameSlot,
     audio: mpsc::Sender<AudioChunk>,
     acks: mpsc::Sender<Vec<u8>>,
 }
@@ -27,6 +28,7 @@ struct Outbound {
 pub use crate::extras::Picture;
 
 pub struct Desk {
+    log: Log,
     stop: Arc<AtomicBool>,
     /// True while a player is attached. The input thread tells the helper.
     session: Arc<AtomicBool>,
@@ -38,6 +40,8 @@ pub struct Desk {
 
 impl Desk {
     pub fn spawn(log: &Log, picture: Picture) -> Self {
+        // Probe encoders now; the first player should not wait for ffmpeg.
+        etherquic_media::caps::warm();
         let stop = Arc::new(AtomicBool::new(false));
         let session = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
@@ -75,6 +79,7 @@ impl Desk {
             log.line("desk thread failed to start");
         }
         Self {
+            log: log.clone(),
             stop,
             session,
             outbound,
@@ -90,7 +95,7 @@ impl Desk {
 
     pub fn attach(
         &self,
-        video: watch::Sender<Vec<u8>>,
+        video: FrameSlot,
         audio: mpsc::Sender<AudioChunk>,
         acks: mpsc::Sender<Vec<u8>>,
     ) {
@@ -102,16 +107,21 @@ impl Desk {
     }
 
     pub async fn serve_player(&self, conn: quinn::Connection) -> Result<(), String> {
-        let (video_tx, video_rx) = watch::channel(Vec::new());
+        let video = FrameSlot::new();
         let (audio_tx, audio_rx) = mpsc::channel(8);
         let (ack_tx, ack_rx) = mpsc::channel(64);
-        self.attach(video_tx, audio_tx, ack_tx);
+        self.attach(video.clone(), audio_tx, ack_tx);
         // The helper wakes the display and moves onto the input desktop. A
         // screen saver, lock screen, or powered-down output would otherwise
         // hand this player a stale black picture and swallow its input.
         self.session.store(true, Ordering::SeqCst);
         let _guard = Detach(self);
-        crate::media::serve(conn, video_rx, audio_rx, self.input(), ack_rx).await
+        let log = self.log.clone();
+        let media_log: etherquic_media::Log = Arc::new(move |line: &str| log.line(line));
+        let result =
+            crate::media::serve(conn, video.clone(), audio_rx, self.input(), ack_rx, media_log).await;
+        video.close();
+        result
     }
 }
 
@@ -230,18 +240,38 @@ fn reader_loop(
     while !stop.load(Ordering::SeqCst) {
         match pipe.read_message(&stop) {
             Ok(None) => return,
-            Ok(Some(Message::Jpeg(jpeg))) => {
-                if !saw_frame && !jpeg.is_empty() {
-                    log.line(&format!("picture {} bytes", jpeg.len()));
+            Ok(Some(Message::Raw(raw))) => {
+                let rgb = match Rgb::from_raw(&raw) {
+                    Ok(rgb) => rgb,
+                    Err(error) => {
+                        log.line(&format!("picture: {error}"));
+                        continue;
+                    }
+                };
+                if !saw_frame {
+                    log.line(&format!("picture {}x{} raw", rgb.width, rgb.height));
                     saw_frame = true;
                 }
-                // The thumbnail is refreshed every 30 s; one copy a second is plenty.
-                if !jpeg.is_empty() && kept_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                // The thumbnail is refreshed every 30 s; one JPEG a second is plenty.
+                if kept_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                    if let Ok(jpeg) = crate::proto::encode_jpeg(&rgb, 60) {
+                        *lock(&picture) = Some(jpeg);
+                    }
+                    kept_at = Some(Instant::now());
+                }
+                if let Some(slot) = video_sender(&outbound) {
+                    slot.put(etherquic_media::Frame { width: rgb.width, height: rgb.height, rgb: rgb.rgb });
+                }
+            }
+            Ok(Some(Message::Jpeg(jpeg))) => {
+                // A helper from an older build. The service decodes it so the
+                // negotiated encoder still gets raw frames.
+                if kept_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
                     *lock(&picture) = Some(jpeg.clone());
                     kept_at = Some(Instant::now());
                 }
-                if let Some(tx) = video_sender(&outbound) {
-                    let _ = tx.send(jpeg);
+                if let (Some(slot), Ok(frame)) = (video_sender(&outbound), etherquic_media::jpeg::decode(&jpeg)) {
+                    slot.put(frame);
                 }
             }
             Ok(Some(Message::Pcm(bytes))) => match AudioChunk::decode(&bytes) {
@@ -344,7 +374,7 @@ fn input_loop(
     }
 }
 
-fn video_sender(outbound: &Mutex<Option<Outbound>>) -> Option<watch::Sender<Vec<u8>>> {
+fn video_sender(outbound: &Mutex<Option<Outbound>>) -> Option<FrameSlot> {
     lock(outbound).as_ref().map(|out| out.video.clone())
 }
 

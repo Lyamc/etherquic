@@ -375,6 +375,7 @@ version = "0.1.0"
 dependencies = [
  "etherquic",
  "etherquic-input",
+ "etherquic-media",
  "jpeg-encoder",
  "quinn",
  "tokio",
@@ -391,6 +392,19 @@ dependencies = [
  "etherquic",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "etherquic-media"
+version = "0.1.0"
+dependencies = [
+ "etherquic",
+ "jpeg-encoder",
+ "libloading",
+ "quinn",
+ "tokio",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

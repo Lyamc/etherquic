@@ -13,6 +13,10 @@ pub const VIDEO_MAGIC: &[u8; 4] = b"EVID";
 pub const AUDIO_MAGIC: &[u8; 4] = b"EAUD";
 pub const INPUT_MAGIC: &[u8; 4] = b"EINP";
 
+/// Desk helper capture rate. The service encodes; at 30 fps a 1280-wide
+/// frame is about 83 MB/s on the pipe.
+pub const CAPTURE_FPS: u32 = 30;
+
 pub const KIND_JPEG: u8 = 1;
 pub const KIND_PCM: u8 = 2;
 pub const KIND_NOTE: u8 = 3;
@@ -20,6 +24,8 @@ pub const KIND_EQIN: u8 = 4;
 pub const KIND_ACK: u8 = 5;
 pub const KIND_WAKE: u8 = 6;
 pub const KIND_RELEASE: u8 = 7;
+/// Helper to service: one raw RGB frame, `u32le` width and height first.
+pub const KIND_RAW: u8 = 8;
 
 /// Same 15 bytes as `etherquic-play`'s `EACK` record.
 pub const ACK_KEY: u8 = 1;
@@ -38,6 +44,30 @@ pub struct Rgb {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<u8>,
+}
+
+impl Rgb {
+    /// The [`Message::Raw`] payload.
+    pub fn raw_payload(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.rgb.len());
+        out.extend_from_slice(&self.width.to_le_bytes());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.rgb);
+        out
+    }
+
+    pub fn from_raw(payload: &[u8]) -> Result<Rgb, String> {
+        if payload.len() < 8 {
+            return Err("raw frame is short".into());
+        }
+        let width = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let height = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let rgb = payload[8..].to_vec();
+        if width == 0 || height == 0 || rgb.len() != width as usize * height as usize * 3 {
+            return Err(format!("raw frame {width}x{height} has {} bytes", rgb.len()));
+        }
+        Ok(Rgb { width, height, rgb })
+    }
 }
 
 /// Interleaved little-endian PCM. Same layout as `etherquic-play`.
@@ -107,6 +137,9 @@ pub enum Message {
     Wake,
     /// Service to helper: the player left. Let the display idle again.
     Release,
+    /// Helper to service: width u32le, height u32le, packed RGB. The service
+    /// encodes it with the codec the player negotiated.
+    Raw(Vec<u8>),
 }
 
 impl Message {
@@ -119,6 +152,7 @@ impl Message {
             Self::Ack(bytes) => (KIND_ACK, bytes),
             Self::Wake => (KIND_WAKE, &[][..]),
             Self::Release => (KIND_RELEASE, &[][..]),
+            Self::Raw(bytes) => (KIND_RAW, bytes),
         }
     }
 
@@ -134,6 +168,7 @@ impl Message {
             KIND_ACK => Self::Ack(payload.to_vec()),
             KIND_WAKE => Self::Wake,
             KIND_RELEASE => Self::Release,
+            KIND_RAW => Self::Raw(payload.to_vec()),
             other => return Err(format!("unknown desk message {other}")),
         })
     }
@@ -278,6 +313,9 @@ mod tests {
 
     #[test]
     fn wake_and_release_are_empty_frames() {
+        let rgb = Rgb { width: 2, height: 2, rgb: (0..12).collect() };
+        assert_eq!(Rgb::from_raw(&rgb.raw_payload()).unwrap(), rgb);
+        assert!(Rgb::from_raw(&[2, 0, 0, 0, 2, 0, 0, 0, 1]).is_err());
         for (message, kind) in [(Message::Wake, KIND_WAKE), (Message::Release, KIND_RELEASE)] {
             let (got, payload) = message.parts();
             assert_eq!(got, kind);

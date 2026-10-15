@@ -5,75 +5,64 @@
 
 #![forbid(unsafe_code)]
 
-use etherquic::{PRIORITY_AUDIO, PRIORITY_VIDEO};
 
 /// Above audio and video so a timing report is not queued behind a picture.
 const PRIORITY_TRACE: i32 = 30;
 const ACK_MAGIC: &[u8; 4] = b"EACK";
 use etherquic_input::{decode, Event};
 use quinn::{Connection, RecvStream, SendStream};
-use tokio::sync::{mpsc, watch};
+use etherquic_media::host::{self, FrameSlot};
+use tokio::sync::mpsc;
 
-use crate::proto::{self, AudioChunk, AUDIO_MAGIC, INPUT_MAGIC, VIDEO_MAGIC};
+use crate::proto::{self, AudioChunk, INPUT_MAGIC};
 
-/// Send desktop and audio until the player leaves or both senders close.
+/// Send desktop and audio until the player leaves.
+///
+/// A player on `etherquic/2` sends a codec offer first and gets the first
+/// codec both ends run; an older player gets MJPEG and PCM on `EVID`/`EAUD`.
+/// Either way the service encodes the helper's raw frames here.
 pub async fn serve(
     conn: Connection,
-    mut video: watch::Receiver<Vec<u8>>,
+    video: FrameSlot,
     mut audio: mpsc::Receiver<AudioChunk>,
     input: mpsc::Sender<Vec<Event>>,
     acks: mpsc::Receiver<Vec<u8>>,
+    log: etherquic_media::Log,
 ) -> Result<(), String> {
+    let (negotiated, stray) = host::accept_offer(&conn).await?;
+    if let Some((_, magic)) = stray {
+        return Err(format!("expected a codec offer, got {}", String::from_utf8_lossy(&magic)));
+    }
+    log(if negotiated.is_v2() { "player negotiates codecs" } else { "player does not negotiate; MJPEG and PCM" });
     // Picture and audio open before input is read, so a confirmation stream
     // cannot be accepted in their place.
-    let mut video_send = open_uni(&conn, PRIORITY_VIDEO, VIDEO_MAGIC).await?;
-    let mut audio_send = open_uni(&conn, PRIORITY_AUDIO, AUDIO_MAGIC).await?;
+    let streams = host::open_streams(&conn, negotiated.is_v2()).await?;
     let input_conn = conn.clone();
     let input_task = tokio::spawn(async move { read_input(input_conn, input).await });
     let ack_conn = conn.clone();
     let ack_task = tokio::spawn(async move { write_acks(ack_conn, acks).await });
-    let mut video_open = true;
-    let mut audio_open = true;
+    let (pcm_tx, pcm_rx) = mpsc::channel(8);
+    let forward = tokio::spawn(async move {
+        while let Some(chunk) = audio.recv().await {
+            let pcm = etherquic_media::Pcm { sample_rate: chunk.sample_rate, channels: chunk.channels, samples: chunk.pcm };
+            if pcm_tx.send(pcm).await.is_err() {
+                break;
+            }
+        }
+    });
+    let caps = tokio::task::spawn_blocking(etherquic_media::caps::host_caps)
+        .await
+        .map_err(|error| error.to_string())?;
+    let options = host::HostOptions { fps: proto::CAPTURE_FPS, caps, log };
     let closed = conn.closed();
-    tokio::pin!(closed);
-    loop {
-        if !video_open && !audio_open {
-            break;
-        }
-        tokio::select! {
-            _ = &mut closed => break,
-            msg = audio.recv(), if audio_open => {
-                match msg {
-                    Some(chunk) => {
-                        let payload = chunk.encode()?;
-                        write_record(&mut audio_send, &payload).await?;
-                    }
-                    None => {
-                        let _ = finish(&mut audio_send).await;
-                        audio_open = false;
-                    }
-                }
-            }
-            changed = video.changed(), if video_open => {
-                if changed.is_err() {
-                    let _ = finish(&mut video_send).await;
-                    video_open = false;
-                    continue;
-                }
-                let jpeg = video.borrow().clone();
-                if jpeg.is_empty() {
-                    continue;
-                }
-                if jpeg.len() > proto::MAX_PAYLOAD {
-                    continue;
-                }
-                write_record(&mut video_send, &jpeg).await?;
-            }
-        }
-    }
+    let result = tokio::select! {
+        result = host::run(streams, negotiated, video, pcm_rx, options) => result,
+        _ = closed => Ok(()),
+    };
+    forward.abort();
     ack_task.abort();
     input_task.abort();
-    Ok(())
+    result
 }
 
 async fn write_acks(conn: Connection, mut acks: mpsc::Receiver<Vec<u8>>) -> Result<(), String> {
