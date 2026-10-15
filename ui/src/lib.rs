@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "ui", target_os = "macos"))]
+mod child_view;
 #[cfg(feature = "ui")]
 mod hosts;
 mod link;

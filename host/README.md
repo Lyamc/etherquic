@@ -48,7 +48,7 @@ $env:RUSTFLAGS = '-L native=C:\Build\networking\borderless\third_party\npcap\lib
 cargo build --release --manifest-path host/Cargo.toml --bin etherquic-host
 ```
 
-Install with [`etherquic-setup`](../setup/README.md). `build-installer.ps1` builds both and copies the payload.
+Install with [`etherquic-setup`](../setup/README.md), or with the MSI that `packaging/windows/build-msi.ps1` builds (it runs the same setup and the Membrane script).
 
 ## Idle, screen saver, and lock
 

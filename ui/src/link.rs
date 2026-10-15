@@ -176,7 +176,7 @@ impl Link {
         let status = Arc::clone(&self.status);
         match std::thread::Builder::new()
             .name("etherquic-connect".into())
-            .spawn(move || client_thread(net, peer, udp, trace_input, stop, status))
+            .spawn(move || client_thread(net, nic, peer, udp, trace_input, stop, status))
         {
             Ok(handle) => {
                 self.thread = Some(handle);
@@ -460,6 +460,7 @@ fn host_audio_device() -> Option<String> {
 
 fn client_thread(
     net: Option<Arc<L2Net>>,
+    nic: Option<String>,
     peer: [u8; 6],
     udp: Option<SocketAddr>,
     trace_input: bool,
@@ -468,16 +469,75 @@ fn client_thread(
 ) {
     #[cfg(feature = "ui")]
     {
-        open_view(net, peer, udp, trace_input, stop, status);
+        #[cfg(target_os = "macos")]
+        {
+            // The picture window needs the main thread, which GPUI holds.
+            drop(net);
+            child_view(nic, peer, udp, trace_input, stop, status);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = nic;
+            open_view(net, peer, udp, trace_input, stop, status);
+        }
     }
     #[cfg(not(feature = "ui"))]
     {
-        let _ = trace_input;
+        let _ = (trace_input, nic);
         client_quic(net, peer, udp, stop, status);
     }
 }
 
-#[cfg(feature = "ui")]
+/// macOS: the picture window runs in a child `etherquic-play connect`.
+#[cfg(all(feature = "ui", target_os = "macos"))]
+fn child_view(
+    nic: Option<String>,
+    peer: [u8; 6],
+    udp: Option<SocketAddr>,
+    trace_input: bool,
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+) {
+    let view = match live_view().lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let connect = crate::child_view::ChildConnect {
+        udp,
+        nic,
+        peer_mac: peer,
+        local_mac: CLIENT_MAC,
+        service_id: PLAY_SERVICE_ID,
+        trace_input,
+        view,
+    };
+    let last = Arc::new(Mutex::new(String::new()));
+    let slot = Arc::clone(&status);
+    let last_slot = Arc::clone(&last);
+    let report = move |text: &str| {
+        write_status(&slot, text);
+        match last_slot.lock() {
+            Ok(mut guard) => *guard = text.to_string(),
+            Err(poisoned) => *poisoned.into_inner() = text.to_string(),
+        }
+    };
+    if let Err(err) = crate::child_view::run(&connect, &stop, &report) {
+        write_status(&status, format!("Connect failed: {err}"));
+        return;
+    }
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
+    let text = match last.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if !status_stands(&text) {
+        write_status(&status, "Disconnected. The view closed.");
+    }
+}
+
+#[cfg(all(feature = "ui", not(target_os = "macos")))]
 fn open_view(
     net: Option<Arc<L2Net>>,
     peer: [u8; 6],

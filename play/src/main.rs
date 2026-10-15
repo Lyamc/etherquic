@@ -45,6 +45,9 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
         }
         args::Command::Connect(connect) => {
+            if connect.parent_pipe {
+                watch_stdin(Arc::clone(&stop));
+            }
             let net = match connect.udp {
                 Some(_) => None,
                 None => Some(L2Net::open(connect.nic.as_deref(), 1500, ETHERTYPE_QUIC)?),
@@ -55,9 +58,9 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     local_mac: connect.local_mac,
                     peer_mac: connect.peer_mac,
                     service_id: connect.service_id,
-                    trace_input: false,
+                    trace_input: connect.trace_input,
                     udp: connect.udp,
-                    view: etherquic_play::live(etherquic_play::ViewOptions::default()),
+                    view: etherquic_play::live(connect.view),
                 },
                 stop,
                 etherquic_play::stderr_status(),
@@ -72,6 +75,23 @@ impl Drop for StopCapture {
     fn drop(&mut self) {
         let _ = etherquic::capture_stop();
     }
+}
+
+/// `--parent-pipe`: the parent closes stdin (or exits) to end the session.
+fn watch_stdin(stop: Arc<AtomicBool>) {
+    let _ = thread::Builder::new()
+        .name("etherquic-play-parent".into())
+        .spawn(move || {
+            let mut sink = [0u8; 64];
+            let mut stdin = std::io::stdin();
+            loop {
+                match std::io::Read::read(&mut stdin, &mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
 }
 
 /// Ctrl-C sets the flag the desktop session already watches.

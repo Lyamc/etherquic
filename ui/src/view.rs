@@ -78,6 +78,7 @@ const USAGE: &str = "\
 etherquic
 etherquic host [--nic IFACE]
 etherquic connect --peer-mac MAC [--nic IFACE]
+etherquic connect --udp IP:PORT
 
 host shares this machine. connect joins one.
 ";
@@ -94,6 +95,8 @@ struct Launch {
     command: Command,
     peer: HexMac,
     nic: Option<String>,
+    /// `connect --udp IP:PORT` dials L3 instead of the L2 peer.
+    udp: Option<std::net::SocketAddr>,
 }
 
 impl Launch {
@@ -104,6 +107,7 @@ impl Launch {
                 command: Command::Window,
                 peer: HexMac::from_bytes(HOST_MAC),
                 nic: None,
+                udp: None,
             });
         }
         if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
@@ -116,6 +120,7 @@ impl Launch {
         };
         let mut peer = None;
         let mut nic = None;
+        let mut udp = None;
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
@@ -128,20 +133,30 @@ impl Launch {
                     i += 1;
                     nic = Some(args.get(i).cloned().ok_or("--nic needs a name")?);
                 }
+                "--udp" => {
+                    i += 1;
+                    let value = args.get(i).ok_or("--udp needs IP:PORT")?;
+                    udp = Some(
+                        value
+                            .parse::<std::net::SocketAddr>()
+                            .map_err(|_| format!("--udp needs IP:PORT, got {value}"))?,
+                    );
+                }
                 other => return Err(format!("unknown argument {other}\n{USAGE}")),
             }
             i += 1;
         }
-        if command == Command::Host && peer.is_some() {
-            return Err(format!("host does not take --peer-mac\n{USAGE}"));
+        if command == Command::Host && (peer.is_some() || udp.is_some()) {
+            return Err(format!("host does not take --peer-mac or --udp\n{USAGE}"));
         }
-        if command == Command::Connect && peer.is_none() {
-            return Err(format!("connect needs --peer-mac\n{USAGE}"));
+        if command == Command::Connect && peer.is_none() && udp.is_none() {
+            return Err(format!("connect needs --peer-mac or --udp\n{USAGE}"));
         }
         Ok(Self {
             command,
             peer: peer.unwrap_or_else(|| HexMac::from_bytes(HOST_MAC)),
             nic,
+            udp,
         })
     }
 }
@@ -384,13 +399,22 @@ impl Desk {
                 let fps = desk.capture_fps();
                 desk.link.host(launch.nic, desk.backend, fps).err()
             }
-            Command::Connect => match desk.peer.parse() {
-                Some(peer) => {
+            Command::Connect => match (launch.udp, desk.peer.parse()) {
+                (Some(addr), peer) => {
+                    let peer = peer.unwrap_or(HOST_MAC);
+                    desk.pending_recent = Some((
+                        addr.to_string(),
+                        HostAddr::Ip { ip: addr.ip(), port: addr.port() },
+                    ));
+                    let trace = desk.applied(peer).trace_input;
+                    desk.link.connect(launch.nic, peer, trace, 0, Some(addr)).err()
+                }
+                (None, Some(peer)) => {
                     desk.pending_recent = Some((format_mac(peer), HostAddr::Mac(peer)));
                     let trace = desk.applied(peer).trace_input;
                     desk.link.connect(launch.nic, peer, trace, 0, None).err()
                 }
-                None => Some("Peer address needs 12 hex digits.".into()),
+                (None, None) => Some("Peer address needs 12 hex digits.".into()),
             },
             Command::Window => None,
         };
