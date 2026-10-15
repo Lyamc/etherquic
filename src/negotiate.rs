@@ -206,6 +206,25 @@ impl HostCaps {
         self.video.iter().find(|cap| cap.video == video)
     }
 
+    /// The two caps lines, for the discovery capability block.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        self.write_lines(&mut out);
+        out
+    }
+
+    /// Read [`HostCaps::to_text`]. `None` when it names no video encoder.
+    pub fn from_text(text: &str) -> Option<HostCaps> {
+        let mut caps = HostCaps { video: Vec::new(), audio: Vec::new() };
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            let Some(key) = words.next() else { continue };
+            let rest: Vec<&str> = words.collect();
+            caps.read_line(key, &rest);
+        }
+        (!caps.video.is_empty()).then_some(caps)
+    }
+
     /// `host-video` and `host-audio` lines.
     pub fn write_lines(&self, out: &mut String) {
         let video: Vec<String> = self
@@ -614,6 +633,15 @@ pub fn predict(offer: &Offer, host: Option<&HostCaps>) -> (Video, Audio) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_caps_text_round_trip() {
+        let caps = host(&[Video::Pyrowave, Video::H264Sw], &[Audio::Opus]);
+        let back = HostCaps::from_text(&caps.to_text()).expect("caps");
+        assert_eq!(back, caps);
+        assert!(HostCaps::from_text("").is_none());
+        assert!(HostCaps::from_text("host-video\nhost-audio pcm\n").is_none());
+    }
 
     fn cap(video: Video, encoder: &str) -> EncodeCap {
         EncodeCap { video, encoder: encoder.into(), limit: Limit::NONE }

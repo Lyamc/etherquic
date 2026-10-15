@@ -160,6 +160,7 @@ pub fn gather_capabilities(pads: Vec<PadInfo>) -> Capabilities {
         pads: found_pads,
         audio_outputs,
         audio_inputs,
+        codecs: etherquic_media::caps::caps_text_if_ready(),
     }
 }
 
@@ -332,6 +333,8 @@ pub fn host_extras(stop: Arc<AtomicBool>) -> Arc<HostExtras> {
 
 #[cfg(feature = "desktop")]
 fn refresh_loop(extras: &HostExtras, stop: &AtomicBool) {
+    // The first refresh then carries the real encoders.
+    let _ = etherquic_media::caps::probe();
     let pictures = thumbnails_wanted(
         std::env::var("ETHERQUIC_DISCOVERY_THUMBNAIL").ok().as_deref(),
         std::env::var_os("WAYLAND_DISPLAY").is_some(),

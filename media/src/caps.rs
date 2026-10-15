@@ -89,10 +89,22 @@ fn run_probe() -> Probe {
     probe
 }
 
+static PROBE: OnceLock<Probe> = OnceLock::new();
+
 /// Probed once per process. The first call can take a second or two.
 pub fn probe() -> &'static Probe {
-    static PROBE: OnceLock<Probe> = OnceLock::new();
     PROBE.get_or_init(run_probe)
+}
+
+/// The probe when it has finished, without waiting. For UI threads.
+pub fn ready() -> Option<&'static Probe> {
+    PROBE.get()
+}
+
+/// The host caps text for the discovery capability block. Empty until the
+/// probe has finished, so an offer never waits on it.
+pub fn caps_text_if_ready() -> String {
+    ready().map(|probe| probe.caps.to_text()).unwrap_or_default()
 }
 
 /// Start the probe on a background thread so a later [`probe`] is instant.

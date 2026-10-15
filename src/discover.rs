@@ -237,6 +237,8 @@ pub const PAD_KIND_STICK: u8 = 3;
 /// reader keeps what it knows and skips the rest. A layout that cannot be
 /// read that way gets a new TLV type instead.
 pub const CAPS_VERSION: u8 = 1;
+/// Longest codec text the capability block carries.
+pub const MAX_CODEC_TEXT: usize = 255;
 const MAX_OS_LABEL: usize = 32;
 const MAX_HOSTNAME: usize = 63;
 const MAX_MONITORS: usize = 16;
@@ -264,6 +266,9 @@ pub struct Capabilities {
     /// them out and an older player stops reading before them.
     pub audio_outputs: Vec<String>,
     pub audio_inputs: Vec<String>,
+    /// The host's encoders as `negotiate::HostCaps::to_text` writes them.
+    /// Empty from a host that does not negotiate codecs. Trailing and optional.
+    pub codecs: String,
 }
 
 impl Capabilities {
@@ -303,6 +308,9 @@ impl Capabilities {
             for name in list {
                 push_str(&mut out, name, MAX_AUDIO_NAME);
             }
+        }
+        if !self.codecs.is_empty() {
+            push_str(&mut out, &self.codecs, MAX_CODEC_TEXT);
         }
         out
     }
@@ -369,6 +377,7 @@ impl Capabilities {
             *list = names;
         }
         let [audio_outputs, audio_inputs] = audio;
+        let codecs = take_str(&mut rest).unwrap_or_default();
         Some(Self {
             os,
             os_label,
@@ -380,6 +389,7 @@ impl Capabilities {
             pads,
             audio_outputs,
             audio_inputs,
+            codecs,
         })
     }
 }
@@ -1438,6 +1448,7 @@ mod tests {
                 .collect(),
             audio_outputs: (0..6).map(|i| format!("Speakers {i} (High Definition Audio Device)")).collect(),
             audio_inputs: vec!["Microphone".into()],
+            codecs: String::new(),
         }
     }
 
@@ -1533,6 +1544,7 @@ mod tests {
         let older = Capabilities {
             audio_outputs: Vec::new(),
             audio_inputs: Vec::new(),
+            codecs: String::new(),
             ..caps.clone()
         }
         .encode();
@@ -1560,6 +1572,7 @@ mod tests {
         let core = Capabilities {
             audio_outputs: Vec::new(),
             audio_inputs: Vec::new(),
+            codecs: String::new(),
             ..caps.clone()
         }
         .encode();
@@ -1639,6 +1652,21 @@ mod tests {
         let payload = offer_payload(id, &card(), &info(), &anon, L2_PAYLOAD_LIMIT);
         let (_, body) = decode_offer(&payload).unwrap();
         assert_eq!(body.caps.unwrap().nic_mac, info().mac);
+    }
+
+    #[test]
+    fn codec_text_is_trailing_and_optional() {
+        let caps = Capabilities {
+            hostname: "box".into(),
+            codecs: "host-video pyrowave=pyrowave:0x0@0 mjpeg=jpeg:0x0@0\nhost-audio opus pcm\n".into(),
+            ..Capabilities::default()
+        };
+        let bytes = caps.encode();
+        assert_eq!(Capabilities::parse(&bytes).unwrap().codecs, caps.codecs);
+        // An older host stops after the audio lists.
+        let older = Capabilities { codecs: String::new(), ..caps.clone() }.encode();
+        assert!(bytes.starts_with(&older));
+        assert!(Capabilities::parse(&older).unwrap().codecs.is_empty());
     }
 
     #[test]

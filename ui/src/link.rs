@@ -147,6 +147,7 @@ impl Link {
         trace_input: bool,
         host_l2: u8,
         udp: Option<SocketAddr>,
+        codecs: CodecOffer,
     ) -> Result<(), String> {
         self.reap();
         if self.thread.is_some() {
@@ -176,7 +177,7 @@ impl Link {
         let status = Arc::clone(&self.status);
         match std::thread::Builder::new()
             .name("etherquic-connect".into())
-            .spawn(move || client_thread(net, nic, peer, udp, trace_input, stop, status))
+            .spawn(move || client_thread(net, nic, peer, udp, trace_input, codecs, stop, status))
         {
             Ok(handle) => {
                 self.thread = Some(handle);
@@ -431,6 +432,54 @@ fn host_thread(
     }
 }
 
+/// The codec order and pins a player offers. Without the window there is no
+/// media session, so the headless build carries nothing.
+#[cfg(feature = "ui")]
+pub type CodecOffer = etherquic_play::CodecChoice;
+#[cfg(not(feature = "ui"))]
+#[derive(Clone, Debug, Default)]
+pub struct CodecOffer;
+
+#[cfg(feature = "ui")]
+static SESSIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "ui")]
+fn session_key(peer: [u8; 6], udp: Option<SocketAddr>) -> String {
+    match udp {
+        Some(addr) => addr.ip().to_string(),
+        None => crate::format_mac(peer),
+    }
+}
+
+#[cfg(feature = "ui")]
+/// Keep the codecs a "Viewing …" status names, for the Settings summary.
+fn remember_session(peer: [u8; 6], udp: Option<SocketAddr>, text: &str) {
+    let Some(pair) = crate::prefs::negotiated_from_status(text) else {
+        return;
+    };
+    let key = session_key(peer, udp);
+    let mut list = SESSIONS.lock().unwrap_or_else(|poison| poison.into_inner());
+    list.retain(|(k, _)| *k != key);
+    list.push((key.clone(), pair));
+    // The MAC also finds it when the host was dialled by IP.
+    if udp.is_some() && peer != [0; 6] {
+        let mac = crate::format_mac(peer);
+        let pair = list.last().map(|(_, p)| p.clone()).unwrap_or_default();
+        list.retain(|(k, _)| *k != mac);
+        list.push((mac, pair));
+    }
+}
+
+#[cfg(feature = "ui")]
+/// The codecs of the last session with this host in this run, if any.
+pub fn last_session(peer: [u8; 6], ip: Option<std::net::IpAddr>) -> Option<String> {
+    let list = SESSIONS.lock().unwrap_or_else(|poison| poison.into_inner());
+    let keys = [ip.map(|ip| ip.to_string()), (peer != [0; 6]).then(|| crate::format_mac(peer))];
+    keys.iter()
+        .flatten()
+        .find_map(|key| list.iter().rev().find(|(k, _)| k == key).map(|(_, p)| p.clone()))
+}
+
 /// What an open view reads every frame. Settings change it while the view runs.
 #[cfg(feature = "ui")]
 pub fn live_view() -> etherquic_play::LiveView {
@@ -464,6 +513,7 @@ fn client_thread(
     peer: [u8; 6],
     udp: Option<SocketAddr>,
     trace_input: bool,
+    codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 ) {
@@ -473,17 +523,17 @@ fn client_thread(
         {
             // The picture window needs the main thread, which GPUI holds.
             drop(net);
-            child_view(nic, peer, udp, trace_input, stop, status);
+            child_view(nic, peer, udp, trace_input, codecs, stop, status);
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = nic;
-            open_view(net, peer, udp, trace_input, stop, status);
+            open_view(net, peer, udp, trace_input, codecs, stop, status);
         }
     }
     #[cfg(not(feature = "ui"))]
     {
-        let _ = (trace_input, nic);
+        let _ = (trace_input, nic, codecs);
         client_quic(net, peer, udp, stop, status);
     }
 }
@@ -495,6 +545,7 @@ fn child_view(
     peer: [u8; 6],
     udp: Option<SocketAddr>,
     trace_input: bool,
+    codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 ) {
@@ -510,12 +561,14 @@ fn child_view(
         service_id: PLAY_SERVICE_ID,
         trace_input,
         view,
+        codecs,
     };
     let last = Arc::new(Mutex::new(String::new()));
     let slot = Arc::clone(&status);
     let last_slot = Arc::clone(&last);
     let report = move |text: &str| {
         write_status(&slot, text);
+        remember_session(peer, udp, text);
         match last_slot.lock() {
             Ok(mut guard) => *guard = text.to_string(),
             Err(poisoned) => *poisoned.into_inner() = text.to_string(),
@@ -543,6 +596,7 @@ fn open_view(
     peer: [u8; 6],
     udp: Option<SocketAddr>,
     trace_input: bool,
+    codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 ) {
@@ -551,6 +605,7 @@ fn open_view(
     let last_slot = Arc::clone(&last);
     let report: etherquic_play::Status = Arc::new(move |text: &str| {
         write_status(&slot, text);
+        remember_session(peer, udp, text);
         match last_slot.lock() {
             Ok(mut guard) => *guard = text.to_string(),
             Err(poisoned) => *poisoned.into_inner() = text.to_string(),
@@ -563,6 +618,7 @@ fn open_view(
         trace_input,
         udp,
         view: live_view(),
+        codecs,
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         etherquic_play::connect_view(net, session, Arc::clone(&stop), report)

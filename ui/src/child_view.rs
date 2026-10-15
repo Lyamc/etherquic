@@ -28,6 +28,8 @@ pub struct ChildConnect {
     pub service_id: u16,
     pub trace_input: bool,
     pub view: ViewOptions,
+    /// Codec order and pins, so the child offers what the Settings say.
+    pub codecs: etherquic_play::CodecChoice,
 }
 
 /// `etherquic-play` arguments for one session. The child stops when its stdin closes.
@@ -67,6 +69,7 @@ pub fn connect_args(c: &ChildConnect) -> Vec<String> {
     for pad in &v.pad_slots {
         args.extend(["--pad".into(), format!("{}={}", pad.slot, pad.name)]);
     }
+    args.extend(c.codecs.args());
     args.push("--parent-pipe".into());
     args
 }
@@ -120,7 +123,10 @@ pub fn classify(line: &str) -> Line {
     let line = line.trim_end();
     match line.strip_prefix("etherquic-play: ") {
         Some(rest) => {
-            const TRACE: [&str; 4] = ["frame ", "audio ", "playing ", "picture "];
+            const TRACE: [&str; 9] = [
+                "frame ", "audio ", "playing ", "picture ", "session ", "stats ", "offer ", "decoder ",
+                "the host does not negotiate",
+            ];
             if TRACE.iter().any(|t| rest.starts_with(t)) {
                 Line::Trace
             } else {
@@ -241,7 +247,22 @@ mod tests {
             service_id: 4433,
             trace_input: false,
             view: ViewOptions::default(),
+            codecs: etherquic_play::CodecChoice::default(),
         }
+    }
+
+    #[test]
+    fn codec_choice_reaches_the_child() {
+        let mut connect = udp();
+        connect.codecs.video = vec![etherquic_play::PicturePref::Pyrowave, etherquic_play::PicturePref::Mjpeg];
+        connect.codecs.video_pin = Some(etherquic_play::PicturePref::Pyrowave);
+        let args = connect_args(&connect);
+        let at = args.iter().position(|a| a == "--video").expect("--video");
+        assert_eq!(args[at + 1], "pyrowave,mjpeg");
+        let at = args.iter().position(|a| a == "--video-pin").expect("--video-pin");
+        assert_eq!(args[at + 1], "pyrowave");
+        assert!(args.ends_with(&["--parent-pipe".to_string()]));
+        assert_eq!(classify("etherquic-play: session video pyrowave encoder pyrowave 1280x720 30 fps 0 kbit/s"), Line::Trace);
     }
 
     #[test]

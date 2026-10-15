@@ -316,9 +316,6 @@ pub fn video_match_line(
     for skip in skipped {
         line.push_str(&format!(". {} skipped: {}", skip.pref.name(), skip.reason));
     }
-    if !matches!(chosen, Some(PicturePref::Mjpeg) | None) {
-        line.push_str(". The desktop picture is still MJPEG.");
-    }
     line
 }
 
@@ -348,6 +345,72 @@ pub fn chosen_audio(
     choose_audio(preference, local, &remote_audio(audio)).0
 }
 
+/// What a session with this host will use: this computer's offer against the
+/// encoders the host put in its capability block. A host that announced none
+/// does not negotiate, so it sends MJPEG and PCM. `None` until this computer's
+/// own codec probe has finished; the probe runs in the background.
+pub fn predicted_pair(
+    choice: &etherquic_play::CodecChoice,
+    caps: Option<&etherquic::discover::Capabilities>,
+) -> Option<Predicted> {
+    etherquic_play::etherquic_media::caps::ready()?;
+    let host = caps.and_then(|caps| etherquic::negotiate::HostCaps::from_text(&caps.codecs));
+    let (video, audio) = etherquic::negotiate::predict(&choice.offer(), host.as_ref());
+    Some(Predicted {
+        video: PicturePref::from_token(video.token())?,
+        audio: AudioId::from_token(audio.token())?,
+        negotiates: host.is_some(),
+    })
+}
+
+/// The pair [`predicted_pair`] expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Predicted {
+    pub video: PicturePref,
+    pub audio: AudioId,
+    /// False for a host that does not negotiate codecs (MJPEG and PCM).
+    pub negotiates: bool,
+}
+
+/// The offer for one connection: the applied order with any pin first.
+pub fn codec_choice_for(
+    applied: &Applied,
+    video_pin: Option<PicturePref>,
+    audio_pin: Option<AudioId>,
+) -> etherquic_play::CodecChoice {
+    let mut video = applied.video.clone();
+    if let Some(pin) = video_pin {
+        move_to_front(&mut video, pin);
+    }
+    let mut audio = applied.audio.clone();
+    if let Some(pin) = audio_pin {
+        move_to_front(&mut audio, pin);
+    }
+    etherquic_play::CodecChoice {
+        video,
+        audio,
+        video_pin,
+        audio_pin,
+        max_width: 0,
+        bitrate_kbps: 0,
+    }
+}
+
+/// "PyroWave 1280x720 (pyrowave) · Opus 128 kbit/s" out of a "Viewing …" status.
+pub fn negotiated_from_status(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("Viewing ")?;
+    let parts: Vec<&str> = rest.split(" · ").collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let audio = parts[2].trim_end_matches('.');
+    let audio = audio.split(" (the host").next().unwrap_or(audio);
+    if parts[1].ends_with("starting") {
+        return None;
+    }
+    Some(format!("{} · {}", parts[1], audio))
+}
+
 /// Move `item` to the front of `order`, adding it when missing.
 pub fn move_to_front<T: PartialEq + Copy>(order: &mut Vec<T>, item: T) {
     order.retain(|entry| *entry != item);
@@ -367,9 +430,6 @@ pub fn audio_match_line(
     };
     for skip in skipped {
         line.push_str(&format!(". {} skipped: {}", skip.codec.name(), skip.reason));
-    }
-    if matches!(chosen, Some(AudioId::Opus | AudioId::Aac)) {
-        line.push_str(". Desktop audio is still PCM.");
     }
     line
 }
@@ -968,7 +1028,30 @@ mod tests {
             false,
         );
         assert!(line.starts_with("Match: H.265 (HW)"), "{line}");
-        assert!(line.contains("desktop picture is still MJPEG"), "{line}");
+        assert!(!line.contains("still MJPEG"), "{line}");
+    }
+
+    #[test]
+    fn negotiated_codecs_come_out_of_the_viewing_status() {
+        let line = "Viewing 192.168.0.58:4434 · PyroWave 1280x720 (pyrowave) · Opus 128 kbit/s · 30 fps · 41.5 Mbit/s.";
+        assert_eq!(
+            negotiated_from_status(line).as_deref(),
+            Some("PyroWave 1280x720 (pyrowave) · Opus 128 kbit/s")
+        );
+        let legacy = "Viewing peer · MJPEG · PCM (the host does not negotiate codecs).";
+        assert_eq!(negotiated_from_status(legacy).as_deref(), Some("MJPEG · PCM"));
+        assert!(negotiated_from_status("Viewing peer · video starting · audio starting.").is_none());
+        assert!(negotiated_from_status("Dialing …").is_none());
+    }
+
+    #[test]
+    fn a_pin_leads_the_offer() {
+        let prefs = Preferences::baseline();
+        let applied = apply_override(&prefs, None);
+        let choice = codec_choice_for(&applied, Some(PicturePref::Mjpeg), None);
+        assert_eq!(choice.video.first(), Some(&PicturePref::Mjpeg));
+        assert_eq!(choice.video_pin, Some(PicturePref::Mjpeg));
+        assert_eq!(choice.video.len(), applied.video.len());
     }
 
     #[test]

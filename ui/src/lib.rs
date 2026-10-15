@@ -32,10 +32,10 @@ pub use hosts::{
 };
 pub use link::{list_nics, Link, NicChoice};
 #[cfg(feature = "ui")]
-pub use link::{live_view, set_host_audio_device};
+pub use link::{last_session, live_view, set_host_audio_device, CodecOffer};
 #[cfg(feature = "ui")]
 pub use prefs::{
-    apply_override, audio_announce, chosen_audio, chosen_video, move_to_front, audio_for, audio_hint, audio_match_line, backend_hint,
+    apply_override, codec_choice_for, negotiated_from_status, predicted_pair, Predicted, audio_announce, chosen_audio, chosen_video, move_to_front, audio_for, audio_hint, audio_match_line, backend_hint,
     backend_label, backend_line, capture_rate, default_audio, default_video, fps_headline,
     listed_top, load_connections, load_preferences, local_video_line, mac_key, remote_backend_line,
     remote_hardware_line, resolve_fps, store_connections, store_preferences, swap_earlier,

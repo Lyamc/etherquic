@@ -2109,6 +2109,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherquic-media"
+version = "0.1.0"
+dependencies = [
+ "etherquic",
+ "jpeg-encoder",
+ "libloading",
+ "quinn",
+ "tokio",
+ "zune-core 0.4.12",
+ "zune-jpeg 0.4.21",
+]
+
+[[package]]
 name = "etherquic-play"
 version = "0.1.0"
 dependencies = [
@@ -2118,6 +2131,7 @@ dependencies = [
  "etherquic",
  "etherquic-container",
  "etherquic-input",
+ "etherquic-media",
  "evdev",
  "gilrs",
  "jpeg-encoder",

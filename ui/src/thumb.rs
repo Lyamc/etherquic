@@ -264,6 +264,7 @@ mod tests {
             }],
             audio_outputs: Vec::new(),
             audio_inputs: Vec::new(),
+            codecs: String::new(),
         }
     }
 

@@ -93,6 +93,8 @@ fn refresh_loop(
     mac: [u8; 6],
     stop: Arc<AtomicBool>,
 ) {
+    // The first refresh then carries the real encoders.
+    let _ = etherquic_media::caps::probe();
     let mut last: Option<Instant> = None;
     let mut encoded_budgets: Vec<usize> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
@@ -193,6 +195,7 @@ pub fn capabilities(frame: Option<(u32, u32)>) -> Capabilities {
         pads: Vec::new(),
         audio_outputs: Vec::new(),
         audio_inputs: Vec::new(),
+        codecs: etherquic_media::caps::caps_text_if_ready(),
     }
 }
 

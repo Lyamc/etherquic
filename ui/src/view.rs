@@ -26,6 +26,7 @@ use etherquic_ui::{
     ConnectionPrefs, DialTarget, FrameRate, HexMac, Layer, Link, NicChoice, Preferences, QrGrid,
     Role, Share, CLIENT_MAC, FPS_CHOICES, HOST_MAC, SOFTWARE_FPS,
 };
+use etherquic_ui::{codec_choice_for, last_session, predicted_pair, Predicted};
 use etherquic_ui::{
     backends as backend_list, chosen_audio, chosen_video, default_audio, default_video,
     load_defaults, load_settings, move_to_front, store_defaults, store_settings, BackendState,
@@ -313,6 +314,8 @@ struct Desk {
 
 impl Desk {
     fn new(cx: &mut Context<Self>, launch: Launch) -> Self {
+        // Codec probe in the background, so Auto can name the real pick.
+        etherquic_play::etherquic_media::caps::warm();
         let (nics, nic_error) = match list_nics() {
             Ok(nics) => (nics, None),
             Err(err) => (Vec::new(), Some(err)),
@@ -407,12 +410,14 @@ impl Desk {
                         HostAddr::Ip { ip: addr.ip(), port: addr.port() },
                     ));
                     let trace = desk.applied(peer).trace_input;
-                    desk.link.connect(launch.nic, peer, trace, 0, Some(addr)).err()
+                    let codecs = desk.codec_offer(Some(peer));
+                    desk.link.connect(launch.nic, peer, trace, 0, Some(addr), codecs).err()
                 }
                 (None, Some(peer)) => {
                     desk.pending_recent = Some((format_mac(peer), HostAddr::Mac(peer)));
                     let trace = desk.applied(peer).trace_input;
-                    desk.link.connect(launch.nic, peer, trace, 0, None).err()
+                    let codecs = desk.codec_offer(Some(peer));
+                    desk.link.connect(launch.nic, peer, trace, 0, None, codecs).err()
                 }
                 (None, None) => Some("Peer address needs 12 hex digits.".into()),
             },
@@ -538,9 +543,10 @@ impl Desk {
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| format_mac(peer))
         });
+        let codecs = self.codec_offer(Some(peer));
         match self
             .link
-            .connect(self.nic.clone(), peer, trace, host_l2, udp)
+            .connect(self.nic.clone(), peer, trace, host_l2, udp, codecs)
         {
             Ok(()) => {
                 self.message = None;
@@ -586,7 +592,8 @@ impl Desk {
             .clone()
             .or_else(|| known.as_ref().map(|row| row.title()))
             .unwrap_or_else(|| addr.display());
-        match self.link.connect(self.nic.clone(), peer, trace, 0, udp) {
+        let codecs = self.codec_offer((peer != [0; 6]).then_some(peer));
+        match self.link.connect(self.nic.clone(), peer, trace, 0, udp, codecs) {
             Ok(()) => {
                 self.message = None;
                 self.pending_recent = Some((name, addr));
@@ -2310,6 +2317,23 @@ impl Desk {
         }
     }
 
+    /// The Settings summary's codec part: the last session's real codecs with
+    /// the picked host, else what negotiation will pick, else the top of the list.
+    fn summary_codecs(&self) -> String {
+        if let Some(mac) = self.peer.parse() {
+            if let Some(pair) = last_session(mac, None) {
+                return format!("last session {pair}");
+            }
+            if let Some(predicted) = self.predicted(mac) {
+                return format!("{} · {}", predicted.video.name(), predicted.audio.name());
+            }
+        }
+        self.video_pref
+            .first()
+            .map(|pref| pref.name().to_string())
+            .unwrap_or_else(|| "no video".into())
+    }
+
     fn connection_selection(&self) -> String {
         let Some(mac) = self.peer.parse() else {
             return listed_top(&self.video_pref, &self.audio_pref, self.fps);
@@ -2321,6 +2345,18 @@ impl Desk {
             .devices
             .into_iter()
             .find(|device| device.l2_mac == mac);
+        if let Some(predicted) = self.predicted(mac) {
+            let note = if predicted.negotiates { "" } else { " (host does not negotiate)" };
+            return format!(
+                "{} · {}{note} · {}",
+                predicted.video.name(),
+                predicted.audio.name(),
+                etherquic_ui::fps_headline(applied.fps, None, matches!(
+                    predicted.video,
+                    PicturePref::Av1Hw | PicturePref::H265Hw | PicturePref::H264Hw
+                )),
+            );
+        }
         match device {
             Some(device) => top_selection(
                 &applied.video,
@@ -2571,6 +2607,34 @@ impl Desk {
             .find(|device| device.l2_mac == mac)
     }
 
+    /// The offer for `mac`: the applied order with this connection's pins first.
+    fn codec_offer(&self, mac: Option<[u8; 6]>) -> etherquic_play::CodecChoice {
+        let applied = match mac {
+            Some(mac) => self.applied(mac),
+            None => apply_override(&self.preferences_now(), None),
+        };
+        let saved = mac
+            .and_then(|mac| self.connections.get(&mac_key(mac)).cloned())
+            .unwrap_or_default();
+        codec_choice_for(
+            &applied,
+            self.session_video.or(saved.video),
+            self.session_audio.or(saved.audio),
+        )
+    }
+
+    /// What negotiation will pick with a discovered host. `None` when the
+    /// host has not been seen or this computer's probe is still running.
+    fn predicted(&self, mac: [u8; 6]) -> Option<Predicted> {
+        let device = self
+            .scan
+            .board()
+            .devices
+            .into_iter()
+            .find(|device| device.l2_mac == mac)?;
+        predicted_pair(&self.codec_offer(Some(mac)), device.caps.as_ref())
+    }
+
     /// Video and audio this connection will use, with the unsaved pick first.
     fn codec_choice(&self) -> (Option<PicturePref>, Option<AudioId>, bool, bool) {
         let mac = self.peer.parse();
@@ -2588,6 +2652,13 @@ impl Desk {
             move_to_front(&mut audio, pick);
         }
         let device = self.selected_device();
+        // Auto names what negotiation will pick with this host, once this
+        // computer's probe is done and the host has been seen.
+        if let Some(predicted) = mac.and_then(|mac| self.predicted(mac)) {
+            let pinned_v = pins.as_ref().is_some_and(|over| over.video.is_some());
+            let pinned_a = pins.as_ref().is_some_and(|over| over.audio.is_some());
+            return (Some(predicted.video), Some(predicted.audio), pinned_v, pinned_a);
+        }
         let chosen_v = chosen_video(
             &video,
             &self.local_video,
@@ -3674,7 +3745,7 @@ impl Render for Desk {
         let settings_summary = format!(
             "{} · {} · {}",
             self.settings.scale.label(),
-            self.video_pref.first().map(|pref| pref.name()).unwrap_or("no video"),
+            self.summary_codecs(),
             match self.peer.parse() {
                 Some(mac) if self.applied(mac).custom => format!("{} has its own picks", self.target_label()),
                 _ => "your defaults".into(),
