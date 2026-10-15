@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -26,6 +26,8 @@ struct Outbound {
 
 pub struct Desk {
     stop: Arc<AtomicBool>,
+    /// True while a player is attached. The input thread tells the helper.
+    session: Arc<AtomicBool>,
     outbound: Arc<Mutex<Option<Outbound>>>,
     input: mpsc::Sender<Vec<Event>>,
     supervisor: Option<JoinHandle<()>>,
@@ -35,14 +37,26 @@ pub struct Desk {
 impl Desk {
     pub fn spawn(log: &Log) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let session = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
         let outbound = Arc::new(Mutex::new(None));
         let pipe_slot = Arc::new(Mutex::new(None));
         let (input_tx, input_rx) = mpsc::channel(64);
         let writer_stop = Arc::clone(&stop);
         let writer_slot = Arc::clone(&pipe_slot);
+        let writer_session = Arc::clone(&session);
+        let writer_generation = Arc::clone(&generation);
         let writer = thread::Builder::new()
             .name("etherquic-input".into())
-            .spawn(move || input_loop(writer_slot, input_rx, writer_stop))
+            .spawn(move || {
+                input_loop(
+                    writer_slot,
+                    input_rx,
+                    writer_stop,
+                    writer_session,
+                    writer_generation,
+                )
+            })
             .ok();
         let supervisor = thread::Builder::new()
             .name("etherquic-desk".into())
@@ -50,8 +64,9 @@ impl Desk {
                 let stop = Arc::clone(&stop);
                 let pipe_slot = Arc::clone(&pipe_slot);
                 let outbound = Arc::clone(&outbound);
+                let generation = Arc::clone(&generation);
                 let log = log.clone();
-                move || supervise(stop, pipe_slot, outbound, log)
+                move || supervise(stop, pipe_slot, outbound, generation, log)
             })
             .ok();
         if writer.is_none() || supervisor.is_none() {
@@ -59,6 +74,7 @@ impl Desk {
         }
         Self {
             stop,
+            session,
             outbound,
             input: input_tx,
             supervisor,
@@ -88,6 +104,10 @@ impl Desk {
         let (audio_tx, audio_rx) = mpsc::channel(8);
         let (ack_tx, ack_rx) = mpsc::channel(64);
         self.attach(video_tx, audio_tx, ack_tx);
+        // The helper wakes the display and moves onto the input desktop. A
+        // screen saver, lock screen, or powered-down output would otherwise
+        // hand this player a stale black picture and swallow its input.
+        self.session.store(true, Ordering::SeqCst);
         let _guard = Detach(self);
         crate::media::serve(conn, video_rx, audio_rx, self.input(), ack_rx).await
     }
@@ -97,6 +117,7 @@ struct Detach<'a>(&'a Desk);
 
 impl Drop for Detach<'_> {
     fn drop(&mut self) {
+        self.0.session.store(false, Ordering::SeqCst);
         self.0.detach();
     }
 }
@@ -117,6 +138,7 @@ fn supervise(
     stop: Arc<AtomicBool>,
     pipe_slot: Arc<Mutex<Option<Pipe>>>,
     outbound: Arc<Mutex<Option<Outbound>>>,
+    generation: Arc<AtomicU64>,
     log: Log,
 ) {
     let mut last_error = String::new();
@@ -126,6 +148,7 @@ fn supervise(
             Arc::clone(&stop),
             Arc::clone(&pipe_slot),
             Arc::clone(&outbound),
+            &generation,
             &log,
         ) {
             Ok(()) => break,
@@ -145,6 +168,7 @@ fn run_once(
     stop: Arc<AtomicBool>,
     pipe_slot: Arc<Mutex<Option<Pipe>>>,
     outbound: Arc<Mutex<Option<Outbound>>>,
+    generation: &AtomicU64,
     log: &Log,
 ) -> Result<(), String> {
     if stop.load(Ordering::SeqCst) {
@@ -163,6 +187,8 @@ fn run_once(
         log.line(&format!("desk token: {}", child.note));
     }
     *lock(&pipe_slot) = Some(pipe.duplicate()?);
+    // A new helper has not heard about a player that is already attached.
+    generation.fetch_add(1, Ordering::SeqCst);
     let reader_pipe = pipe.duplicate()?;
     let reader = thread::Builder::new()
         .name("etherquic-desk-read".into())
@@ -237,7 +263,7 @@ fn reader_loop(
                     let _ = tx.try_send(bytes);
                 }
             }
-            Ok(Some(Message::Eqin(_))) => {}
+            Ok(Some(Message::Eqin(_) | Message::Wake | Message::Release)) => {}
             Err(error) => {
                 log.line(&format!("desk read: {error}"));
                 return;
@@ -246,8 +272,43 @@ fn reader_loop(
     }
 }
 
-fn input_loop(pipe_slot: Arc<Mutex<Option<Pipe>>>, mut input: mpsc::Receiver<Vec<Event>>, stop: Arc<AtomicBool>) {
+/// What to tell the helper so it matches `active`.
+///
+/// `told` is the generation of the helper that was last told, and what it was
+/// told. A helper from a newer generation starts idle.
+fn session_message(active: bool, told: Option<(u64, bool)>, generation: u64) -> Option<Message> {
+    let known = match told {
+        Some((seen, was)) if seen == generation => was,
+        _ => false,
+    };
+    match (known, active) {
+        (false, true) => Some(Message::Wake),
+        (true, false) => Some(Message::Release),
+        _ => None,
+    }
+}
+
+fn input_loop(
+    pipe_slot: Arc<Mutex<Option<Pipe>>>,
+    mut input: mpsc::Receiver<Vec<Event>>,
+    stop: Arc<AtomicBool>,
+    session: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+) {
+    // The only writer on the service side of the pipe, so Wake and Release
+    // cannot interleave with an EQIN message.
+    let mut told: Option<(u64, bool)> = None;
     while !stop.load(Ordering::SeqCst) {
+        let active = session.load(Ordering::SeqCst);
+        let current = generation.load(Ordering::SeqCst);
+        if let Some(message) = session_message(active, told, current) {
+            let pipe = lock(&pipe_slot).as_ref().and_then(|pipe| pipe.duplicate().ok());
+            if let Some(pipe) = pipe {
+                if pipe.write_message(&message, &stop).is_ok() {
+                    told = Some((current, active));
+                }
+            }
+        }
         let events = match input.try_recv() {
             Ok(events) => events,
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -284,4 +345,25 @@ fn ack_sender(outbound: &Mutex<Option<Outbound>>) -> Option<mpsc::Sender<Vec<u8>
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_message;
+    use crate::proto::Message;
+
+    #[test]
+    fn helper_hears_wake_once_and_release_once() {
+        assert_eq!(session_message(false, None, 1), None);
+        assert_eq!(session_message(true, None, 1), Some(Message::Wake));
+        assert_eq!(session_message(true, Some((1, true)), 1), None);
+        assert_eq!(session_message(false, Some((1, true)), 1), Some(Message::Release));
+        assert_eq!(session_message(false, Some((1, false)), 1), None);
+    }
+
+    #[test]
+    fn a_restarted_helper_is_woken_again_mid_session() {
+        assert_eq!(session_message(true, Some((1, true)), 2), Some(Message::Wake));
+        assert_eq!(session_message(false, Some((1, true)), 2), None);
+    }
 }

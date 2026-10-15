@@ -49,3 +49,13 @@ cargo build --release --manifest-path host/Cargo.toml --bin etherquic-host
 ```
 
 Install with [`etherquic-setup`](../setup/README.md). `build-installer.ps1` builds both and copies the payload.
+
+## Idle, screen saver, and lock
+
+The desk helper (`--desk`, SYSTEM on the console session) moves its capture and injection threads onto whichever desktop has input: `Default`, `Screen-saver`, or `Winlogon`. A thread left on `Default` while a screen saver or the secure desktop is up gets `BitBlt` win32 6, a frozen duplication, and `SendInput` win32 5. That combination looked like a black picture with no input.
+
+When a player attaches, the service sends the helper `Wake`. The helper resets the display idle timer, ends a screen saver with a small pointer move that it puts back, and holds `ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED` until `Release` when the player leaves. Power settings are not changed. The idle timers start again once nobody is connected.
+
+Capture rebuilds duplication when the input desktop changes, after about three seconds of only the held picture, and every five seconds while it is in GDI mode. A headless adapter's output can be missing at start and show up later. WASAPI loopback delivers nothing while no app renders sound, so the helper sends silence in its place, and it reopens the default output after ten seconds without a packet.
+
+`host.log` notes `capture desktop NAME`, `input desktop NAME`, `wake: ...`, and `release: ...`. A capture error is logged once, then once a minute, instead of once a second.

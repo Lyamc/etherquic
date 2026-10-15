@@ -5,8 +5,10 @@
 //! loopback and `SendInput` stay in this file too. The `windows` crate's GNU
 //! import libraries do not link, so this uses `winapi` against the system DLLs.
 
+use std::cell::Cell;
 use std::mem;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use winapi::ctypes::c_void;
 use winapi::shared::dxgi::{
@@ -19,7 +21,7 @@ use winapi::shared::mmreg::{
     WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT,
     WAVE_FORMAT_PCM,
 };
-use winapi::shared::windef::HGDIOBJ;
+use winapi::shared::windef::{HDESK, HGDIOBJ, POINT};
 use winapi::um::d3d11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
@@ -40,9 +42,13 @@ use winapi::um::wingdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
+use winapi::um::processthreadsapi::GetCurrentThreadId;
+use winapi::um::winbase::SetThreadExecutionState;
+use winapi::um::winnt::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, HANDLE};
 use winapi::um::winuser::{
-    CloseDesktop, GetDC, GetSystemMetrics, MapVirtualKeyW, OpenInputDesktop, ReleaseDC, SendInput,
-    SetThreadDesktop, INPUT, INPUT_KEYBOARD,
+    CloseDesktop, GetCursorPos, GetDC, GetSystemMetrics, GetThreadDesktop,
+    GetUserObjectInformationW, MapVirtualKeyW, OpenInputDesktop, ReleaseDC, SendInput,
+    SetCursorPos, SetThreadDesktop, INPUT, INPUT_KEYBOARD, UOI_NAME,
     INPUT_MOUSE, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
     MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
@@ -76,6 +82,44 @@ pub struct ScreenCapture {
     mode: String,
     primed: bool,
     held: Option<(Vec<u8>, u32, u32)>,
+    /// Input desktop this thread captures: `Default`, `Winlogon`, `Screen-saver`.
+    desktop: String,
+    /// Frames in a row that were only the held picture.
+    stale: u32,
+    /// Last attempt to get duplication back after it fell to GDI.
+    retried: Instant,
+}
+
+/// Held-only frames before duplication is torn down and enumerated again.
+/// At 10 fps this is about three seconds.
+pub const STALE_LIMIT: u32 = 30;
+/// How often GDI mode asks DXGI for an output again. A headless adapter's
+/// output can be missing at start and appear later.
+const RETRY_DUPLICATION: Duration = Duration::from_secs(5);
+
+/// What the capture loop should do before taking the next frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recover {
+    Nothing,
+    /// The input desktop changed. The held picture is from the old one.
+    NewDesktop,
+    /// Only the held picture for `STALE_LIMIT` frames: enumerate again.
+    Stale,
+    /// GDI mode, and it is time to ask for duplication again.
+    RetryDuplication,
+}
+
+/// Pure decision so the policy is testable without a desktop.
+pub fn recover_step(moved: bool, stale: u32, gdi_only: bool, since_retry: Duration, wants_dup: bool) -> Recover {
+    if moved {
+        Recover::NewDesktop
+    } else if stale >= STALE_LIMIT {
+        Recover::Stale
+    } else if gdi_only && wants_dup && since_retry >= RETRY_DUPLICATION {
+        Recover::RetryDuplication
+    } else {
+        Recover::Nothing
+    }
 }
 
 struct Duplication {
@@ -100,6 +144,9 @@ impl ScreenCapture {
                 mode: "duplication".to_string(),
                 primed: false,
                 held: None,
+                desktop: thread_desktop_name(),
+                stale: 0,
+                retried: Instant::now(),
             },
             Err(error) => Self::gdi(&format!("gdi ({})", clip(error))),
         }
@@ -109,7 +156,48 @@ impl ScreenCapture {
         &self.mode
     }
 
+    pub fn desktop(&self) -> &str {
+        &self.desktop
+    }
+
+    /// Follow the input desktop, and rebuild capture when it moved, when only
+    /// the held picture has been available for a while, or when GDI mode is due
+    /// to try duplication again. Then take one frame.
     pub fn frame(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+        let moved = match follow_input_desktop() {
+            Ok(Some(name)) => {
+                self.desktop = name;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => false,
+        };
+        let step = recover_step(
+            moved,
+            self.stale,
+            self.duplication.is_none(),
+            self.retried.elapsed(),
+            crate::config::desk_duplication(),
+        );
+        match step {
+            Recover::Nothing => {}
+            Recover::NewDesktop | Recover::Stale => {
+                self.held = None;
+                self.stale = 0;
+                if crate::config::desk_duplication() {
+                    self.retried = Instant::now();
+                    self.reopen_after_loss();
+                }
+            }
+            Recover::RetryDuplication => {
+                self.retried = Instant::now();
+                self.reopen_after_loss();
+            }
+        }
+        self.frame_once()
+    }
+
+    fn frame_once(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
         if self.duplication.is_none() {
             return self.bitblt_or_held();
         }
@@ -118,6 +206,7 @@ impl ScreenCapture {
         match acquired {
             Ok(Some(picture)) => {
                 self.primed = true;
+                self.stale = 0;
                 self.held = Some(picture.clone());
                 if self.mode != "duplication" {
                     self.mode = "duplication".to_string();
@@ -153,13 +242,31 @@ impl ScreenCapture {
             mode: mode.to_string(),
             primed: true,
             held: None,
+            desktop: thread_desktop_name(),
+            stale: 0,
+            retried: Instant::now(),
         }
     }
 
     fn bitblt_or_held(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
-        match unsafe { capture_rgba_gdi() } {
-            Ok(picture) => Ok(picture),
-            Err(error) => self.held.clone().ok_or(error),
+        let mut result = unsafe { capture_rgba_gdi() };
+        if result.is_err() {
+            // BitBlt fails (win32 6) from a desktop that is not the input desktop.
+            if let Ok(Some(name)) = follow_input_desktop() {
+                self.desktop = name;
+                self.held = None;
+                result = unsafe { capture_rgba_gdi() };
+            }
+        }
+        match result {
+            Ok(picture) => {
+                self.stale = 0;
+                Ok(picture)
+            }
+            Err(error) => {
+                self.stale = self.stale.saturating_add(1);
+                self.held.clone().ok_or(error)
+            }
         }
     }
 
@@ -240,14 +347,106 @@ fn release_device(device: *mut ID3D11Device, context: *mut ID3D11DeviceContext) 
     }
 }
 
-/// The capture thread must sit on the desktop the user is looking at.
-unsafe fn use_input_desktop() {
-    let desk = OpenInputDesktop(0, 0, 0x01ff);
+/// Every desktop right except `DELETE`, `WRITE_DAC`, and `WRITE_OWNER`:
+/// read objects for GDI, journal playback for `SendInput`.
+const DESKTOP_ACCESS: u32 = 0x01ff;
+
+thread_local! {
+    /// Desktop handle this thread opened and now sits on. Closed on the next move.
+    static THREAD_DESK: Cell<HDESK> = const { Cell::new(ptr::null_mut()) };
+}
+
+unsafe fn desktop_name(desk: HDESK) -> Option<String> {
     if desk.is_null() {
-        return;
+        return None;
     }
-    SetThreadDesktop(desk);
-    CloseDesktop(desk);
+    let mut buf = [0u16; 256];
+    let mut needed: DWORD = 0;
+    let ok = GetUserObjectInformationW(
+        desk as HANDLE,
+        UOI_NAME as i32,
+        buf.as_mut_ptr() as *mut c_void,
+        (buf.len() * 2) as DWORD,
+        &mut needed,
+    );
+    if ok == 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// Desktop the calling thread is on, for logging.
+pub fn thread_desktop_name() -> String {
+    unsafe { desktop_name(GetThreadDesktop(GetCurrentThreadId())) }.unwrap_or_else(|| "unknown".into())
+}
+
+/// Move the calling thread onto the desktop that receives input.
+///
+/// A screen saver runs on `Screen-saver`, and the lock screen, UAC, and
+/// Ctrl+Alt+Del run on `Winlogon`. A thread left on `Default` gets
+/// `BitBlt` win32 6, a frozen duplication, and `SendInput` win32 5 until the
+/// user comes back. `Ok(Some(name))` means the thread moved, `Ok(None)` that
+/// it was already there. The helper is SYSTEM, so it may open `Winlogon`.
+pub fn follow_input_desktop() -> Result<Option<String>, String> {
+    unsafe {
+        let input = OpenInputDesktop(0, 0, DESKTOP_ACCESS);
+        if input.is_null() {
+            return Err(win32("OpenInputDesktop"));
+        }
+        let want = desktop_name(input);
+        let have = desktop_name(GetThreadDesktop(GetCurrentThreadId()));
+        if want.is_some() && want == have {
+            CloseDesktop(input);
+            return Ok(None);
+        }
+        if SetThreadDesktop(input) == 0 {
+            let error = win32("SetThreadDesktop");
+            CloseDesktop(input);
+            return Err(error);
+        }
+        let previous = THREAD_DESK.with(|slot| slot.replace(input));
+        if !previous.is_null() {
+            CloseDesktop(previous);
+        }
+        Ok(Some(want.unwrap_or_else(|| "unknown".into())))
+    }
+}
+
+/// Turn the display on and end a screen saver for a player that just attached.
+///
+/// The execution state resets the display idle timer, which powers an output
+/// back up. A screen saver only ends on input, so the pointer moves a few
+/// pixels on the input desktop and is put back.
+pub fn wake_display() -> Result<(), String> {
+    unsafe {
+        SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    }
+    let _ = follow_input_desktop();
+    let mut at = POINT { x: 0, y: 0 };
+    let have_point = unsafe { GetCursorPos(&mut at) } != 0;
+    send_mouse(16, 16, 0, MOUSEEVENTF_MOVE)?;
+    send_mouse(-16, -16, 0, MOUSEEVENTF_MOVE)?;
+    if have_point {
+        unsafe {
+            SetCursorPos(at.x, at.y);
+        }
+    }
+    Ok(())
+}
+
+/// Keep the display and the system awake while a player is attached.
+///
+/// Per thread: call `hold_display(false)` from the thread that held it.
+pub fn hold_display(on: bool) {
+    let flags = if on {
+        ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    unsafe {
+        SetThreadExecutionState(flags);
+    }
 }
 
 /// Release every acquired frame. Leaving one held stalls the desktop.
@@ -373,7 +572,7 @@ unsafe fn copy_texture(
 }
 
 unsafe fn open_duplication() -> Result<Duplication, String> {
-    use_input_desktop();
+    let _ = follow_input_desktop();
     match open_from_factory() {
         Ok(dup) => Ok(dup),
         Err(factory_error) => match open_hardware() {
@@ -815,13 +1014,19 @@ fn send_mouse(dx: i32, dy: i32, data: u32, flags: u32) -> Result<(), String> {
 }
 
 fn send_input(input: &mut INPUT) -> Result<(), String> {
-    let sent = unsafe { SendInput(1, input, mem::size_of::<INPUT>() as i32) };
-    if sent == 0 {
-        let code = unsafe { GetLastError() };
-        Err(format!("SendInput: win32 {code}"))
-    } else {
-        Ok(())
+    if send_once(input) {
+        return Ok(());
     }
+    let code = unsafe { GetLastError() };
+    // Win32 5: input belongs to another desktop now. Move there and retry once.
+    if matches!(follow_input_desktop(), Ok(Some(_))) && send_once(input) {
+        return Ok(());
+    }
+    Err(format!("SendInput: win32 {code}"))
+}
+
+fn send_once(input: &mut INPUT) -> bool {
+    unsafe { SendInput(1, input, mem::size_of::<INPUT>() as i32) != 0 }
 }
 
 unsafe fn capture_rgba_gdi() -> Result<(Vec<u8>, u32, u32), String> {
@@ -1144,7 +1349,23 @@ fn float_to_i16(sample: f32) -> i16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ascii_key, decode_samples, float_to_i16, virtual_key};
+    use super::{
+        ascii_key, decode_samples, float_to_i16, recover_step, virtual_key, Recover, STALE_LIMIT,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn capture_rebuilds_after_a_desktop_switch_or_a_stale_run() {
+        let soon = Duration::from_millis(100);
+        let late = Duration::from_secs(6);
+        assert_eq!(recover_step(true, 0, false, soon, true), Recover::NewDesktop);
+        assert_eq!(recover_step(false, STALE_LIMIT, false, soon, true), Recover::Stale);
+        assert_eq!(recover_step(false, STALE_LIMIT - 1, false, late, true), Recover::Nothing);
+        assert_eq!(recover_step(false, 0, true, late, true), Recover::RetryDuplication);
+        assert_eq!(recover_step(false, 0, true, soon, true), Recover::Nothing);
+        assert_eq!(recover_step(false, 0, true, late, false), Recover::Nothing);
+    }
+
     use winapi::shared::mmreg::{WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM};
 
     #[test]

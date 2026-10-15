@@ -4,6 +4,12 @@
 //! cannot see that desktop, so GDI, WASAPI loopback, and `SendInput` stay here.
 //! Desktop duplication, when `desk.conf` leaves it on, only keeps DWM composing.
 //! The JPEG is still the GDI copy.
+//!
+//! Capture and injection follow the input desktop. After idle the console can
+//! be on the screen saver's desktop or on `Winlogon`, and a thread left on
+//! `Default` sees a frozen picture and has every `SendInput` refused. When a
+//! player attaches, the service sends `Wake`: the display is woken and held on,
+//! and the screen saver is ended, until `Release`.
 
 #![forbid(unsafe_code)]
 
@@ -124,10 +130,17 @@ fn capture_loop(
     note_mode(&notes, &capture, &mut logged_mode);
     let period = Duration::from_millis((1000 / u64::from(FPS.max(1))).max(1));
     let mut logged: Option<(u32, u32)> = None;
+    let mut logged_desktop = capture.desktop().to_string();
+    let mut last_error = String::new();
+    let mut repeats = 0u32;
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
         let result = one_frame(&screen, &mut capture);
         note_mode(&notes, &capture, &mut logged_mode);
+        if capture.desktop() != logged_desktop {
+            note(&notes, format!("capture desktop {}", capture.desktop()));
+            logged_desktop = capture.desktop().to_string();
+        }
         match result {
             Ok((jpeg, width, height)) => {
                 if logged != Some((width, height)) {
@@ -137,10 +150,21 @@ fn capture_loop(
                     );
                     logged = Some((width, height));
                 }
+                if repeats > 1 {
+                    note(&notes, format!("capture recovered after {repeats} errors"));
+                }
+                last_error.clear();
+                repeats = 0;
                 publish_frame(&frames, jpeg);
             }
             Err(error) => {
-                note(&notes, format!("capture: {error}"));
+                // One line per new error, then one a minute. A headless idle
+                // console used to write this once a second for hours.
+                repeats += 1;
+                if error != last_error || repeats % 60 == 0 {
+                    note(&notes, format!("capture: {error} (x{repeats})"));
+                    last_error = error;
+                }
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -175,41 +199,92 @@ fn one_frame(
     Ok((jpeg, picture.width, picture.height))
 }
 
+/// Silence the loopback owes the player after `gap` with no packet.
+///
+/// WASAPI loopback delivers nothing at all while no app renders audio, which
+/// is the normal state of an idle console. The player then sees an audio
+/// stream with no records. Silence keeps the stream moving. A gap is at most
+/// 200 ms of frames so a stall does not become one huge record.
+pub fn silence_frames(rate: u32, gap: Duration) -> usize {
+    let gap = gap.min(Duration::from_millis(200));
+    (u128::from(rate) * gap.as_micros() / 1_000_000) as usize
+}
+
+/// Emit silence after this long without a loopback packet.
+const SILENCE_AFTER: Duration = Duration::from_millis(60);
+/// Reopen the default output after this long without a real packet. An
+/// output that went away while the display slept does not report an error.
+const REOPEN_AFTER: Duration = Duration::from_secs(10);
+
 fn audio_loop(
     stop: &AtomicBool,
     audio: SyncSender<AudioChunk>,
     notes: Arc<Mutex<VecDeque<String>>>,
 ) {
     link::init_com();
-    let mut loopback = match desktop::Loopback::open() {
-        Ok(loopback) => loopback,
-        Err(error) => {
-            note(&notes, format!("audio: {error}"));
-            return;
-        }
-    };
-    note(
-        &notes,
-        format!(
-            "audio capture {} {} Hz {} ch",
-            loopback.name(),
-            loopback.rate(),
-            loopback.channels()
-        ),
-    );
+    let mut loopback = None;
+    let mut last_error = String::new();
+    let mut logged_format = None;
+    let mut last_packet = Instant::now();
+    let mut last_sent = Instant::now();
     while !stop.load(Ordering::SeqCst) {
-        match loopback.poll() {
+        if loopback.is_none() {
+            match desktop::Loopback::open() {
+                Ok(next) => {
+                    let format = (next.rate(), next.channels());
+                    if logged_format != Some(format) {
+                        note(
+                            &notes,
+                            format!("audio capture {} {} Hz {} ch", next.name(), format.0, format.1),
+                        );
+                        logged_format = Some(format);
+                    }
+                    last_error.clear();
+                    last_packet = Instant::now();
+                    loopback = Some(next);
+                }
+                Err(error) => {
+                    if error != last_error {
+                        note(&notes, format!("audio: {error}"));
+                        last_error = error;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            }
+        }
+        let Some(open) = loopback.as_mut() else {
+            continue;
+        };
+        match open.poll() {
             Ok(Some(chunk)) => {
+                last_packet = Instant::now();
+                last_sent = last_packet;
                 let _ = audio.try_send(chunk);
             }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let gap = last_sent.elapsed();
+                if gap >= SILENCE_AFTER {
+                    let frames = silence_frames(open.rate(), gap);
+                    let channels = open.channels().max(1);
+                    let _ = audio.try_send(AudioChunk {
+                        sample_rate: open.rate(),
+                        channels,
+                        pcm: vec![0; frames * usize::from(channels)],
+                    });
+                    last_sent = Instant::now();
+                }
+                if last_packet.elapsed() >= REOPEN_AFTER {
+                    // Picks up a new default output, or the same one powered back up.
+                    loopback = None;
+                    continue;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(error) => {
                 note(&notes, format!("audio: {error}"));
-                thread::sleep(Duration::from_secs(1));
-                match desktop::Loopback::open() {
-                    Ok(next) => loopback = next,
-                    Err(error) => note(&notes, format!("audio: {error}")),
-                }
+                loopback = None;
+                thread::sleep(Duration::from_millis(200));
             }
         }
     }
@@ -283,7 +358,12 @@ fn read_loop(
     acks: Arc<Mutex<VecDeque<Vec<u8>>>>,
     failed: Arc<AtomicBool>,
 ) {
-    let mut hands = Hands { buttons: 0, warned: false };
+    let mut hands = Hands {
+        buttons: 0,
+        warned: None,
+        followed: Instant::now() - Duration::from_secs(1),
+        desktop: desktop::thread_desktop_name(),
+    };
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -297,6 +377,19 @@ fn read_loop(
                 Ok(events) => hands.apply(&events, &screen, &notes, &acks),
                 Err(error) => note(&notes, format!("input: {error}")),
             },
+            Ok(Some(Message::Wake)) => {
+                // This thread injects, so it holds the display and owns the desktop move.
+                desktop::hold_display(true);
+                hands.follow(&notes);
+                match desktop::wake_display() {
+                    Ok(()) => note(&notes, format!("wake: display on, input desktop {}", desktop::thread_desktop_name())),
+                    Err(error) => note(&notes, format!("wake: {error}")),
+                }
+            }
+            Ok(Some(Message::Release)) => {
+                desktop::hold_display(false);
+                note(&notes, "release: display may idle".to_string());
+            }
             Ok(Some(_)) => {}
             Err(error) => {
                 note(&notes, format!("desk read: {error}"));
@@ -328,10 +421,34 @@ fn confirm(event: &Event, outcome: &Result<bool, String>) -> Option<Vec<u8>> {
 
 struct Hands {
     buttons: u8,
-    warned: bool,
+    /// Last injection error noted. Cleared by the next success.
+    warned: Option<String>,
+    /// Last time this thread checked the input desktop.
+    followed: Instant,
+    desktop: String,
 }
 
+/// How often the injecting thread checks the input desktop between failures.
+const FOLLOW_EVERY: Duration = Duration::from_millis(250);
+
 impl Hands {
+    fn follow(&mut self, notes: &Mutex<VecDeque<String>>) {
+        self.followed = Instant::now();
+        match desktop::follow_input_desktop() {
+            Ok(Some(name)) => {
+                note(notes, format!("input desktop {name}"));
+                self.desktop = name;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if self.warned.as_deref() != Some(error.as_str()) {
+                    note(notes, format!("input desktop: {error}"));
+                    self.warned = Some(error);
+                }
+            }
+        }
+    }
+
     fn apply(
         &mut self,
         events: &[Event],
@@ -339,6 +456,9 @@ impl Hands {
         notes: &Mutex<VecDeque<String>>,
         acks: &Mutex<VecDeque<Vec<u8>>>,
     ) {
+        if self.followed.elapsed() >= FOLLOW_EVERY {
+            self.follow(notes);
+        }
         let width = screen.width.load(Ordering::Relaxed).max(1);
         let height = screen.height.load(Ordering::Relaxed).max(1);
         for event in events {
@@ -350,11 +470,19 @@ impl Hands {
                 }
                 queue.push_back(bytes);
             }
-            if let Err(error) = outcome {
-                if !self.warned {
-                    note(notes, format!("inject: {error}"));
-                    self.warned = true;
+            match outcome {
+                Err(error) => {
+                    // Once per distinct error, again after input worked in between.
+                    if self.warned.as_deref() != Some(error.as_str()) {
+                        note(notes, format!("inject: {error} (desktop {})", self.desktop));
+                        self.warned = Some(error);
+                    }
                 }
+                Ok(true) if self.warned.is_some() => {
+                    note(notes, format!("inject: working again on desktop {}", self.desktop));
+                    self.warned = None;
+                }
+                Ok(_) => {}
             }
         }
     }
@@ -408,5 +536,20 @@ impl Hands {
         }
         self.buttons = next;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::silence_frames;
+    use std::time::Duration;
+
+    #[test]
+    fn idle_loopback_owes_silence_for_the_gap() {
+        assert_eq!(silence_frames(48_000, Duration::from_millis(100)), 4_800);
+        assert_eq!(silence_frames(44_100, Duration::from_millis(60)), 2_646);
+        // Capped so a long stall is not one huge record.
+        assert_eq!(silence_frames(48_000, Duration::from_secs(5)), 9_600);
+        assert_eq!(silence_frames(48_000, Duration::ZERO), 0);
     }
 }

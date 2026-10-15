@@ -37,10 +37,12 @@ winapi = { version = "0.3", features = [
     "objidlbase",
     "propidl",
     "propkeydef",
+    "processthreadsapi",
     "propsys",
     "strmif",
     "unknwnbase",
     "wingdi",
+    "winbase",
     "winnt",
     "winuser",
 ] }

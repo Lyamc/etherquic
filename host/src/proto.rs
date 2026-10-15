@@ -18,6 +18,8 @@ pub const KIND_PCM: u8 = 2;
 pub const KIND_NOTE: u8 = 3;
 pub const KIND_EQIN: u8 = 4;
 pub const KIND_ACK: u8 = 5;
+pub const KIND_WAKE: u8 = 6;
+pub const KIND_RELEASE: u8 = 7;
 
 /// Same 15 bytes as `etherquic-play`'s `EACK` record.
 pub const ACK_KEY: u8 = 1;
@@ -100,6 +102,11 @@ pub enum Message {
     Eqin(Vec<u8>),
     /// Fifteen-byte input confirmation, desk helper to service.
     Ack(Vec<u8>),
+    /// Service to helper: a player is attached. Follow the input desktop,
+    /// wake the display, and keep it on until `Release`.
+    Wake,
+    /// Service to helper: the player left. Let the display idle again.
+    Release,
 }
 
 impl Message {
@@ -110,6 +117,8 @@ impl Message {
             Self::Note(text) => (KIND_NOTE, text.as_bytes()),
             Self::Eqin(bytes) => (KIND_EQIN, bytes),
             Self::Ack(bytes) => (KIND_ACK, bytes),
+            Self::Wake => (KIND_WAKE, &[][..]),
+            Self::Release => (KIND_RELEASE, &[][..]),
         }
     }
 
@@ -123,6 +132,8 @@ impl Message {
             KIND_NOTE => Self::Note(String::from_utf8_lossy(payload).into_owned()),
             KIND_EQIN => Self::Eqin(payload.to_vec()),
             KIND_ACK => Self::Ack(payload.to_vec()),
+            KIND_WAKE => Self::Wake,
+            KIND_RELEASE => Self::Release,
             other => return Err(format!("unknown desk message {other}")),
         })
     }
@@ -263,6 +274,18 @@ mod tests {
         assert_eq!(bytes[8], ACK_KEY);
         let msg = Message::decode(KIND_ACK, &bytes).unwrap();
         assert_eq!(msg, Message::Ack(bytes));
+    }
+
+    #[test]
+    fn wake_and_release_are_empty_frames() {
+        for (message, kind) in [(Message::Wake, KIND_WAKE), (Message::Release, KIND_RELEASE)] {
+            let (got, payload) = message.parts();
+            assert_eq!(got, kind);
+            assert!(payload.is_empty());
+            let bytes = frame(got, payload).unwrap();
+            assert_eq!(bytes, vec![kind, 0, 0, 0, 0]);
+            assert_eq!(Message::decode(bytes[0], &bytes[5..]).unwrap(), message);
+        }
     }
 
     #[test]
