@@ -52,6 +52,7 @@ pub struct ConnectSession {
 /// winit permits one [`EventLoop`] per process and `run_app` consumes it. This
 /// builder runs on the picture-window thread, and each connect calls
 /// [`EventLoopExtRunOnDemand::run_app_on_demand`] on that same loop.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn player_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     let mut builder = EventLoop::builder();
     #[cfg(target_os = "linux")]
@@ -79,6 +80,7 @@ struct ViewRequest {
     done: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn window_sender() -> Result<std::sync::mpsc::Sender<ViewRequest>, String> {
     static SLOT: OnceLock<std::sync::mpsc::Sender<ViewRequest>> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
@@ -98,6 +100,7 @@ fn window_sender() -> Result<std::sync::mpsc::Sender<ViewRequest>, String> {
     Ok(sender)
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn window_thread(receiver: std::sync::mpsc::Receiver<ViewRequest>) {
     let mut event_loop = match player_event_loop() {
         Ok(event_loop) => event_loop,
@@ -110,10 +113,17 @@ fn window_thread(receiver: std::sync::mpsc::Receiver<ViewRequest>) {
         }
     };
     while let Ok(request) = receiver.recv() {
+        run_view(&mut event_loop, request);
+    }
+}
+
+/// Run one picture window on `event_loop` until it closes, and report on `done`.
+fn run_view(event_loop: &mut EventLoop<()>, request: ViewRequest) {
+    {
         let proxy = event_loop.create_proxy();
         if request.proxy.send(Ok(proxy)).is_err() {
             let _ = request.done.send(Err("the picture window stopped".into()));
-            continue;
+            return;
         }
         let mut app = App {
             frames: request.frames,
@@ -145,6 +155,62 @@ fn window_thread(receiver: std::sync::mpsc::Receiver<ViewRequest>) {
     }
 }
 
+/// macOS runs a winit loop on the main thread only. The command-line player
+/// calls [`connect_view`] there, so its window runs inline on one loop kept
+/// for the process. A caller on another thread gets an error, not a panic.
+#[cfg(target_os = "macos")]
+fn on_main_thread() -> bool {
+    // Rust names the thread that runs `main` "main". The crate forbids unsafe,
+    // so this stands in for pthread_main_np.
+    std::thread::current().name() == Some("main")
+}
+
+#[cfg(target_os = "macos")]
+fn run_view_here(request: ViewRequest) {
+    thread_local! {
+        static LOOP: std::cell::RefCell<Option<EventLoop<()>>> = const { std::cell::RefCell::new(None) };
+    }
+    LOOP.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            match EventLoop::builder().build() {
+                Ok(event_loop) => *slot = Some(event_loop),
+                Err(err) => {
+                    let _ = request.proxy.send(Err(err.to_string()));
+                    let _ = request.done.send(Err(err.to_string()));
+                    return;
+                }
+            }
+        }
+        if let Some(event_loop) = slot.as_mut() {
+            run_view(event_loop, request);
+        }
+    });
+}
+
+/// Wake the window when a picture or a title arrives, and close it on Stop.
+async fn wake_window(
+    proxy: EventLoopProxy<()>,
+    frames: Arc<Mutex<Option<Picture>>>,
+    stop: Arc<AtomicBool>,
+    pads_stop: Arc<AtomicBool>,
+    title: Arc<Mutex<String>>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if stop.load(Ordering::SeqCst) {
+            pads_stop.store(true, Ordering::SeqCst);
+            let _ = proxy.send_event(());
+            break;
+        }
+        let ready = frames.lock().map(|slot| slot.is_some()).unwrap_or(false);
+        let titled = title.lock().map(|slot| !slot.is_empty()).unwrap_or(false);
+        if ready || titled {
+            let _ = proxy.send_event(());
+        }
+    }
+}
+
 fn view_error(message: impl std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(std::io::Error::other(message.to_string()))
 }
@@ -159,6 +225,12 @@ pub fn connect_view(
     stop: Arc<AtomicBool>,
     status: Status,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "macos")]
+    if !on_main_thread() {
+        return Err(view_error(
+            "On macOS the picture window has to run on the main thread, which this window already uses. Use etherquic-play connect from a terminal for now.",
+        ));
+    }
     install_pure_crypto();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -222,50 +294,46 @@ pub fn connect_view(
 
     let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    window_sender()
-        .map_err(view_error)?
-        .send(ViewRequest {
-            frames: frames.clone(),
-            input: Arc::clone(&gate),
-            stop: Arc::clone(&stop),
-            trace: trace_input,
-            view: window_view,
-            stamps: Arc::clone(&stamps),
-            title: Arc::clone(&title),
-            proxy: proxy_tx,
-            done: done_tx,
-        })
-        .map_err(|_| view_error("the picture window stopped"))?;
-    let proxy = proxy_rx
-        .recv()
-        .map_err(|_| view_error("the picture window stopped"))?
-        .map_err(view_error)?;
+    let request = ViewRequest {
+        frames: frames.clone(),
+        input: Arc::clone(&gate),
+        stop: Arc::clone(&stop),
+        trace: trace_input,
+        view: window_view,
+        stamps: Arc::clone(&stamps),
+        title: Arc::clone(&title),
+        proxy: proxy_tx,
+        done: done_tx,
+    };
     let wake_frames = frames.clone();
     let wake_stop = Arc::clone(&stop);
     let wake_pads = Arc::clone(&pads_stop);
     let wake_title = Arc::clone(&title);
-    // The spawn above has no proxy. A second task watches the same slot and Stop.
-    rt.spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            if wake_stop.load(Ordering::SeqCst) {
-                wake_pads.store(true, Ordering::SeqCst);
-                let _ = proxy.send_event(());
-                break;
-            }
-            let ready = wake_frames
-                .lock()
-                .map(|slot| slot.is_some())
-                .unwrap_or(false);
-            let titled = wake_title
-                .lock()
-                .map(|slot| !slot.is_empty())
-                .unwrap_or(false);
-            if ready || titled {
-                let _ = proxy.send_event(());
-            }
-        }
-    });
+    #[cfg(target_os = "macos")]
+    {
+        // The window runs on this thread, so the waker picks up the proxy itself.
+        rt.spawn(async move {
+            let proxy = match tokio::task::spawn_blocking(move || proxy_rx.recv()).await {
+                Ok(Ok(Ok(proxy))) => proxy,
+                _ => return,
+            };
+            wake_window(proxy, wake_frames, wake_stop, wake_pads, wake_title).await;
+        });
+        run_view_here(request);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        window_sender()
+            .map_err(view_error)?
+            .send(request)
+            .map_err(|_| view_error("the picture window stopped"))?;
+        let proxy = proxy_rx
+            .recv()
+            .map_err(|_| view_error("the picture window stopped"))?
+            .map_err(view_error)?;
+        // The spawn above has no proxy. A second task watches the same slot and Stop.
+        rt.spawn(wake_window(proxy, wake_frames, wake_stop, wake_pads, wake_title));
+    }
     done_rx
         .recv()
         .map_err(|_| view_error("the picture window stopped"))?
