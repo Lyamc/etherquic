@@ -13,12 +13,14 @@
 mod ack;
 mod capture;
 mod codec;
+pub mod hostinfo;
 mod outbox;
 mod pad;
 mod picture;
 mod pointer;
 mod session;
 mod svc;
+pub mod view_options;
 mod wire;
 
 pub use capture::{desktop_audio, DesktopAudio};
@@ -38,6 +40,10 @@ pub use picture::{
 pub use pointer::{ei_absolute, place_pointer, wayland_wheel, PointerPlace};
 pub use session::{play, resample, serve, AudioChunk};
 pub use svc::{drop_jitter_enhancement, SvcLayer};
+pub use view_options::{
+    live, place, slot_for, snapshot, to_remote, LiveView, PadSlot, Placement, ScaleMode, SizeMatch,
+    ViewOptions, PAD_SLOTS,
+};
 pub use wire::{AUDIO_MAGIC, INPUT_MAGIC, VIDEO_MAGIC};
 
 /// Play session. The same id `etherquic` and `etherquic-video` use.
@@ -92,7 +98,7 @@ mod seat_wl;
 #[cfg(feature = "desktop")]
 pub use client_desk::{connect_view, ConnectSession};
 #[cfg(feature = "desktop")]
-pub use host_desk::{display_hz, host_desktop, HostSession};
+pub use host_desk::{audio_devices, display_hz, host_desktop, HostSession};
 
 /// Where a desktop session reports a line the caller can show.
 #[cfg(feature = "desktop")]

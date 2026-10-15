@@ -10,12 +10,16 @@ autobins = false
 
 [features]
 default = ["ui"]
-ui = ["dep:gpui", "dep:etherquic-play", "etherquic-play/desktop"]
+ui = ["dep:gpui", "dep:etherquic-play", "etherquic-play/desktop", "dep:image"]
 
 [dependencies]
 etherquic = { path = ".." }
 etherquic-play = { path = "../play", default-features = false, optional = true }
 qrcode = { version = "0.14", default-features = false }
+# Discovery thumbnails are JPEG XL. Pure Rust, reads a cut-short progressive stream.
+jxl-oxide = { version = "0.12", default-features = false }
+# GPUI's own image type for the decoded thumbnail.
+image = { version = "0.25.1", default-features = false, optional = true }
 tokio = { version = "1.28", features = ["rt", "macros", "sync", "time"] }
 gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true }
 

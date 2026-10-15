@@ -47,6 +47,8 @@ pub struct HostSession {
     pub fps: u32,
     pub cert: PathBuf,
     pub key: PathBuf,
+    /// Desktop audio source by device name. `None` picks one as before.
+    pub audio_device: Option<String>,
 }
 
 /// Share this desktop and block until `stop` is set or the player leaves.
@@ -93,11 +95,12 @@ async fn listen(
             .spawn(move || capture_loop(capture_stop, capture_screen, video_tx, max_width, fps))?,
     );
     let audio_stop = Arc::clone(&stop);
+    let audio_device = host.audio_device.clone();
     let mut audio = Some(
         thread::Builder::new()
             .name("etherquic-play-audio".into())
             .spawn(move || {
-                if let Err(error) = capture_audio(audio_stop, audio_tx) {
+                if let Err(error) = capture_audio(audio_stop, audio_tx, audio_device.as_deref()) {
                     eprintln!("etherquic-play: audio capture stopped: {error}");
                 }
             })?,
@@ -327,9 +330,16 @@ fn one_frame(screen: &Screen, max_width: u32) -> Result<Vec<u8>, String> {
     encode_picture(PictureCodec::Mjpeg, &picture, 40).map_err(|error| error.to_string())
 }
 
-fn capture_audio(stop: Arc<AtomicBool>, audio: mpsc::Sender<AudioChunk>) -> Result<(), String> {
+fn capture_audio(
+    stop: Arc<AtomicBool>,
+    audio: mpsc::Sender<AudioChunk>,
+    wanted: Option<&str>,
+) -> Result<(), String> {
     let host = cpal::default_host();
-    let (device, config) = desktop_stream(&host)?;
+    let (device, config) = match wanted.and_then(|wanted| named_source(&host, wanted)) {
+        Some(found) => found,
+        None => desktop_stream(&host)?,
+    };
     let name = device.name().unwrap_or_else(|_| "audio".into());
     eprintln!("etherquic-play: capturing audio from {name}");
     let rate = config.sample_rate().0;
@@ -409,6 +419,54 @@ fn desktop_stream(
             Ok((device, config))
         }
     }
+}
+
+/// A capture device by name, or an output by name opened as loopback on Windows.
+fn named_source(
+    host: &cpal::Host,
+    wanted: &str,
+) -> Option<(cpal::Device, cpal::SupportedStreamConfig)> {
+    let named = |device: &cpal::Device| device.name().map(|name| name == wanted).unwrap_or(false);
+    if let Some(device) = host.input_devices().ok()?.find(named) {
+        let config = device.default_input_config().ok()?;
+        return Some((device, config));
+    }
+    if cfg!(windows) {
+        if let Some(device) = host.output_devices().ok()?.find(named) {
+            let config = device.default_output_config().ok()?;
+            return Some((device, config));
+        }
+    }
+    None
+}
+
+/// Names of this computer's audio outputs and inputs, defaults first.
+pub fn audio_devices() -> (Vec<String>, Vec<String>) {
+    let host = cpal::default_host();
+    let list = |devices: Option<Vec<cpal::Device>>, default: Option<cpal::Device>| {
+        let default = default.and_then(|device| device.name().ok());
+        let mut names: Vec<String> = devices
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|device| device.name().ok())
+            .collect();
+        names.sort();
+        names.dedup();
+        if let Some(default) = default {
+            names.retain(|name| *name != default);
+            names.insert(0, default);
+        }
+        names
+    };
+    let outputs = list(
+        host.output_devices().ok().map(Iterator::collect),
+        host.default_output_device(),
+    );
+    let inputs = list(
+        host.input_devices().ok().map(Iterator::collect),
+        host.default_input_device(),
+    );
+    (outputs, inputs)
 }
 
 fn input_devices(host: &cpal::Host) -> (Option<cpal::Device>, Option<cpal::Device>) {

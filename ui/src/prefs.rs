@@ -322,6 +322,38 @@ pub fn video_match_line(
     line
 }
 
+/// The picture codec this order gives with that computer, or `None`.
+pub fn chosen_video(
+    preference: &[PicturePref],
+    local: &MachineCodecs,
+    video: Option<&[AnnouncedCodec]>,
+    skip_without_hardware_encode: bool,
+) -> Option<PicturePref> {
+    choose_codec(
+        preference,
+        local,
+        &remote_video(video),
+        false,
+        skip_without_hardware_encode,
+    )
+    .0
+}
+
+/// The audio codec this order gives with that computer, or `None`.
+pub fn chosen_audio(
+    preference: &[AudioId],
+    local: &AudioMachine,
+    audio: Option<&[AnnouncedCodec]>,
+) -> Option<AudioId> {
+    choose_audio(preference, local, &remote_audio(audio)).0
+}
+
+/// Move `item` to the front of `order`, adding it when missing.
+pub fn move_to_front<T: PartialEq + Copy>(order: &mut Vec<T>, item: T) {
+    order.retain(|entry| *entry != item);
+    order.insert(0, item);
+}
+
 pub fn audio_match_line(
     preference: &[AudioId],
     local: &AudioMachine,

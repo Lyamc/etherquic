@@ -33,7 +33,11 @@ impl Default for Slot {
     }
 }
 
-pub fn run(input: Arc<Gate>, stop: Arc<AtomicBool>) {
+/// Send this computer's controllers. Each is sent as the slot pinned to its
+/// name in `view`, else the lowest free slot, so "controller 2" stays the
+/// same pad whichever is plugged in first. Pins and the on/off switch are read
+/// on every event, so a change in the console applies straight away.
+pub fn run(input: Arc<Gate>, stop: Arc<AtomicBool>, view: crate::LiveView) {
     let mut gilrs = match Gilrs::new() {
         Ok(gilrs) => gilrs,
         Err(error) => {
@@ -42,7 +46,7 @@ pub fn run(input: Arc<Gate>, stop: Arc<AtomicBool>) {
         }
     };
     let mut slots: HashMap<GamepadId, Slot> = HashMap::new();
-    let mut indexes: Vec<GamepadId> = Vec::new();
+    let mut sent_as: HashMap<GamepadId, u8> = HashMap::new();
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -50,14 +54,17 @@ pub fn run(input: Arc<Gate>, stop: Arc<AtomicBool>) {
         let mut idle = true;
         while let Some(gilrs::Event { id, event, .. }) = gilrs.next_event() {
             idle = false;
-            let index = index_of(&mut indexes, id);
+            let options = crate::snapshot(&view);
+            let name = gilrs.gamepad(id).name().to_string();
+            let index = slot_of(&mut sent_as, id, &name, &options.pad_slots, &input);
             if matches!(event, EventType::Disconnected) {
                 slots.remove(&id);
+                sent_as.remove(&id);
                 input.push(gamepad_event(index, 0, Axes::default()));
                 continue;
             }
             let slot = slots.entry(id).or_default();
-            if apply(slot, &event) {
+            if apply(slot, &event) && options.send_pads {
                 input.push(gamepad_event(index, slot.buttons, slot.axes));
             }
         }
@@ -67,12 +74,29 @@ pub fn run(input: Arc<Gate>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn index_of(indexes: &mut Vec<GamepadId>, id: GamepadId) -> u8 {
-    if let Some(pos) = indexes.iter().position(|have| *have == id) {
-        return u8::try_from(pos).unwrap_or(u8::MAX);
+/// The slot `id` is sent as. When its pin moved, the old slot is released first.
+fn slot_of(
+    sent_as: &mut HashMap<GamepadId, u8>,
+    id: GamepadId,
+    name: &str,
+    pins: &[crate::PadSlot],
+    input: &Gate,
+) -> u8 {
+    let pinned = pins.iter().find(|pin| pin.name == name).map(|pin| pin.slot);
+    if let Some(&now) = sent_as.get(&id) {
+        match pinned {
+            Some(pin) if pin != now => {
+                input.push(gamepad_event(now, 0, Axes::default()));
+                sent_as.insert(id, pin);
+                return pin;
+            }
+            _ => return now,
+        }
     }
-    indexes.push(id);
-    u8::try_from(indexes.len() - 1).unwrap_or(u8::MAX)
+    let taken: Vec<u8> = sent_as.values().copied().collect();
+    let slot = crate::slot_for(pins, name, &taken);
+    sent_as.insert(id, slot);
+    slot
 }
 
 fn apply(slot: &mut Slot, event: &EventType) -> bool {

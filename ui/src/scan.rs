@@ -11,6 +11,8 @@ pub struct Board {
     pub looking: bool,
     pub error: Option<String>,
     pub devices: Vec<Found>,
+    /// Counts finished bursts, so the window can tell a new answer from the same one.
+    pub burst: u64,
 }
 
 impl Default for Board {
@@ -19,6 +21,7 @@ impl Default for Board {
             looking: false,
             error: None,
             devices: Vec::new(),
+            burst: 0,
         }
     }
 }
@@ -69,6 +72,7 @@ impl Scan {
                 looking: board.looking,
                 error: board.error.clone(),
                 devices: board.devices.clone(),
+                burst: board.burst,
             },
             Err(poisoned) => {
                 let board = poisoned.into_inner();
@@ -76,6 +80,7 @@ impl Scan {
                     looking: board.looking,
                     error: board.error.clone(),
                     devices: board.devices.clone(),
+                    burst: board.burst,
                 }
             }
         }
@@ -100,6 +105,7 @@ fn worker(rx: mpsc::Receiver<Job>, generation: Arc<AtomicU64>, board: Arc<Mutex<
             Ok(devices) => {
                 slot.devices = devices;
                 slot.error = None;
+                slot.burst += 1;
             }
             Err(err) => slot.error = Some(err),
         }
