@@ -37,6 +37,12 @@ if [ -x "$brew/bin/cjxl" ]; then
     done
 fi
 
+# libopus (BSD) for Opus audio. The media code dlopens it from Frameworks.
+if [ -f "$brew/opt/opus/lib/libopus.0.dylib" ]; then
+    cp "$(readlink -f "$brew/opt/opus/lib/libopus.0.dylib")" "$app/Contents/Frameworks/libopus.0.dylib"
+    cp "$brew/opt/opus/COPYING" "$app/Contents/Resources/licenses/LICENSE-opus.txt"
+fi
+
 if [ -n "$pyrowave" ]; then
     cp "$pyrowave/libpyrowave-shared.1.dylib" "$app/Contents/Frameworks/"
     ln -s libpyrowave-shared.1.dylib "$app/Contents/Frameworks/libpyrowave-shared.dylib"
