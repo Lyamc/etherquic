@@ -78,6 +78,46 @@ impl NetworkDriver {
     }
 }
 
+/// One value in Settings. "Make default" and the "default" hint work per field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    Scale,
+    SizeMatch,
+    SendKeyboard,
+    SendMouse,
+    SendPads,
+    PadSlots,
+    OutputDevice,
+    ShareDevice,
+    Network,
+    Language,
+}
+
+impl Field {
+    pub const ALL: [Field; 10] = [
+        Self::Scale,
+        Self::SizeMatch,
+        Self::SendKeyboard,
+        Self::SendMouse,
+        Self::SendPads,
+        Self::PadSlots,
+        Self::OutputDevice,
+        Self::ShareDevice,
+        Self::Network,
+        Self::Language,
+    ];
+
+    pub fn section(self) -> Section {
+        match self {
+            Self::Scale | Self::SizeMatch => Section::Appearance,
+            Self::SendKeyboard | Self::SendMouse | Self::SendPads | Self::PadSlots => Section::Input,
+            Self::OutputDevice | Self::ShareDevice => Section::Sound,
+            Self::Network => Section::Network,
+            Self::Language => Section::Language,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub scale: ScaleMode,
@@ -127,28 +167,46 @@ impl Settings {
         }
     }
 
-    /// Put one section back to its defaults. Codecs and capture rate live in
-    /// the preferences file and are reset there.
-    pub fn reset(&mut self, section: Section) {
-        let base = Settings::default();
-        match section {
-            Section::Appearance => {
-                self.scale = base.scale;
-                self.size_match = base.size_match;
+    /// Put one section back to `base`: the user's defaults, or
+    /// `Settings::default()` for factory values. Codecs and capture rate live
+    /// in the preferences file and are reset there.
+    pub fn reset(&mut self, section: Section, base: &Settings) {
+        for field in Field::ALL {
+            if field.section() == section {
+                self.take(base, field);
             }
-            Section::Sound => {
-                self.output_device = base.output_device;
-                self.share_device = base.share_device;
-            }
-            Section::Input => {
-                self.send_keyboard = base.send_keyboard;
-                self.send_mouse = base.send_mouse;
-                self.send_pads = base.send_pads;
-                self.pad_slots = base.pad_slots;
-            }
-            Section::Network => self.network = base.network,
-            Section::Language => self.language = base.language,
-            Section::Capture | Section::Codecs => {}
+        }
+    }
+
+    /// Whether `field` has the same value in both.
+    pub fn same(&self, other: &Settings, field: Field) -> bool {
+        match field {
+            Field::Scale => self.scale == other.scale,
+            Field::SizeMatch => self.size_match == other.size_match,
+            Field::SendKeyboard => self.send_keyboard == other.send_keyboard,
+            Field::SendMouse => self.send_mouse == other.send_mouse,
+            Field::SendPads => self.send_pads == other.send_pads,
+            Field::PadSlots => self.pad_slots == other.pad_slots,
+            Field::OutputDevice => self.output_device == other.output_device,
+            Field::ShareDevice => self.share_device == other.share_device,
+            Field::Network => self.network == other.network,
+            Field::Language => self.language == other.language,
+        }
+    }
+
+    /// Copy one field from `from`.
+    pub fn take(&mut self, from: &Settings, field: Field) {
+        match field {
+            Field::Scale => self.scale = from.scale,
+            Field::SizeMatch => self.size_match = from.size_match,
+            Field::SendKeyboard => self.send_keyboard = from.send_keyboard,
+            Field::SendMouse => self.send_mouse = from.send_mouse,
+            Field::SendPads => self.send_pads = from.send_pads,
+            Field::PadSlots => self.pad_slots = from.pad_slots.clone(),
+            Field::OutputDevice => self.output_device = from.output_device.clone(),
+            Field::ShareDevice => self.share_device = from.share_device.clone(),
+            Field::Network => self.network = from.network,
+            Field::Language => self.language = from.language.clone(),
         }
     }
 
@@ -187,6 +245,32 @@ pub fn load_settings() -> Settings {
 pub fn store_settings(settings: &Settings) -> Result<(), String> {
     let path = settings_path().ok_or("no home directory for settings")?;
     store_settings_at(&path, settings)
+}
+
+/// The user's own defaults, set with "Make default". Same format as
+/// `settings.txt`. Reset goes back to these; a missing file is factory values.
+pub fn defaults_path() -> Option<PathBuf> {
+    crate::prefs::preferences_path().map(|path| path.with_file_name("defaults.txt"))
+}
+
+pub fn load_defaults() -> Settings {
+    defaults_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| parse_settings(&text))
+        .unwrap_or_default()
+}
+
+/// Factory values remove the file, so a later build's factory values apply.
+pub fn store_defaults(defaults: &Settings) -> Result<(), String> {
+    let path = defaults_path().ok_or("no home directory for settings")?;
+    if *defaults == Settings::default() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("remove {}: {err}", path.display())),
+        };
+    }
+    store_settings_at(&path, defaults)
 }
 
 fn store_settings_at(path: &Path, settings: &Settings) -> Result<(), String> {
@@ -456,13 +540,64 @@ mod tests {
             output_device: Some("Headset".into()),
             ..Settings::default()
         };
-        settings.reset(Section::Appearance);
+        let factory = Settings::default();
+        settings.reset(Section::Appearance, &factory);
         assert_eq!(settings.scale, ScaleMode::Fit);
         assert!(!settings.send_mouse);
-        settings.reset(Section::Sound);
+        settings.reset(Section::Sound, &factory);
         assert_eq!(settings.output_device, None);
-        settings.reset(Section::Input);
+        settings.reset(Section::Input, &factory);
         assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn make_default_then_reset_returns_to_it() {
+        let mut defaults = Settings::default();
+        let mut settings = Settings {
+            scale: ScaleMode::Native,
+            send_mouse: false,
+            output_device: Some("Headset".into()),
+            ..Settings::default()
+        };
+        // "Make default" on the scale only.
+        assert!(!settings.same(&defaults, Field::Scale));
+        defaults.take(&settings, Field::Scale);
+        assert!(settings.same(&defaults, Field::Scale));
+        assert!(!settings.same(&defaults, Field::SendMouse));
+        settings.scale = ScaleMode::Stretch;
+        settings.reset(Section::Appearance, &defaults);
+        assert_eq!(settings.scale, ScaleMode::Native);
+        // Fields that were not made default still go back to factory values.
+        settings.reset(Section::Input, &defaults);
+        assert!(settings.send_mouse);
+        assert_eq!(settings.output_device.as_deref(), Some("Headset"));
+        // The defaults file uses the settings format.
+        assert_eq!(parse_settings(&render_settings(&defaults)), defaults);
+    }
+
+    #[test]
+    fn every_field_belongs_to_a_resettable_section() {
+        let changed = Settings {
+            scale: ScaleMode::Native,
+            size_match: SizeMatch::WindowToHost,
+            send_keyboard: false,
+            send_mouse: false,
+            send_pads: false,
+            pad_slots: vec![PadSlot { name: "Pad".into(), slot: 1 }],
+            output_device: Some("A".into()),
+            share_device: Some("B".into()),
+            network: NetworkDriver::Npcap,
+            language: "en-x".into(),
+        };
+        let factory = Settings::default();
+        for field in Field::ALL {
+            assert!(!changed.same(&factory, field), "{field:?} unchanged in the test");
+        }
+        let mut settings = changed.clone();
+        for section in Section::ALL {
+            settings.reset(section, &factory);
+        }
+        assert_eq!(settings, factory);
     }
 
     #[test]

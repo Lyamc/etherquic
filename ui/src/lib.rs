@@ -46,8 +46,9 @@ pub use session::{
 };
 #[cfg(feature = "ui")]
 pub use settings::{
-    backends, load_settings, parse_settings, render_settings, settings_path, store_settings,
-    Backend, BackendState, NetworkDriver, Part, Section, Settings,
+    backends, defaults_path, load_defaults, load_settings, parse_settings, render_settings,
+    settings_path, store_defaults, store_settings, Backend, BackendState, Field, NetworkDriver,
+    Part, Section, Settings,
 };
 pub use share::{qr_grid, this_pc, QrGrid, Share, ShareRow};
 pub use thumb::{caps_details, caps_summary, decode_thumbnail, Thumb};

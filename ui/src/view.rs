@@ -28,8 +28,8 @@ use etherquic_ui::{
 };
 use etherquic_ui::{
     backends as backend_list, chosen_audio, chosen_video, default_audio, default_video,
-    load_settings, move_to_front, store_settings, BackendState, NetworkDriver, Part, RosterRow,
-    Section, Settings,
+    load_defaults, load_settings, move_to_front, store_defaults, store_settings, BackendState,
+    Field, NetworkDriver, Part, RosterRow, Section, Settings,
 };
 use etherquic_play::{ScaleMode, SizeMatch, PAD_SLOTS};
 use etherquic_ui::{
@@ -284,6 +284,8 @@ struct Desk {
     menu: Option<Menu>,
     /// A Reset waiting for its confirmation. `Some(None)` is Reset all.
     confirm_reset: Option<Option<Section>>,
+    /// The user's defaults: what Reset returns to and what "default" marks.
+    defaults: Settings,
     local_outputs: Vec<String>,
     local_inputs: Vec<String>,
     local_pads: Vec<String>,
@@ -359,6 +361,7 @@ impl Desk {
             backend,
             pyrowave_library: etherquic::pyrowave_library_present(),
             settings: load_settings(),
+            defaults: load_defaults(),
             session_video: None,
             session_audio: None,
             menu: None,
@@ -2359,14 +2362,32 @@ impl Desk {
         self.apply_settings(true);
     }
 
-    /// Put a section, or everything with `None`, back to its defaults.
-    fn reset_settings(&mut self, section: Option<Section>) {
+    /// Make the current value of `fields` the user's default.
+    fn make_default(&mut self, fields: &[Field]) {
+        for field in fields {
+            self.defaults.take(&self.settings, *field);
+        }
+        if let Err(err) = store_defaults(&self.defaults) {
+            self.message = Some(format!("Defaults were not saved: {err}"));
+        }
+    }
+
+    /// Put a section, or everything with `None`, back to the user's defaults.
+    /// `factory` also forgets those defaults first.
+    fn reset_settings(&mut self, section: Option<Section>, factory: bool) {
+        if factory {
+            self.defaults = Settings::default();
+            if let Err(err) = store_defaults(&self.defaults) {
+                self.message = Some(format!("Defaults were not saved: {err}"));
+            }
+        }
+        let base = self.defaults.clone();
         let sections: Vec<Section> = match section {
             Some(section) => vec![section],
             None => Section::ALL.to_vec(),
         };
         for section in sections {
-            self.settings.reset(section);
+            self.settings.reset(section, &base);
             match section {
                 Section::Capture => self.fps = FrameRate::Auto,
                 Section::Sound => {
@@ -2630,7 +2651,9 @@ impl Desk {
                     .cursor_pointer()
                     .when(on, |item| item.bg(rgb(0x243044)).font_weight(FontWeight::BOLD))
                     .hover(|item| item.bg(rgb(0x2a3242)))
+                    .justify_between()
                     .child(text)
+                    .when(pick.is_none(), |item| item.child(faint_default()))
                     .on_click(cx.listener(move |desk, _, _, cx| {
                         match (which, pick) {
                             (Menu::Video, None) => {
@@ -2840,6 +2863,7 @@ impl Desk {
             None => "all".into(),
         };
         let asking = self.confirm_reset == Some(target);
+        let custom = self.defaults != Settings::default();
         let label: &'static str = if target.is_none() { "Reset all" } else { "Reset" };
         let mut slot = div()
             .flex()
@@ -2848,21 +2872,39 @@ impl Desk {
             .justify_end()
             .items_center()
             .gap_1()
-            .w(px(if target.is_none() { 220. } else { 190. }));
+            .w(px(if target.is_none() { 300. } else { 190. }));
         if asking {
+            let factory_too = target.is_none() && custom;
             slot = slot
-                .child(div().text_xs().text_color(rgb(DANGER)).child("Reset to defaults?"))
+                .child(div().text_xs().text_color(rgb(DANGER)).child(if factory_too {
+                    "Reset to:"
+                } else {
+                    "Reset to defaults?"
+                }))
                 .child(small_chip(
                     SharedString::from(format!("reset-yes-{key}")),
-                    "Reset",
+                    if factory_too { "My defaults" } else { "Reset" },
                     Some(DANGER),
                     true,
                     cx.listener(move |desk, _, _, cx| {
-                        desk.reset_settings(target);
+                        desk.reset_settings(target, false);
                         desk.confirm_reset = None;
                         cx.notify();
                     }),
                 ))
+                .when(factory_too, |slot| {
+                    slot.child(small_chip(
+                        "reset-factory",
+                        "Factory",
+                        Some(DANGER),
+                        true,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.reset_settings(None, true);
+                            desk.confirm_reset = None;
+                            cx.notify();
+                        }),
+                    ))
+                })
                 .child(small_chip(
                     SharedString::from(format!("reset-no-{key}")),
                     "Cancel",
@@ -2888,6 +2930,37 @@ impl Desk {
         slot
     }
 
+    /// A setting's label, and "Make default" when its value is not the default.
+    /// The row has a fixed height, so the button appearing moves nothing.
+    fn field_head(
+        &mut self,
+        label: &'static str,
+        fields: &'static [Field],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let changed = fields.iter().any(|field| !self.settings.same(&self.defaults, *field));
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(24.))
+            .min_w_0()
+            .child(section_label(label))
+            .when(changed, |row| {
+                row.child(small_chip(
+                    SharedString::from(format!("make-default-{label}")),
+                    "Make default",
+                    None,
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.make_default(fields);
+                        cx.notify();
+                    }),
+                ))
+            })
+    }
+
     /// Backends for one part. Only a real choice is clickable; the rest are
     /// shown greyed with why.
     fn backend_row(&mut self, part: Part, cx: &mut Context<Self>) -> AnyElement {
@@ -2904,7 +2977,8 @@ impl Desk {
                         "Npcap" => NetworkDriver::Npcap,
                         _ => NetworkDriver::Automatic,
                     };
-                    (self.settings.network == driver, true, None)
+                    let note = (self.defaults.network == driver).then_some("default");
+                    (self.settings.network == driver, true, note)
                 }
                 BackendState::Unavailable(why) => (false, false, Some(*why)),
             };
@@ -2968,17 +3042,22 @@ impl Desk {
         let render = self.backend_row(Part::Render, cx);
         let scale = self.settings.scale;
         let size_match = self.settings.size_match;
+        let default_scale = self.defaults.scale;
+        let default_size = self.defaults.size_match;
         let mut scales = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
         for mode in ScaleMode::ALL {
-            scales = scales.child(choice_chip(
-                SharedString::from(format!("scale-{}", mode.token())),
-                mode.label(),
-                scale == mode,
-                96.,
-                cx.listener(move |desk, _, _, cx| {
-                    desk.edit_settings(|settings| settings.scale = mode);
-                    cx.notify();
-                }),
+            scales = scales.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("scale-{}", mode.token())),
+                    mode.label(),
+                    scale == mode,
+                    96.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.scale = mode);
+                        cx.notify();
+                    }),
+                ),
+                default_scale == mode,
             ));
         }
         let mut sizes = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
@@ -2995,17 +3074,22 @@ impl Desk {
                     cx.notify();
                 }),
             );
-            sizes = sizes.child(div().when(!choice.available(), |chip| chip.opacity(0.45)).child(chip));
+            sizes = sizes.child(with_default(
+                div().when(!choice.available(), |chip| chip.opacity(0.45)).child(chip),
+                default_size == choice,
+            ));
         }
+        let scale_head = self.field_head("Scale to fit", &[Field::Scale], cx);
+        let size_head = self.field_head("Resolution matching", &[Field::SizeMatch], cx);
         let appearance_body = div()
             .flex()
             .flex_col()
             .gap_2()
             .w_full()
             .min_w_0()
-            .child(section_label("Scale to fit"))
+            .child(scale_head)
             .child(scales)
-            .child(section_label("Resolution matching"))
+            .child(size_head)
             .child(sizes)
             .child(muted_line(
                 "Applies to an open view at once. Host matches window is not available: hosts do not change their resolution yet.".into(),
@@ -3053,11 +3137,16 @@ impl Desk {
             ));
         }
         let share_pick = self.settings.share_device.clone();
+        let share_default = self.defaults.share_device.clone();
+        let out_default = self.defaults.output_device.clone();
+        let share_head = self.field_head("This computer: input (shared when hosting)", &[Field::ShareDevice], cx);
+        let out_head = self.field_head("This computer: output (remote sound plays here)", &[Field::OutputDevice], cx);
         let mut shared = div().flex().flex_col().gap_1().w_full().min_w_0();
         shared = shared.child(device_chip(
             "share-auto".into(),
             "Desktop audio (automatic)".into(),
             share_pick.is_none(),
+            share_default.is_none(),
             true,
             cx.listener(|desk, _, _, cx| {
                 desk.edit_settings(|settings| settings.share_device = None);
@@ -3079,11 +3168,13 @@ impl Desk {
         }
         for (index, name) in sources.into_iter().enumerate() {
             let on = share_pick.as_deref() == Some(name.as_str());
+            let is_default = share_default.as_deref() == Some(name.as_str());
             let pick = name.clone();
             shared = shared.child(device_chip(
                 SharedString::from(format!("share-{index}")),
                 name,
                 on,
+                is_default,
                 true,
                 cx.listener(move |desk, _, _, cx| {
                     let pick = pick.clone();
@@ -3098,6 +3189,7 @@ impl Desk {
             "out-default".into(),
             "System default".into(),
             out_pick.is_none(),
+            out_default.is_none(),
             true,
             cx.listener(|desk, _, _, cx| {
                 desk.edit_settings(|settings| settings.output_device = None);
@@ -3111,11 +3203,13 @@ impl Desk {
         }
         for (index, name) in sinks.into_iter().enumerate() {
             let on = out_pick.as_deref() == Some(name.as_str());
+            let is_default = out_default.as_deref() == Some(name.as_str());
             let pick = name.clone();
             outputs = outputs.child(device_chip(
                 SharedString::from(format!("out-{index}")),
                 name,
                 on,
+                is_default,
                 true,
                 cx.listener(move |desk, _, _, cx| {
                     let pick = pick.clone();
@@ -3150,8 +3244,8 @@ impl Desk {
             .w_full()
             .min_w_0()
             .child(two_columns(
-                column("This computer: input (shared when hosting)", shared),
-                column("This computer: output (remote sound plays here)", outputs),
+                div().flex().flex_col().gap_1().w_full().min_w_0().child(share_head).child(shared),
+                div().flex().flex_col().gap_1().w_full().min_w_0().child(out_head).child(outputs),
             ))
             .child(two_columns(
                 column_owned(format!("{remote_name}: input"), remote_in),
@@ -3273,6 +3367,9 @@ impl Desk {
         let mouse = self.settings.send_mouse;
         let pads = self.settings.send_pads;
         let trace_input = self.trace_input;
+        let send_head = self.field_head("Send", &[Field::SendKeyboard, Field::SendMouse, Field::SendPads], cx);
+        let slots_head = self.field_head("Controller to player slot", &[Field::PadSlots], cx);
+        let default_pins = self.defaults.clone();
         let mut slots = div().flex().flex_col().gap_1().w_full().min_w_0();
         if self.local_pads.is_empty() {
             slots = slots.child(muted_line(
@@ -3324,6 +3421,19 @@ impl Desk {
                     }),
                 ));
             }
+            let default_slot = default_pins.pinned_slot(&name);
+            row = row.child(
+                div()
+                    .flex_none()
+                    .w(px(64.))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .opacity(0.6)
+                    .child(match default_slot {
+                        Some(slot) => format!("default P{}", slot + 1),
+                        None => "default Auto".to_string(),
+                    }),
+            );
             slots = slots.child(row);
         }
         let remote_pads = remote_caps.as_ref().map(|caps| {
@@ -3343,25 +3453,26 @@ impl Desk {
             .gap_2()
             .w_full()
             .min_w_0()
+            .child(send_head)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .flex_wrap()
                     .gap_2()
-                    .child(toggle_chip("send-keyboard", "Send keyboard", keyboard, cx.listener(|desk, _, _, cx| {
+                    .child(toggle_chip("send-keyboard", "Send keyboard", keyboard, Some(self.defaults.send_keyboard), cx.listener(|desk, _, _, cx| {
                         desk.edit_settings(|settings| settings.send_keyboard = !settings.send_keyboard);
                         cx.notify();
                     })))
-                    .child(toggle_chip("send-mouse", "Send mouse", mouse, cx.listener(|desk, _, _, cx| {
+                    .child(toggle_chip("send-mouse", "Send mouse", mouse, Some(self.defaults.send_mouse), cx.listener(|desk, _, _, cx| {
                         desk.edit_settings(|settings| settings.send_mouse = !settings.send_mouse);
                         cx.notify();
                     })))
-                    .child(toggle_chip("send-pads", "Send controllers", pads, cx.listener(|desk, _, _, cx| {
+                    .child(toggle_chip("send-pads", "Send controllers", pads, Some(self.defaults.send_pads), cx.listener(|desk, _, _, cx| {
                         desk.edit_settings(|settings| settings.send_pads = !settings.send_pads);
                         cx.notify();
                     })))
-                    .child(toggle_chip("trace-input", "Trace input timing", trace_input, cx.listener(|desk, _, _, cx| {
+                    .child(toggle_chip("trace-input", "Trace input timing", trace_input, Some(false), cx.listener(|desk, _, _, cx| {
                         desk.trace_input = !desk.trace_input;
                         desk.persist();
                         cx.notify();
@@ -3370,7 +3481,7 @@ impl Desk {
             .child(muted_line(
                 "Send toggles apply to an open view at once. Trace input asks the remote to confirm each key and click; turn it on, then connect.".into(),
             ))
-            .child(section_label("Controller to player slot"))
+            .child(slots_head)
             .child(slots)
             .child(muted_line(
                 "Auto gives the next free slot in plug-in order. A pinned controller always arrives as that player on the host.".into(),
@@ -3428,6 +3539,7 @@ impl Desk {
                     .cursor_pointer()
                     .child(flag_en())
                     .child("English")
+                    .when(self.defaults.language == "en", |chip| chip.child(faint_default()))
                     .on_click(cx.listener(|desk, _, _, cx| {
                         desk.edit_settings(|settings| settings.language = "en".into());
                         cx.notify();
@@ -4872,6 +4984,7 @@ fn device_chip(
     id: SharedString,
     label: String,
     on: bool,
+    is_default: bool,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -4892,15 +5005,40 @@ fn device_chip(
         .text_color(rgb(if on { TEXT } else { MUTED }))
         .when(!enabled, |chip| chip.opacity(0.45))
         .when(enabled, |chip| chip.cursor_pointer().on_click(on_click))
+        .gap_2()
         .child(
             div()
-                .w_full()
+                .flex_1()
+                .min_w_0()
                 .h(px(16.))
                 .line_height(px(16.))
                 .overflow_hidden()
                 .whitespace_normal()
                 .child(label),
         )
+        .when(is_default, |chip| chip.child(faint_default()))
+}
+
+/// The faint "default" mark on the option the user's defaults pick.
+fn faint_default() -> impl IntoElement {
+    div()
+        .flex_none()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .opacity(0.6)
+        .child("default")
+}
+
+/// A choice with the faint "default" mark beside it when it is the default.
+fn with_default(chip: impl IntoElement, is_default: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .child(chip)
+        .when(is_default, |row| row.child(faint_default()))
 }
 
 /// A remote device: shown, not picked here. The first is that computer's default.
@@ -4997,6 +5135,7 @@ fn toggle_chip(
     id: &'static str,
     label: &'static str,
     on: bool,
+    default_on: Option<bool>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -5023,6 +5162,15 @@ fn toggle_chip(
                 .when(on, |box_| box_.bg(rgb(PLAYER_BLUE))),
         )
         .child(label)
+        .when_some(default_on, |chip, default_on| {
+            chip.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .opacity(0.6)
+                    .child(if default_on { "default on" } else { "default off" }),
+            )
+        })
         .on_click(on_click)
 }
 
