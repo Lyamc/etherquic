@@ -1,10 +1,13 @@
 # Build dist\etherquic-<version>-windows-x64.msi (WiX 5: dotnet tool install --global wix --version 5.0.2).
-#   powershell -File packaging\windows\build-msi.ps1 [-Version 0.1.0] [-Cjxl DIR] [-Npcap DIR]
+#   powershell -File packaging\windows\build-msi.ps1 [-Version 0.1.0] [-Cjxl DIR] [-Codecs DIR] [-Npcap DIR]
+# -Codecs is a directory with libopus-0.dll, libpyrowave-shared-1.dll, the MinGW runtime
+# DLLs and their LICENSE-*.txt files (see packaging/windows/codecs.sh).
 # Builds etherquic-host and the app (both link Npcap's wpcap.lib), etherquic-setup and the etherquic app,
 # stages them with the Membrane driver package and cjxl, and runs wix build.
 param(
     [string]$Version = "0.1.0",
     [string]$Cjxl = "",
+    [string]$Codecs = "",
     [string]$Npcap = "C:\Build\networking\borderless\third_party\npcap\lib"
 )
 $ErrorActionPreference = "Stop"
@@ -29,6 +32,10 @@ Copy-Item (Join-Path $root "certs\cert.pem"), (Join-Path $root "certs\key.pem") 
 Copy-Item (Join-Path $PSScriptRoot "msi-setup.ps1") $stage
 Get-ChildItem (Join-Path $root "windows") -File | Copy-Item -Destination (Join-Path $stage "membrane")
 Copy-Item (Join-Path $PSScriptRoot "run-logged.ps1") (Join-Path $stage "membrane")
+if ($Codecs) {
+    Get-ChildItem $Codecs -File | Where-Object { $_.Name -like "*.dll" -or $_.Name -like "LICENSE-*" } |
+        Copy-Item -Destination $stage
+}
 if ($Cjxl) {
     Copy-Item (Join-Path $Cjxl "cjxl.exe") $stage
     Get-ChildItem $Cjxl -Filter "LICENSE.*" | Copy-Item -Destination $stage

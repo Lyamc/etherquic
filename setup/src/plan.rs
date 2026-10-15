@@ -34,6 +34,18 @@ pub const PYROWAVE_FILES: [&str; 3] = [
     "libpyrowave-shared-1.dll",
     "LICENSE-pyrowave.txt",
 ];
+/// Copied only when present. libopus (BSD) gives Opus audio. The MinGW C++
+/// runtime (GCC runtime exception) and mcfgthread are what the MinGW-built
+/// PyroWave library loads. The host probes each codec and announces only what works.
+pub const CODEC_FILES: [&str; 7] = [
+    "libopus-0.dll",
+    "LICENSE-opus.txt",
+    "libgcc_s_seh-1.dll",
+    "libstdc++-6.dll",
+    "libmcfgthread-2.dll",
+    "LICENSE-gcc-runtime.txt",
+    "LICENSE-mcfgthread.txt",
+];
 /// Copied only when present. The host runs cjxl.exe from its own directory to make
 /// the JPEG XL thumbnail it announces in discovery. libjxl and its parts are BSD/MIT/zlib.
 pub const THUMBNAIL_FILES: [&str; 11] = [
@@ -255,7 +267,7 @@ pub fn install_plan(
             to: paths.install_dir.join(name),
         });
     }
-    for name in PYROWAVE_FILES.iter().chain(THUMBNAIL_FILES.iter()) {
+    for name in PYROWAVE_FILES.iter().chain(CODEC_FILES.iter()).chain(THUMBNAIL_FILES.iter()) {
         let from = paths.payload_dir.join(name);
         if from.is_file() {
             steps.push(Step::CopyFile {
@@ -869,6 +881,7 @@ service=5000
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(payload.join("libpyrowave-shared.dll"), b"dll").unwrap();
         std::fs::write(payload.join("LICENSE-pyrowave.txt"), b"mit").unwrap();
+        std::fs::write(payload.join("libopus-0.dll"), b"dll").unwrap();
         let staged = Paths {
             install_dir: install,
             payload_dir: payload,
@@ -887,6 +900,8 @@ service=5000
         assert!(names.iter().any(|name| name == "libpyrowave-shared.dll"));
         assert!(names.iter().any(|name| name == "LICENSE-pyrowave.txt"));
         assert!(!names.iter().any(|name| name == "libpyrowave-shared-1.dll"));
+        assert!(names.iter().any(|name| name == "libopus-0.dll"));
+        assert!(!names.iter().any(|name| name == "libstdc++-6.dll"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
