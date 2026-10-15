@@ -22,6 +22,9 @@ use etherquic::thumbnail::{cjxl_path, downscale, encode_cjxl, fit_to_budget, THU
 pub type Picture = Arc<Mutex<Option<Vec<u8>>>>;
 
 pub const REFRESH: Duration = Duration::from_secs(30);
+/// Encoded before any player asks, so the first answer already carries a
+/// picture. Smaller than any budget an IPv4, IPv6, or L2 offer leaves.
+const SEED_BUDGET: usize = 900;
 
 #[derive(Default)]
 struct Cache {
@@ -41,7 +44,10 @@ pub struct HostExtras {
 impl HostExtras {
     /// Start the refresher. It stops with `stop`.
     pub fn start(picture: Picture, stop: Arc<AtomicBool>) -> Self {
-        let cache = Arc::new(Mutex::new(Cache::default()));
+        let cache = Arc::new(Mutex::new(Cache {
+            budgets: vec![SEED_BUDGET],
+            ..Cache::default()
+        }));
         let worker = Arc::clone(&cache);
         let cjxl = cjxl_path();
         let _ = thread::Builder::new()
@@ -87,7 +93,10 @@ fn refresh_loop(
     let mut last: Option<Instant> = None;
     let mut encoded_budgets: Vec<usize> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
-        let due = last.is_none_or(|at| at.elapsed() >= REFRESH);
+        // Until the helper's first frame arrives, look again every second.
+        let waiting = lock(&cache).frame.is_none()
+            && last.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+        let due = waiting || last.is_none_or(|at| at.elapsed() >= REFRESH);
         let new_budget = {
             let cache = lock(&cache);
             cache.budgets.iter().any(|b| !encoded_budgets.contains(b))
