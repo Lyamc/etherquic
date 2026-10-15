@@ -46,6 +46,12 @@ pub const CODEC_FILES: [&str; 7] = [
     "LICENSE-gcc-runtime.txt",
     "LICENSE-mcfgthread.txt",
 ];
+/// Copied only when present, into `vulkan-cpu\`. CPU Vulkan for PCs without a
+/// GPU driver: Mesa lavapipe (MIT, from mesa-dist-win) and a small vulkan-1.dll
+/// shim (packaging/windows/lvp-shim) that PyroWave's Granite loads. A
+/// subdirectory, so the shim never shadows a real Vulkan loader for the host.
+pub const VULKAN_CPU_DIR: &str = "vulkan-cpu";
+pub const VULKAN_CPU_FILES: [&str; 3] = ["vulkan-1.dll", "vulkan_lvp.dll", "LICENSE-mesa.txt"];
 /// Copied only when present. The host runs cjxl.exe from its own directory to make
 /// the JPEG XL thumbnail it announces in discovery. libjxl and its parts are BSD/MIT/zlib.
 pub const THUMBNAIL_FILES: [&str; 11] = [
@@ -273,6 +279,15 @@ pub fn install_plan(
             steps.push(Step::CopyFile {
                 from,
                 to: paths.install_dir.join(name),
+            });
+        }
+    }
+    for name in VULKAN_CPU_FILES {
+        let from = paths.payload_dir.join(VULKAN_CPU_DIR).join(name);
+        if from.is_file() {
+            steps.push(Step::CopyFile {
+                from,
+                to: paths.install_dir.join(VULKAN_CPU_DIR).join(name),
             });
         }
     }
@@ -903,6 +918,36 @@ service=5000
         assert!(names.iter().any(|name| name == "libopus-0.dll"));
         assert!(!names.iter().any(|name| name == "libstdc++-6.dll"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cpu_vulkan_goes_to_its_own_subdirectory() {
+        let payload = std::env::temp_dir().join(format!("eq-setup-lvp-{}", std::process::id()));
+        std::fs::create_dir_all(payload.join(VULKAN_CPU_DIR)).unwrap();
+        let mut p = paths();
+        p.payload_dir = payload.clone();
+        let targets = |steps: &[Step]| {
+            steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::CopyFile { to, .. } => Some(to.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let without = install_plan(&p, &cli(), None, MACHINE).unwrap();
+        assert!(!targets(&without).iter().any(|t| t.ends_with("vulkan_lvp.dll")));
+        for name in VULKAN_CPU_FILES {
+            std::fs::write(payload.join(VULKAN_CPU_DIR).join(name), b"x").unwrap();
+        }
+        let with = targets(&install_plan(&p, &cli(), None, MACHINE).unwrap());
+        for name in VULKAN_CPU_FILES {
+            let want = p.install_dir.join(VULKAN_CPU_DIR).join(name);
+            assert!(with.contains(&want), "{name}");
+        }
+        // Never beside etherquic-host.exe, where it would shadow System32's loader.
+        assert!(!with.contains(&p.install_dir.join("vulkan-1.dll")));
+        let _ = std::fs::remove_dir_all(&payload);
     }
 
     #[test]

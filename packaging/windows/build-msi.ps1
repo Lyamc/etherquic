@@ -1,13 +1,16 @@
 # Build dist\etherquic-<version>-windows-x64.msi (WiX 5: dotnet tool install --global wix --version 5.0.2).
-#   powershell -File packaging\windows\build-msi.ps1 [-Version 0.1.0] [-Cjxl DIR] [-Codecs DIR] [-Npcap DIR]
+#   powershell -File packaging\windows\build-msi.ps1 [-Version 0.1.0] [-Cjxl DIR] [-Codecs DIR] [-VulkanCpu DIR] [-Npcap DIR]
 # -Codecs is a directory with libopus-0.dll, libpyrowave-shared-1.dll, the MinGW runtime
 # DLLs and their LICENSE-*.txt files (see packaging/windows/codecs.sh).
+# -VulkanCpu is the lavapipe + vulkan-1.dll shim directory from packaging/windows/vulkan-cpu.sh;
+# it is staged as vulkan-cpu\ so PyroWave works on PCs without a GPU Vulkan driver.
 # Builds etherquic-host and the app (both link Npcap's wpcap.lib), etherquic-setup and the etherquic app,
 # stages them with the Membrane driver package and cjxl, and runs wix build.
 param(
     [string]$Version = "0.1.0",
     [string]$Cjxl = "",
     [string]$Codecs = "",
+    [string]$VulkanCpu = "",
     [string]$Npcap = "C:\Build\networking\borderless\third_party\npcap\lib"
 )
 $ErrorActionPreference = "Stop"
@@ -35,6 +38,11 @@ Copy-Item (Join-Path $PSScriptRoot "run-logged.ps1") (Join-Path $stage "membrane
 if ($Codecs) {
     Get-ChildItem $Codecs -File | Where-Object { $_.Name -like "*.dll" -or $_.Name -like "LICENSE-*" } |
         Copy-Item -Destination $stage
+}
+if ($VulkanCpu) {
+    $vk = Join-Path $stage "vulkan-cpu"
+    New-Item -ItemType Directory -Force -Path $vk | Out-Null
+    foreach ($f in "vulkan-1.dll", "vulkan_lvp.dll", "LICENSE-mesa.txt") { Copy-Item (Join-Path $VulkanCpu $f) $vk }
 }
 if ($Cjxl) {
     Copy-Item (Join-Path $Cjxl "cjxl.exe") $stage

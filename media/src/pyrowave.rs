@@ -3,10 +3,13 @@
 //! The CPU-buffer API is used on both ends: the host converts RGB to I420
 //! and PyroWave compresses it with Vulkan compute; the player pushes packets
 //! and reads I420 back. Granite (inside PyroWave) loads the Vulkan loader
-//! itself; `GRANITE_VULKAN_LIBRARY` points it at one when the system has none,
-//! which is how a Windows PC without a Vulkan driver uses the bundled
-//! SwiftShader, and macOS gets the KosmicKrisp manifest through
-//! `VK_DRIVER_FILES` (MoltenVK cannot run the encoder).
+//! itself. On Windows Granite only ever does `LoadLibraryA("vulkan-1.dll")`
+//! (it ignores `GRANITE_VULKAN_LIBRARY` there), so a PC without a Vulkan
+//! loader gets the bundled `vulkan-cpu\vulkan-1.dll` shim preloaded, which
+//! hands Granite Mesa lavapipe (CPU Vulkan). SwiftShader cannot run PyroWave:
+//! its subgroups are 4 wide, it lacks clustered subgroup ops and 8-bit storage.
+//! macOS gets the KosmicKrisp manifest through `VK_DRIVER_FILES` (MoltenVK
+//! cannot run the encoder).
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -163,22 +166,7 @@ pub fn library_candidates() -> Vec<PathBuf> {
 /// device is made. Only fills variables the user has not set.
 fn prepare_vulkan() {
     #[cfg(windows)]
-    if std::env::var_os("GRANITE_VULKAN_LIBRARY").is_none() {
-        let system = PathBuf::from(r"C:\Windows\System32\vulkan-1.dll");
-        if !system.is_file() {
-            let dirs = [exe_dir(), Some(PathBuf::from(r"C:\Program Files\etherquic"))];
-            if let Some(swiftshader) = dirs
-                .into_iter()
-                .flatten()
-                .map(|dir| dir.join("vk_swiftshader.dll"))
-                .find(|path| path.is_file())
-            {
-                // SwiftShader exports vkGetInstanceProcAddr, so Granite can
-                // use it as the loader. Used only when no Vulkan is installed.
-                std::env::set_var("GRANITE_VULKAN_LIBRARY", swiftshader);
-            }
-        }
-    }
+    preload_cpu_vulkan();
     #[cfg(target_os = "macos")]
     {
         if std::env::var_os("VK_DRIVER_FILES").is_none()
@@ -196,6 +184,46 @@ fn prepare_vulkan() {
             }
         }
     }
+}
+
+/// Subdirectory of the install directory with the CPU Vulkan fallback.
+pub const VULKAN_CPU_DIR: &str = "vulkan-cpu";
+
+/// When Windows has no Vulkan loader, load the bundled shim so Granite's later
+/// `LoadLibraryA("vulkan-1.dll")` gets this already-loaded module. The shim
+/// loads `vulkan_lvp.dll` from its own directory; nothing is registered
+/// system-wide, and the Khronos loader's `VK_DRIVER_FILES` (ignored in our
+/// elevated service anyway) is not involved.
+#[cfg(windows)]
+fn preload_cpu_vulkan() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let system = PathBuf::from(system_root).join(r"System32\vulkan-1.dll");
+        if system.is_file() || std::env::var_os("ETHERQUIC_NO_CPU_VULKAN").is_some() {
+            return;
+        }
+        let dirs = [exe_dir(), Some(PathBuf::from(r"C:\Program Files\etherquic"))];
+        let Some(dir) = dirs
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.join(VULKAN_CPU_DIR))
+            .find(|dir| dir.join("vulkan-1.dll").is_file() && dir.join("vulkan_lvp.dll").is_file())
+        else {
+            return;
+        };
+        // PyroWave needs full 16/32/64-wide subgroups. lavapipe's subgroup is
+        // its vector width / 32, so 512 bits gives 16 lanes (LLVM splits it
+        // for AVX2). lavapipe reads it when it loads, so set it first.
+        if std::env::var_os("LP_NATIVE_VECTOR_WIDTH").is_none() {
+            std::env::set_var("LP_NATIVE_VECTOR_WIDTH", "512");
+        }
+        match load(&dir.join("vulkan-1.dll")) {
+            // Kept loaded for the life of the process.
+            Ok(lib) => std::mem::forget(lib),
+            Err(error) => eprintln!("pyrowave: CPU Vulkan shim in {}: {error}", dir.display()),
+        }
+    });
 }
 
 fn load(path: &PathBuf) -> Result<Library, String> {
