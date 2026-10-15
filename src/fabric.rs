@@ -59,6 +59,10 @@ struct VecDequeFrame(std::collections::VecDeque<Frame>);
 #[derive(Debug)]
 pub struct Fabric {
     inner: Mutex<HashMap<Mac, Arc<Mutex<Inbox>>>>,
+    /// The adapter's own MAC and the socket MAC its frames go to. Wi-Fi sends
+    /// every frame with the station's address as source, so a peer answers
+    /// that address and not the socket MAC this side put in the frame.
+    alias: Mutex<Option<(Mac, Mac)>>,
     ether_type: u16,
     interface_mtu: usize,
     pub stats: FabricStats,
@@ -85,6 +89,7 @@ impl Fabric {
         );
         Arc::new(Self {
             inner: Mutex::new(HashMap::new()),
+            alias: Mutex::new(None),
             ether_type,
             interface_mtu,
             stats: FabricStats::default(),
@@ -113,6 +118,18 @@ impl Fabric {
     pub(crate) fn detach(&self, mac: Mac) {
         let mut map = self.inner.lock().expect("fabric lock");
         map.remove(&mac);
+        let mut alias = self.alias.lock().expect("fabric alias lock");
+        if alias.is_some_and(|(_, to)| to == mac) {
+            *alias = None;
+        }
+    }
+
+    /// Deliver unicast frames for `hardware` (the adapter's own MAC) to the
+    /// socket attached as `socket`, unless a socket is attached as `hardware`.
+    pub fn alias_hardware(&self, hardware: Mac, socket: Mac) {
+        if hardware != socket && hardware != BROADCAST {
+            *self.alias.lock().expect("fabric alias lock") = Some((hardware, socket));
+        }
     }
 
     pub(crate) fn inject(&self, frame: Frame) {
@@ -132,7 +149,17 @@ impl Fabric {
         self.stats.sent.fetch_add(1, Ordering::Relaxed);
         let map = self.inner.lock().expect("fabric lock");
         let targets: Vec<_> = match delivery {
-            Delivery::Unicast(mac) => map.get(&mac).cloned().into_iter().collect(),
+            Delivery::Unicast(mac) => {
+                let alias = *self.alias.lock().expect("fabric alias lock");
+                map.get(&mac)
+                    .or_else(|| match alias {
+                        Some((hardware, socket)) if hardware == mac => map.get(&socket),
+                        _ => None,
+                    })
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            }
             Delivery::Broadcast { except_src } => map
                 .iter()
                 .filter(|(mac, _)| **mac != except_src)
@@ -177,6 +204,33 @@ mod tests {
             src_service: 1,
             payload: vec![1, 2, 3],
         }
+    }
+
+    #[test]
+    fn frames_for_the_adapter_mac_reach_the_aliased_socket() {
+        let fabric = Fabric::new(1500);
+        let socket = [2, 0, 0, 0, 0, 2];
+        let wifi = [0x3a, 0x13, 0x6f, 0x4b, 0x73, 0x53];
+        let inbox = fabric.attach(socket);
+        fabric.inject(frame(wifi));
+        assert!(pop_frame(&inbox).is_none(), "no alias yet");
+        fabric.alias_hardware(wifi, socket);
+        fabric.inject(frame(wifi));
+        assert_eq!(pop_frame(&inbox).map(|f| f.dst), Some(wifi));
+        // A socket attached as the adapter MAC itself wins.
+        let own = fabric.attach(wifi);
+        fabric.inject(frame(wifi));
+        assert!(pop_frame(&inbox).is_none());
+        assert!(pop_frame(&own).is_some());
+        fabric.detach(wifi);
+        fabric.detach(socket);
+        let again = fabric.attach(socket);
+        fabric.inject(frame(wifi));
+        assert!(pop_frame(&again).is_none(), "alias goes with its socket");
+        // Other machines' frames are still not delivered.
+        fabric.alias_hardware(wifi, socket);
+        fabric.inject(frame([0x3a, 0, 0, 0, 0, 9]));
+        assert!(pop_frame(&again).is_none());
     }
 
     #[test]

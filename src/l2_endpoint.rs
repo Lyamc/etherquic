@@ -31,6 +31,7 @@ pub struct L2Net {
     out: std::sync::mpsc::Sender<Vec<u8>>,
     ethertype: u16,
     l2_backend: u8,
+    hw_mac: Option<Mac>,
 }
 
 impl L2Net {
@@ -39,9 +40,13 @@ impl L2Net {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let mut io = open_packet_io(nic, ethertype)?;
         let l2_backend = io.l2_backend();
+        let hw_mac = io.hw_mac();
         eprintln!(
-            "etherquic L2: backend={} ethertype=0x{ethertype:04x} mtu={mtu}",
-            io.name()
+            "etherquic L2: backend={} ethertype=0x{ethertype:04x} mtu={mtu} adapter={}",
+            io.name(),
+            hw_mac
+                .map(|m| m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"))
+                .unwrap_or_else(|| "unknown".into())
         );
 
         let fabric_rx = fabric.clone();
@@ -90,6 +95,7 @@ impl L2Net {
             out: tx,
             ethertype,
             l2_backend,
+            hw_mac,
         }))
     }
 
@@ -101,6 +107,11 @@ impl L2Net {
     /// [`crate::discover::L2_MEMBRANE`]. This is the driver the session opened.
     pub fn l2_backend(&self) -> u8 {
         self.l2_backend
+    }
+
+    /// The adapter's own MAC, when the OS reports it.
+    pub fn hardware_mac(&self) -> Option<Mac> {
+        self.hw_mac
     }
 }
 
@@ -183,6 +194,10 @@ struct L2Socket {
 impl L2Socket {
     fn open(net: Arc<L2Net>, mac: Mac, service_id: u16) -> Box<Self> {
         let inner = EtherSocket::open(net.fabric.clone(), mac, service_id);
+        // On Wi-Fi the peer sees, and answers, the adapter's MAC.
+        if let Some(hardware) = net.hw_mac {
+            net.fabric.alias_hardware(hardware, mac);
+        }
         Box::new(Self {
             inner,
             net,
@@ -305,6 +320,14 @@ impl PacketIo {
             PacketIo::Pcap(_) => crate::discover::L2_LIBPCAP,
             #[cfg(windows)]
             PacketIo::Ndis(_) => crate::discover::L2_MEMBRANE,
+        }
+    }
+
+    fn hw_mac(&self) -> Option<Mac> {
+        match self {
+            PacketIo::Pcap(link) => link.hw_mac,
+            #[cfg(windows)]
+            PacketIo::Ndis(_) => None,
         }
     }
 

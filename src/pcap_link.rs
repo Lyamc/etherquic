@@ -125,17 +125,31 @@ fn usable_v6(ip: Ipv6Addr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
 }
 
-fn read_hw_mac(name: &str) -> Option<Mac> {
+/// The adapter's own MAC: sysfs on Linux, `ifconfig` on macOS.
+pub fn read_hw_mac(name: &str) -> Option<Mac> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let text = std::fs::read_to_string(format!("/sys/class/net/{name}/address")).ok()?;
         parse_mac(text.trim())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/sbin/ifconfig").arg(name).output().ok()?;
+        ifconfig_ether(&String::from_utf8_lossy(&out.stdout))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         let _ = name;
         None
     }
+}
+
+/// The `ether aa:bb:…` line of BSD `ifconfig` output.
+pub fn ifconfig_ether(text: &str) -> Option<Mac> {
+    text.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next() == Some("ether")).then(|| words.next().and_then(parse_mac)).flatten()
+    })
 }
 
 pub fn list_nics() -> Result<Vec<Nic>> {
@@ -171,6 +185,8 @@ pub struct Link {
     cap: pcap::Capture<pcap::Active>,
     pub nic: Nic,
     pub ethertype: u16,
+    /// The adapter's own MAC, when the OS reports it.
+    pub hw_mac: Option<Mac>,
 }
 
 impl Link {
@@ -210,10 +226,12 @@ fn open_nic(nic: Nic, ethertype: u16) -> Result<Link> {
     let filter = format!("ether proto 0x{ethertype:04x}");
     cap.filter(&filter, true).map_err(map_pcap)?;
     let cap = cap.setnonblock().map_err(map_pcap)?;
+    let hw_mac = read_hw_mac(&nic.name);
     Ok(Link {
         cap,
         nic,
         ethertype,
+        hw_mac,
     })
 }
 
@@ -238,4 +256,19 @@ pub fn parse_mac(s: &str) -> Option<Mac> {
         mac[i] = u8::from_str_radix(p, 16).ok()?;
     }
     Some(mac)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ifconfig_ether_line() {
+        let text = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+                    \toptions=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>\n\
+                    \tether 3a:13:6f:4b:73:53\n\
+                    \tinet 192.168.0.30 netmask 0xffffff00 broadcast 192.168.0.255\n";
+        assert_eq!(ifconfig_ether(text), Some([0x3a, 0x13, 0x6f, 0x4b, 0x73, 0x53]));
+        assert_eq!(ifconfig_ether("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n"), None);
+    }
 }
