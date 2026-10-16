@@ -132,7 +132,9 @@ Convert-PngIcoToBmp $ico.FullName $arpIco
 $msi = Join-Path $dist "etherquic-$Version-windows-x64.msi"
 wix extension add -g WixToolset.Util.wixext/5.0.2
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-wix build (Join-Path $PSScriptRoot "etherquic.wxs") -arch x64 -ext WixToolset.Util.wixext `
+wix extension add -g WixToolset.UI.wixext/5.0.2
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+wix build (Join-Path $PSScriptRoot "etherquic.wxs") -arch x64 -ext WixToolset.Util.wixext -ext WixToolset.UI.wixext `
     -d "Stage=$stage" -d "ProductVersion=$Version" -d "Icon=$arpIco" -o $msi
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Get-Item $msi | Select-Object FullName, Length

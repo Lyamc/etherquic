@@ -409,7 +409,7 @@ const MAX_OS_VER: usize = 16;
 /// This build and the operating system, carried in [`TLV_RELEASE`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
-    /// `CARGO_PKG_VERSION` of the etherquic crate, such as `0.1.0`.
+    /// [`crate::RELEASE`], such as `0.1.5.1`.
     pub version: String,
     pub os: u8,
     /// `Windows`, `macOS`, `Android`, or a Linux distribution name.
@@ -579,7 +579,7 @@ pub fn local_release() -> Release {
 fn read_local_release() -> Release {
     let (os, os_name, os_version) = platform_os();
     Release {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::RELEASE.to_string(),
         os,
         os_name,
         os_version,
@@ -2283,7 +2283,7 @@ CurrentBuildNumber    REG_SZ    2600
         let payload = offer_payload(EXT_MARK | 3, &card(), &info(), &extras, L2_PAYLOAD_LIMIT);
         let (_, body) = decode_offer(&payload).unwrap();
         let sent = body.release.expect("offer carries the release");
-        assert_eq!(sent.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(sent.version, crate::RELEASE);
         // An older reader skips the record. A hand-built one still decodes.
         let mut marked = encode_header(VERSION_EXT, OFFER, EXT_MARK | 1);
         write_body(&mut marked, &card(), &info());

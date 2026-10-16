@@ -1,17 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Per-machine installer for the etherquic host service and the etherquic app.
-  WiX 5:  see build-msi.ps1, which stages the files and runs wix build.
+  Per-machine installer for the etherquic app and, when chosen, the host service.
+  WiX 5: see build-msi.ps1, which stages the files and runs wix build.
 
-  Files land in Program Files\etherquic-setup. The payload is then installed by
-  the existing flow: msi-setup.ps1 optionally runs membrane\install-membrane-ndis.ps1
-  and then etherquic-setup.exe (unattended, attended or saved mode) with that directory as its payload,
-  which copies the host to Program Files\etherquic and creates etherquic-service.
-  Uninstall runs etherquic-setup.exe in uninstall mode (host.conf is kept).
+  A double-click shows Welcome, then a service question, then progress, then a
+  success page. The app always lands in Program Files\etherquic-setup with a
+  Start menu shortcut. INSTALLSERVICE=1 (the default, including a quiet install)
+  runs msi-setup.ps1, which may install Membrane and then etherquic-setup.exe.
+  That copies the host to Program Files\etherquic and creates etherquic-service.
+  INSTALLSERVICE=0 installs the app only and removes a host service left by an
+  older install. host.conf is kept. MSI compares only the first three version
+  fields, so AllowSameVersionUpgrades lets 0.1.5.1 replace 0.1.5.
 
   Properties (msiexec ... NAME=value):
-    MEMBRANE=1|0|force  install the Membrane NDIS filter (default 1: skipped when already running). Needs Secure Boot off;
-                       turning test signing on asks for a reboot, the MSI does not reboot.
+    INSTALLSERVICE=1|0   1 installs the host service (default). 0 is the app only.
+    MEMBRANE=1|0|force   install the Membrane NDIS filter when the service is installed
+                         (default 1: skipped when already running). Needs Secure Boot off;
+                         turning test signing on asks for a reboot, the MSI does not reboot.
     ACCESS=unattended|attended|<empty>   empty keeps the saved mode (fresh install: attended).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
@@ -22,12 +27,20 @@
            UpgradeCode="5B0E7F3C-2A41-4C8E-9D6B-71E4A3C90F12"
            Scope="perMachine"
            Compressed="yes">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- Fourth field is ignored by Windows Installer, so 0.1.5.1 must replace 0.1.5. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="etherquic.ico" SourceFile="$(var.Icon)" />
     <Property Id="ARPPRODUCTICON" Value="etherquic.ico" />
+    <!-- No maintenance dialog, so Programs and Features offers uninstall only. -->
+    <Property Id="ARPNOMODIFY" Value="1" />
 
+    <!-- Checked by default. Secure so the elevated install sees the checkbox.
+         Clearing the box deletes the property; the Install button sets it to 0
+         so that empty value is not replaced by this default on the server. -->
+    <Property Id="INSTALLSERVICE" Value="1" Secure="yes" />
     <Property Id="MEMBRANE" Value="1" />
     <Property Id="ACCESS" Secure="yes" />
     <Property Id="ARPCOMMENTS" Value="etherquic host service, Membrane L2 filter and the etherquic app" />
@@ -59,8 +72,54 @@
       <ComponentRef Id="StartMenu" />
     </Feature>
 
+    <UI>
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+      <DialogRef Id="ExitDialog" />
+      <DialogRef Id="CancelDlg" />
+
+      <Dialog Id="ServiceDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Install the etherquic app" />
+        <Control Id="Description" Type="Text" X="20" Y="52" Width="330" Height="30" NoPrefix="yes" Text="The app is always installed. You can also install the host as a Windows service, in addition to the client tools." />
+        <Control Id="InstallService" Type="CheckBox" X="20" Y="90" Width="330" Height="18" Property="INSTALLSERVICE" CheckBoxValue="1" Text="Install the host as a Windows service" />
+        <Control Id="ServiceHelp" Type="Text" X="20" Y="116" Width="330" Height="70" NoPrefix="yes" Text="The service accepts incoming players while you are signed out. Clearing this box installs the app only. A host service left by an older install is removed, and its saved settings are kept." />
+        <Control Id="Back" Type="PushButton" X="156" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="WelcomeDlg" />
+        </Control>
+        <Control Id="Install" Type="PushButton" ElevationShield="yes" X="212" Y="243" Width="80" Height="17" Default="yes" Text="!(loc.VerifyReadyDlgInstall)">
+          <!-- An unchecked box deletes INSTALLSERVICE. Set 0 before leaving so the elevated install does not fall back to the default of 1. -->
+          <Publish Property="INSTALLSERVICE" Value="0" Order="1" Condition="NOT INSTALLSERVICE=1" />
+          <Publish Property="WIXUI_EXITDIALOGOPTIONALTEXT" Value="etherquic is installed. The app is on the Start menu, and the host service accepts incoming players." Order="2" Condition="INSTALLSERVICE=1" />
+          <Publish Property="WIXUI_EXITDIALOGOPTIONALTEXT" Value="etherquic is installed. The app is on the Start menu. The host service was not installed." Order="2" Condition="NOT INSTALLSERVICE=1" />
+          <Publish Event="EndDialog" Value="Return" Order="3" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="ServiceDlg" Condition="NOT Installed" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+    </UI>
+    <UIRef Id="WixUI_Common" />
+
     <SetProperty Id="EqInstall" Before="EqInstall" Sequence="execute"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]msi-setup.ps1&quot; -Membrane &quot;[MEMBRANE]&quot; -Access &quot;[ACCESS]&quot;" />
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]msi-setup.ps1&quot; -Membrane &quot;[MEMBRANE]&quot; -Access &quot;[ACCESS]&quot; -Service &quot;[INSTALLSERVICE]&quot;" />
     <CustomAction Id="EqInstall" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec"
                   Execute="deferred" Impersonate="no" Return="check" />
 

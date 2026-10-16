@@ -4,6 +4,9 @@
 param(
     [string]$Membrane = "1",
     [string]$Access = "",
+    # 1 installs the host service. Anything else installs the app only and
+    # removes a service left by an older install. host.conf is kept.
+    [string]$Service = "1",
     [switch]$Uninstall
 )
 # Continue: PowerShell 5.1 turns a native command's stderr into an error under Stop.
@@ -15,10 +18,12 @@ $log = Join-Path $logDir 'msi-setup.log'
 function Log([string]$m) { Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date -Format s), $m) }
 $setup = Join-Path $here 'etherquic-setup.exe'
 
-if ($Uninstall) {
+if ($Uninstall -or $Service -ne '1') {
     $out = & $setup --uninstall 2>&1 | Out-String
-    Log "etherquic-setup --uninstall exit ${LASTEXITCODE}: $out"
-    exit 0
+    $code = $LASTEXITCODE
+    $why = if ($Uninstall) { 'uninstall' } else { 'client tools only' }
+    Log "etherquic-setup --uninstall ($why) exit ${code}: $out"
+    exit $code
 }
 
 $running = (Get-Service membrane_ndis -ErrorAction SilentlyContinue).Status -eq 'Running'
