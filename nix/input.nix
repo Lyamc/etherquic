@@ -25,9 +25,9 @@ rustPlatform.buildRustPackage {
       && !(lib.hasInfix "/.git/" p);
   };
 
-  cargoLock.lockFile = ../input/Cargo.lock;
-  cargoRoot = "input";
-  buildAndTestSubdir = "input";
+  cargoLock.lockFile = ../Cargo.lock;
+  cargoBuildFlags = [ "-p" "etherquic-input" ];
+  cargoTestFlags = [ "-p" "etherquic-input" ];
 
   nativeBuildInputs = [
     pkg-config

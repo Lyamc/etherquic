@@ -12,6 +12,7 @@
 pub mod addr;
 pub mod backend;
 pub mod capture;
+pub mod cursor;
 pub mod discover;
 pub mod endpoint;
 pub mod fabric;
@@ -19,9 +20,10 @@ pub mod frame;
 #[cfg(windows)]
 pub mod hostinput;
 pub mod l2_endpoint;
-pub mod negotiate;
+pub mod look;
 #[cfg(windows)]
 pub mod ndis_link;
+pub mod negotiate;
 pub mod pcap_link;
 pub mod priority;
 pub mod socket;
@@ -35,9 +37,9 @@ pub type Mac = [u8; 6];
 pub use addr::{peer_to_socket_addr, socket_addr_to_peer};
 pub use backend::{
     default_backend_order, gpu_compute_present, nvidia_present, offer_from, offer_media,
-    pick_backend, probe_backends, pyrowave_library_present, pyrowave_ready, pyrowave_ready_with,
-    selected_backend,
-    widen_process_path, BackendProbe, MediaBackend,
+    pick_backend, probe_backends, pyrowave_hardware_encode, pyrowave_library_present,
+    pyrowave_ready, pyrowave_ready_with, selected_backend, widen_process_path, BackendProbe,
+    MediaBackend,
 };
 pub use capture::{
     capture_active, capture_dir, capture_from_env, capture_start, capture_stop, note_app,

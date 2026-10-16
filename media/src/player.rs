@@ -12,7 +12,7 @@ use crate::audio::AudioDecoder;
 use crate::caps;
 use crate::negotiate::{
     build_offer, Audio, Limit, Offer, OfferInput, StreamConfig, Video, VideoCodec, OFFER_MAGIC,
-    RECORD_CONFIG, RECORD_DATA,
+    RECORD_CONFIG, RECORD_CURSOR, RECORD_DATA,
 };
 use crate::video::VideoDecoder;
 use crate::{wire, Frame, Pcm, Sink};
@@ -49,7 +49,8 @@ pub fn offer_for(
 /// offer on it renegotiates.
 pub async fn send_offer(conn: &Connection, offer: &Offer) -> Result<SendStream, String> {
     let mut send = conn.open_uni().await.map_err(|e| e.to_string())?;
-    send.set_priority(etherquic::PRIORITY_INPUT).map_err(|e| e.to_string())?;
+    send.set_priority(etherquic::PRIORITY_INPUT)
+        .map_err(|e| e.to_string())?;
     wire::write_magic(&mut send, OFFER_MAGIC).await?;
     wire::write_record(&mut send, OFFER_MAGIC, &offer.encode()).await?;
     Ok(send)
@@ -64,9 +65,17 @@ pub async fn resend_offer(send: &mut SendStream, offer: &Offer) -> Result<(), St
 pub enum PlayerEvent {
     Video(StreamConfig),
     Audio(StreamConfig),
-    VideoFailed { video: Video, reason: String },
-    AudioFailed { audio: Audio, reason: String },
+    VideoFailed {
+        video: Video,
+        reason: String,
+    },
+    AudioFailed {
+        audio: Audio,
+        reason: String,
+    },
     Stats(Stats),
+    /// Host cursor. Older sessions never send one.
+    Cursor(etherquic::cursor::CursorUpdate),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -91,7 +100,11 @@ pub async fn read_video(
     frames: Sink<Frame>,
     events: mpsc::UnboundedSender<PlayerEvent>,
 ) -> Result<(), String> {
-    let magic: &[u8; 4] = if v2 { crate::negotiate::VIDEO2_MAGIC } else { crate::host::LEGACY_VIDEO_MAGIC };
+    let magic: &[u8; 4] = if v2 {
+        crate::negotiate::VIDEO2_MAGIC
+    } else {
+        crate::host::LEGACY_VIDEO_MAGIC
+    };
     let decoded = Arc::new(AtomicU64::new(0));
     let (tx, mut rx) = mpsc::channel::<DecodeIn>(8);
     let thread_events = events.clone();
@@ -110,31 +123,50 @@ pub async fn read_video(
             let mut decoder: Option<(VideoDecoder, Video)> = if v2 {
                 None
             } else {
-                Some((VideoDecoder::Mjpeg { sink: counted.clone() }, Video::Mjpeg))
+                Some((
+                    VideoDecoder::Mjpeg {
+                        sink: counted.clone(),
+                    },
+                    Video::Mjpeg,
+                ))
             };
             while let Some(input) = rx.blocking_recv() {
                 match input {
                     DecodeIn::Config(config) => {
                         decoder = None;
                         let Some(video) = config.video else { continue };
-                        match VideoDecoder::open(video, config.width, config.height, counted.clone()) {
+                        match VideoDecoder::open(
+                            video,
+                            config.width,
+                            config.height,
+                            counted.clone(),
+                        ) {
                             Ok(dec) => decoder = Some((dec, video)),
                             Err(reason) => {
-                                let _ = thread_events.send(PlayerEvent::VideoFailed { video, reason });
+                                let _ =
+                                    thread_events.send(PlayerEvent::VideoFailed { video, reason });
                             }
                         }
                     }
                     DecodeIn::Data(bytes) => {
-                        let Some((dec, video)) = decoder.as_mut() else { continue };
+                        let Some((dec, video)) = decoder.as_mut() else {
+                            continue;
+                        };
                         if let Err(reason) = dec.push(&bytes) {
                             let video = *video;
                             decoder = None;
                             // MJPEG is the floor: one bad JPEG is skipped, not renegotiated.
                             if video == Video::Mjpeg {
                                 eprintln!("etherquic-play: picture: {reason}");
-                                decoder = Some((VideoDecoder::Mjpeg { sink: counted.clone() }, Video::Mjpeg));
+                                decoder = Some((
+                                    VideoDecoder::Mjpeg {
+                                        sink: counted.clone(),
+                                    },
+                                    Video::Mjpeg,
+                                ));
                             } else {
-                                let _ = thread_events.send(PlayerEvent::VideoFailed { video, reason });
+                                let _ =
+                                    thread_events.send(PlayerEvent::VideoFailed { video, reason });
                             }
                         }
                     }
@@ -175,6 +207,12 @@ pub async fn read_video(
                     }
                 },
                 Some(&RECORD_DATA) => DecodeIn::Data(record[1..].to_vec()),
+                Some(&RECORD_CURSOR) => {
+                    if let Ok(update) = etherquic::cursor::CursorUpdate::decode(&record[1..]) {
+                        let _ = events.send(PlayerEvent::Cursor(update));
+                    }
+                    continue;
+                }
                 _ => continue,
             }
         };
@@ -204,8 +242,16 @@ pub async fn read_audio(
     pcm: mpsc::Sender<Pcm>,
     events: mpsc::UnboundedSender<PlayerEvent>,
 ) -> Result<(), String> {
-    let magic: &[u8; 4] = if v2 { crate::negotiate::AUDIO2_MAGIC } else { crate::host::LEGACY_AUDIO_MAGIC };
-    let mut decoder: Option<(AudioDecoder, Audio)> = if v2 { None } else { Some((AudioDecoder::Pcm, Audio::Pcm)) };
+    let magic: &[u8; 4] = if v2 {
+        crate::negotiate::AUDIO2_MAGIC
+    } else {
+        crate::host::LEGACY_AUDIO_MAGIC
+    };
+    let mut decoder: Option<(AudioDecoder, Audio)> = if v2 {
+        None
+    } else {
+        Some((AudioDecoder::Pcm, Audio::Pcm))
+    };
     while let Some(record) = wire::read_record(&mut recv, magic).await? {
         let data: &[u8] = if !v2 {
             &record
@@ -220,7 +266,8 @@ pub async fn read_audio(
                                 match AudioDecoder::open(audio, config.channels.max(1)) {
                                     Ok(dec) => decoder = Some((dec, audio)),
                                     Err(reason) => {
-                                        let _ = events.send(PlayerEvent::AudioFailed { audio, reason });
+                                        let _ =
+                                            events.send(PlayerEvent::AudioFailed { audio, reason });
                                     }
                                 }
                             }
@@ -233,7 +280,9 @@ pub async fn read_audio(
                 _ => continue,
             }
         };
-        let Some((dec, audio)) = decoder.as_mut() else { continue };
+        let Some((dec, audio)) = decoder.as_mut() else {
+            continue;
+        };
         match dec.decode(data) {
             Ok(chunk) => {
                 if pcm.send(chunk).await.is_err() {

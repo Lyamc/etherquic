@@ -32,6 +32,8 @@ const FPS: u32 = proto::CAPTURE_FPS;
 struct Screen {
     width: AtomicU32,
     height: AtomicU32,
+    frame_w: AtomicU32,
+    frame_h: AtomicU32,
 }
 
 pub fn run(stop: &'static AtomicBool) -> Result<(), String> {
@@ -44,8 +46,11 @@ pub fn run(stop: &'static AtomicBool) -> Result<(), String> {
     let screen = Arc::new(Screen {
         width: AtomicU32::new(0),
         height: AtomicU32::new(0),
+        frame_w: AtomicU32::new(0),
+        frame_h: AtomicU32::new(0),
     });
     let frames = Arc::new(Mutex::new(None));
+    let cursors = Arc::new(Mutex::new(None::<Vec<u8>>));
     let (audio_tx, audio_rx) = sync_channel(16);
     let notes = Arc::new(Mutex::new(VecDeque::new()));
     let acks = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
@@ -59,9 +64,18 @@ pub fn run(stop: &'static AtomicBool) -> Result<(), String> {
     let capture_screen = Arc::clone(&screen);
     let capture_notes = Arc::clone(&notes);
     let capture_frames = Arc::clone(&frames);
+    let capture_cursors = Arc::clone(&cursors);
     let capture = thread::Builder::new()
         .name("etherquic-capture".into())
-        .spawn(move || capture_loop(capture_stop, capture_screen, capture_frames, capture_notes))
+        .spawn(move || {
+            capture_loop(
+                capture_stop,
+                capture_screen,
+                capture_frames,
+                capture_cursors,
+                capture_notes,
+            )
+        })
         .map_err(|err| err.to_string())?;
 
     let audio_notes = Arc::clone(&notes);
@@ -74,6 +88,7 @@ pub fn run(stop: &'static AtomicBool) -> Result<(), String> {
     let write_frames = Arc::clone(&frames);
     let write_notes = Arc::clone(&notes);
     let write_acks = Arc::clone(&acks);
+    let write_cursors = Arc::clone(&cursors);
     let writer = thread::Builder::new()
         .name("etherquic-desk-write".into())
         .spawn(move || {
@@ -84,6 +99,7 @@ pub fn run(stop: &'static AtomicBool) -> Result<(), String> {
                 audio_rx,
                 write_notes,
                 write_acks,
+                write_cursors,
                 write_failed,
             )
         })
@@ -122,8 +138,10 @@ fn capture_loop(
     stop: &AtomicBool,
     screen: Arc<Screen>,
     frames: Arc<Mutex<Option<Vec<u8>>>>,
+    cursors: Arc<Mutex<Option<Vec<u8>>>>,
     notes: Arc<Mutex<VecDeque<String>>>,
 ) {
+    let mut cursor = etherquic::cursor::Watch::new();
     link::init_com();
     let mut capture = desktop::ScreenCapture::open();
     let mut logged_mode = String::new();
@@ -144,7 +162,10 @@ fn capture_loop(
         match result {
             Ok((raw, width, height)) => {
                 if logged != Some((width, height)) {
-                    note(&notes, format!("frame {width}x{height} raw {} bytes", raw.len()));
+                    note(
+                        &notes,
+                        format!("frame {width}x{height} raw {} bytes", raw.len()),
+                    );
                     logged = Some((width, height));
                 }
                 if repeats > 1 {
@@ -166,10 +187,44 @@ fn capture_loop(
                 continue;
             }
         }
-        let spent = started.elapsed();
-        if spent < period {
-            thread::sleep(period - spent);
+        pace(started, period, stop, || {
+            publish_cursor(&mut cursor, &screen, &cursors)
+        });
+    }
+}
+
+fn publish_cursor(
+    cursor: &mut etherquic::cursor::Watch,
+    screen: &Screen,
+    cursors: &Mutex<Option<Vec<u8>>>,
+) {
+    let frame_w = screen.frame_w.load(Ordering::Relaxed);
+    let frame_h = screen.frame_h.load(Ordering::Relaxed);
+    let capture_w = screen.width.load(Ordering::Relaxed);
+    let capture_h = screen.height.load(Ordering::Relaxed);
+    if frame_w == 0 || frame_h == 0 || capture_w == 0 || capture_h == 0 {
+        return;
+    }
+    let Some(update) = cursor.poll() else {
+        return;
+    };
+    let bytes = update
+        .map_to_frame(0, 0, capture_w, capture_h, frame_w, frame_h)
+        .encode();
+    *cursors.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(bytes);
+}
+
+fn pace(started: Instant, period: Duration, stop: &AtomicBool, mut on_tick: impl FnMut()) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
         }
+        let left = period.saturating_sub(started.elapsed());
+        on_tick();
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(left.min(Duration::from_millis(16)));
     }
 }
 
@@ -192,6 +247,8 @@ fn one_frame(
     screen.width.store(width.max(1), Ordering::Relaxed);
     screen.height.store(height.max(1), Ordering::Relaxed);
     let picture = fit_rgba(&rgba, width, height, MAX_WIDTH)?;
+    screen.frame_w.store(picture.width, Ordering::Relaxed);
+    screen.frame_h.store(picture.height, Ordering::Relaxed);
     Ok((picture.raw_payload(), picture.width, picture.height))
 }
 
@@ -231,7 +288,12 @@ fn audio_loop(
                     if logged_format != Some(format) {
                         note(
                             &notes,
-                            format!("audio capture {} {} Hz {} ch", next.name(), format.0, format.1),
+                            format!(
+                                "audio capture {} {} Hz {} ch",
+                                next.name(),
+                                format.0,
+                                format.1
+                            ),
                         );
                         logged_format = Some(format);
                     }
@@ -293,6 +355,7 @@ fn write_loop(
     audio: Receiver<AudioChunk>,
     notes: Arc<Mutex<VecDeque<String>>>,
     acks: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    cursors: Arc<Mutex<Option<Vec<u8>>>>,
     failed: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::SeqCst) {
@@ -340,6 +403,17 @@ fn write_loop(
                 return;
             }
         }
+        let cursor = cursors
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(bytes) = cursor {
+            progress = true;
+            if pipe.write_message(&Message::Cursor(bytes), stop).is_err() {
+                failed.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
         if !progress {
             thread::sleep(Duration::from_millis(5));
         }
@@ -378,7 +452,13 @@ fn read_loop(
                 desktop::hold_display(true);
                 hands.follow(&notes);
                 match desktop::wake_display() {
-                    Ok(()) => note(&notes, format!("wake: display on, input desktop {}", desktop::thread_desktop_name())),
+                    Ok(()) => note(
+                        &notes,
+                        format!(
+                            "wake: display on, input desktop {}",
+                            desktop::thread_desktop_name()
+                        ),
+                    ),
                     Err(error) => note(&notes, format!("wake: {error}")),
                 }
             }
@@ -411,7 +491,11 @@ fn confirm(event: &Event, outcome: &Result<bool, String>) -> Option<Vec<u8>> {
         Err(_) => proto::ACK_FAILED,
     };
     Some(proto::encode_input_ack(
-        event.time_us, kind, code, result, detail,
+        event.time_us,
+        kind,
+        code,
+        result,
+        detail,
     ))
 }
 
@@ -475,7 +559,10 @@ impl Hands {
                     }
                 }
                 Ok(true) if self.warned.is_some() => {
-                    note(notes, format!("inject: working again on desktop {}", self.desktop));
+                    note(
+                        notes,
+                        format!("inject: working again on desktop {}", self.desktop),
+                    );
                     self.warned = None;
                 }
                 Ok(_) => {}
@@ -514,7 +601,10 @@ impl Hands {
                 let state = if *down { "down" } else { "up" };
                 note(notes, format!("applied key {code:#x} {state}"));
             }
-            Body::Delta { .. } | Body::Gamepad { .. } | Body::Sync { .. } | Body::Unknown { .. } => {
+            Body::Delta { .. }
+            | Body::Gamepad { .. }
+            | Body::Sync { .. }
+            | Body::Unknown { .. } => {
                 return Ok(false);
             }
         }

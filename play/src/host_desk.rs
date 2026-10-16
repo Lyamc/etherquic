@@ -1,7 +1,7 @@
 //! Capture the primary monitor and its audio, and inject player input.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -14,10 +14,11 @@ use etherquic_input::{Body, Buttons, Event, KeySource};
 use tokio::sync::mpsc;
 use xcap::Monitor;
 
+use crate::desk_io::{self, NoteSide};
 use crate::pad_inject::Pads;
 use crate::{
-    desktop_audio, fit_rgba, format_mac, pad_report, place_pointer, serve,
-    AudioChunk, DesktopAudio, PointerPlace, Status,
+    desktop_audio, fit_rgba, format_mac, pad_report, place_pointer, serve_session, AudioChunk,
+    DesktopAudio, PointerPlace, Status,
 };
 
 /// Refresh rate of the monitor `host` captures, in whole frames per second.
@@ -78,7 +79,12 @@ async fn listen(
     let screen = Arc::new(Screen {
         width: AtomicU32::new(1),
         height: AtomicU32::new(1),
+        frame_w: AtomicU32::new(0),
+        frame_h: AtomicU32::new(0),
+        origin_x: AtomicI32::new(0),
+        origin_y: AtomicI32::new(0),
     });
+    let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
     let frames = etherquic_media::host::FrameSlot::new();
     let video_tx = frames.clone();
     let (audio_tx, audio_rx) = mpsc::channel(8);
@@ -94,7 +100,16 @@ async fn listen(
     let mut capture = Some(
         thread::Builder::new()
             .name("etherquic-play-capture".into())
-            .spawn(move || capture_loop(capture_stop, capture_screen, video_tx, max_width, fps))?,
+            .spawn(move || {
+                capture_loop(
+                    capture_stop,
+                    capture_screen,
+                    video_tx,
+                    cursor_tx,
+                    max_width,
+                    fps,
+                )
+            })?,
     );
     let audio_stop = Arc::clone(&stop);
     let audio_device = host.audio_device.clone();
@@ -216,22 +231,29 @@ async fn listen(
             codec_status(&format!("Sending {line}."));
         }
     });
-    let session = serve(
+    let (cmd_tx, pipes, outbound, inbound) = desk_io::open_notes(desk_io::desk_roster());
+    desk_io::attach_host(cmd_tx);
+    tokio::spawn(desk_io::pump_outbound(outbound));
+    tokio::spawn(desk_io::pump_inbound(NoteSide::Host, inbound));
+    let session = serve_session(
         conn,
         crate::HostMedia {
             frames: video_rx.clone().expect("frame slot"),
             audio: audio_rx.take().expect("audio receiver"),
             fps,
             log,
+            cursor: cursor_rx,
         },
         input_tx,
         Some(ack_rx),
+        pipes,
     );
     let asked = tokio::select! {
         result = session => {
             let asked = stop.load(Ordering::SeqCst);
             if let Err(error) = result {
                 inject.abort();
+                desk_io::detach_host();
                 release_host(
                     &stop,
                     &up,
@@ -248,6 +270,7 @@ async fn listen(
         _ = until_stop(&stop) => true,
     };
     inject.abort();
+    desk_io::detach_host();
     release_host(
         &stop,
         &up,
@@ -299,15 +322,21 @@ async fn until_stop(stop: &AtomicBool) {
 struct Screen {
     width: AtomicU32,
     height: AtomicU32,
+    frame_w: AtomicU32,
+    frame_h: AtomicU32,
+    origin_x: AtomicI32,
+    origin_y: AtomicI32,
 }
 
 fn capture_loop(
     stop: Arc<AtomicBool>,
     screen: Arc<Screen>,
     video: etherquic_media::host::FrameSlot,
+    cursor_tx: tokio::sync::watch::Sender<Option<Vec<u8>>>,
     max_width: u32,
     fps: u32,
 ) {
+    let mut cursor = etherquic::cursor::Watch::new();
     let period = Duration::from_millis((1000 / fps.max(1) as u64).max(1));
     let mut frames = 0u64;
     let mut logged = Instant::now();
@@ -334,10 +363,53 @@ fn capture_loop(
                 continue;
             }
         }
-        let spent = started.elapsed();
-        if spent < period {
-            thread::sleep(period - spent);
+        let screen = &screen;
+        let cursor_tx = &cursor_tx;
+        pace(started, period, &stop, || {
+            publish_cursor(&mut cursor, screen, cursor_tx)
+        });
+    }
+}
+
+fn publish_cursor(
+    cursor: &mut etherquic::cursor::Watch,
+    screen: &Screen,
+    cursor_tx: &tokio::sync::watch::Sender<Option<Vec<u8>>>,
+) {
+    let frame_w = screen.frame_w.load(Ordering::Relaxed);
+    let frame_h = screen.frame_h.load(Ordering::Relaxed);
+    let capture_w = screen.width.load(Ordering::Relaxed);
+    let capture_h = screen.height.load(Ordering::Relaxed);
+    if frame_w == 0 || frame_h == 0 || capture_w == 0 || capture_h == 0 {
+        return;
+    }
+    let Some(update) = cursor.poll() else {
+        return;
+    };
+    let bytes = update
+        .map_to_frame(
+            screen.origin_x.load(Ordering::Relaxed),
+            screen.origin_y.load(Ordering::Relaxed),
+            capture_w,
+            capture_h,
+            frame_w,
+            frame_h,
+        )
+        .encode();
+    let _ = cursor_tx.send(Some(bytes));
+}
+
+fn pace(started: Instant, period: Duration, stop: &AtomicBool, mut on_tick: impl FnMut()) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
         }
+        let left = period.saturating_sub(started.elapsed());
+        on_tick();
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(left.min(Duration::from_millis(16)));
     }
 }
 
@@ -352,9 +424,17 @@ fn one_frame(screen: &Screen, max_width: u32) -> Result<etherquic_media::Frame, 
     let height = monitor.height().map_err(|error| error.to_string())?;
     screen.width.store(width.max(1), Ordering::Relaxed);
     screen.height.store(height.max(1), Ordering::Relaxed);
+    screen
+        .origin_x
+        .store(monitor.x().unwrap_or(0), Ordering::Relaxed);
+    screen
+        .origin_y
+        .store(monitor.y().unwrap_or(0), Ordering::Relaxed);
     let image = monitor.capture_image().map_err(|error| error.to_string())?;
     let picture = fit_rgba(image.as_raw(), image.width(), image.height(), max_width)
         .map_err(|error| error.to_string())?;
+    screen.frame_w.store(picture.width, Ordering::Relaxed);
+    screen.frame_h.store(picture.height, Ordering::Relaxed);
     Ok(etherquic_media::Frame {
         width: picture.width,
         height: picture.height,
@@ -565,6 +645,25 @@ fn sample_to_i16(sample: f32) -> i16 {
     (float * i16::MAX as f32) as i16
 }
 
+static INPUT_RECORDER: Mutex<Option<Arc<Mutex<Vec<Event>>>>> = Mutex::new(None);
+
+/// Record injected input here instead of typing on this desktop.
+///
+/// `None` restores the real keyboard and mouse. The desktop session still
+/// calls the same `Hands::one` path.
+pub fn set_input_recorder(slot: Option<Arc<Mutex<Vec<Event>>>>) {
+    *INPUT_RECORDER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = slot;
+}
+
+fn recorded_input() -> Option<Arc<Mutex<Vec<Event>>>> {
+    INPUT_RECORDER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
 struct Hands {
     enigo: Option<Enigo>,
     #[cfg(target_os = "linux")]
@@ -628,6 +727,12 @@ impl Hands {
     }
 
     fn one(&mut self, event: &Event, width: u32, height: u32) -> Result<bool, String> {
+        if let Some(slot) = recorded_input() {
+            slot.lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(event.clone());
+            return Ok(true);
+        }
         match &event.body {
             Body::Pointer {
                 x,
@@ -832,7 +937,32 @@ fn key_from_keysym(code: u32) -> Option<Key> {
         0xffc7 => Key::F10,
         0xffc8 => Key::F11,
         0xffc9 => Key::F12,
-        code if code < 0x80 => Key::Unicode(char::from_u32(code)?),
-        _ => return None,
+        code => {
+            let ch = char::from_u32(code)?;
+            if ch.is_control() {
+                return None;
+            }
+            Key::Unicode(ch)
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_from_keysym;
+    use enigo::Key;
+
+    #[test]
+    fn typed_paste_covers_letters_past_ascii() {
+        assert!(matches!(
+            key_from_keysym(u32::from('a')),
+            Some(Key::Unicode('a'))
+        ));
+        assert!(matches!(
+            key_from_keysym(u32::from('é')),
+            Some(Key::Unicode('é'))
+        ));
+        assert!(matches!(key_from_keysym(0xff0d), Some(Key::Return)));
+        assert!(key_from_keysym(u32::from('\n')).is_none());
+    }
 }

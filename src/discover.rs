@@ -25,9 +25,11 @@
 //! ```
 //!
 //! [`TLV_CAPS`] carries [`Capabilities`] and [`TLV_THUMBNAIL`] a JPEG XL
-//! desktop thumbnail sized to the room left in the frame. Unknown types are
-//! skipped, so later records do not break this reader. An unmarked announce
-//! (an older player) always gets the old offer, which that player accepts.
+//! desktop thumbnail sized to the room left in the frame. [`TLV_RELEASE`]
+//! carries this build's etherquic version and the operating system's name
+//! and version. Unknown types are skipped, so later records do not break
+//! this reader. An unmarked announce (an older player) always gets the old
+//! offer, which that player accepts.
 //!
 //! Every offer fits one frame: [`L2_PAYLOAD_LIMIT`] on Ethernet, and
 //! [`UDP4_PAYLOAD_LIMIT`] or [`UDP6_PAYLOAD_LIMIT`] for UDP.
@@ -35,6 +37,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -71,6 +74,8 @@ pub const TLV_HEADER: usize = 3;
 pub const TLV_CAPS: u8 = 1;
 /// JPEG XL thumbnail record (a bare codestream).
 pub const TLV_THUMBNAIL: u8 = 2;
+/// Etherquic version and operating system. Older players skip this type.
+pub const TLV_RELEASE: u8 = 3;
 /// Below this a thumbnail is not worth sending.
 pub const MIN_THUMBNAIL: usize = 64;
 const ANNOUNCE: u8 = 1;
@@ -177,6 +182,8 @@ pub struct Found {
     pub caps: Option<Capabilities>,
     /// JPEG XL codestream from a version-3 offer.
     pub thumbnail: Option<Vec<u8>>,
+    /// Etherquic version and operating system. `None` from an older host.
+    pub release: Option<Release>,
     /// Answered over raw Ethernet.
     pub via_l2: bool,
     /// Answered over UDP.
@@ -214,6 +221,7 @@ pub struct PadInfo {
 pub const OS_WINDOWS: u8 = 1;
 pub const OS_LINUX: u8 = 2;
 pub const OS_MACOS: u8 = 3;
+pub const OS_ANDROID: u8 = 4;
 
 pub const INPUT_KEYBOARD: u16 = 1 << 0;
 pub const INPUT_MOUSE: u16 = 1 << 1;
@@ -394,6 +402,355 @@ impl Capabilities {
     }
 }
 
+const MAX_PRODUCT: usize = 16;
+const MAX_OS_NAME: usize = 24;
+const MAX_OS_VER: usize = 16;
+
+/// This build and the operating system, carried in [`TLV_RELEASE`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Release {
+    /// `CARGO_PKG_VERSION` of the etherquic crate, such as `0.1.0`.
+    pub version: String,
+    pub os: u8,
+    /// `Windows`, `macOS`, `Android`, or a Linux distribution name.
+    pub os_name: String,
+    /// Short mark: `11`, `8.1`, `XP`, `15.1`, `14`.
+    pub os_version: String,
+}
+
+impl Release {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![1];
+        push_str(&mut out, &self.version, MAX_PRODUCT);
+        out.push(self.os);
+        push_str(&mut out, &self.os_name, MAX_OS_NAME);
+        push_str(&mut out, &self.os_version, MAX_OS_VER);
+        out
+    }
+
+    /// `None` when a known field is cut short. Bytes after the known fields are ignored.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let mut rest = bytes;
+        let record = take_u8(&mut rest)?;
+        if record == 0 {
+            return None;
+        }
+        let version = take_str(&mut rest)?;
+        let os = take_u8(&mut rest)?;
+        let os_name = take_str(&mut rest)?;
+        let os_version = take_str(&mut rest)?;
+        Some(Self {
+            version,
+            os,
+            os_name,
+            os_version,
+        })
+    }
+
+    /// `Windows 11`, or the name alone when the version is already in it.
+    pub fn os_label(&self) -> String {
+        let name = self.os_name.trim();
+        let ver = self.os_version.trim();
+        if ver.is_empty()
+            || name
+                .to_ascii_lowercase()
+                .contains(&ver.to_ascii_lowercase())
+        {
+            name.to_string()
+        } else {
+            format!("{name} {ver}")
+        }
+    }
+
+    /// `Windows 11 · version 0.1.0`.
+    pub fn list_line(&self) -> String {
+        let os = self.os_label();
+        let ver = self.version.trim();
+        match (os.is_empty(), ver.is_empty()) {
+            (false, false) => format!("{os} · version {ver}"),
+            (false, true) => os,
+            (true, false) => format!("version {ver}"),
+            (true, true) => String::new(),
+        }
+    }
+}
+
+/// Which grey mark to draw. The version number is painted on top of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsFace {
+    WindowsXp,
+    WindowsVista,
+    Windows7,
+    Windows8,
+    Windows81,
+    Windows10,
+    Windows11,
+    Windows,
+    Mac,
+    Android,
+    Other,
+}
+
+impl OsFace {
+    pub fn from_os(os: u8, name: &str, version: &str) -> Self {
+        let (face, _) = if version.trim().is_empty() {
+            face_from_label(os, name)
+        } else {
+            face_from_label(os, &format!("{name} {version}"))
+        };
+        if face != OsFace::Other {
+            return face;
+        }
+        match os {
+            OS_WINDOWS => OsFace::Windows,
+            OS_MACOS => OsFace::Mac,
+            OS_ANDROID => OsFace::Android,
+            _ => OsFace::Other,
+        }
+    }
+}
+
+/// Icon and the short number painted on its corner. `label` is what an older
+/// host put in one string, such as `Windows 11` or `macOS 15.1`.
+pub fn face_from_label(os: u8, label: &str) -> (OsFace, String) {
+    let lower = label.to_ascii_lowercase();
+    if os == OS_ANDROID || lower.contains("android") {
+        return (OsFace::Android, first_number(label));
+    }
+    if os == OS_MACOS || lower.contains("mac") {
+        return (OsFace::Mac, first_number(label));
+    }
+    if os == OS_WINDOWS || lower.contains("windows") {
+        if let Some((face, sub)) = windows_token(&lower) {
+            return (face, sub);
+        }
+        return (OsFace::Windows, String::new());
+    }
+    (OsFace::Other, first_number(label))
+}
+
+fn windows_token(lower: &str) -> Option<(OsFace, String)> {
+    const RULES: &[(&str, &str, OsFace)] = &[
+        ("8.1", "8.1", OsFace::Windows81),
+        ("vista", "Vista", OsFace::WindowsVista),
+        ("xp", "XP", OsFace::WindowsXp),
+        ("11", "11", OsFace::Windows11),
+        ("10", "10", OsFace::Windows10),
+        ("8", "8", OsFace::Windows8),
+        ("7", "7", OsFace::Windows7),
+    ];
+    for (needle, sub, face) in RULES {
+        if contains_token(lower, needle) {
+            return Some((*face, (*sub).to_string()));
+        }
+    }
+    None
+}
+
+fn contains_token(hay: &str, needle: &str) -> bool {
+    hay.match_indices(needle).any(|(at, _)| {
+        let before_ok = hay[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '.');
+        let after_ok = hay[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '.');
+        before_ok && after_ok
+    })
+}
+
+fn first_number(text: &str) -> String {
+    for token in text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.') {
+        if token.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+            return token.chars().take(8).collect();
+        }
+    }
+    String::new()
+}
+
+/// This process. Read once: a discovery reply must not wait on the registry.
+pub fn local_release() -> Release {
+    static CACHED: OnceLock<Release> = OnceLock::new();
+    CACHED.get_or_init(read_local_release).clone()
+}
+
+fn read_local_release() -> Release {
+    let (os, os_name, os_version) = platform_os();
+    Release {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        os,
+        os_name,
+        os_version,
+    }
+}
+
+/// `XP`, `Vista`, `7`, `8`, `8.1`, `10`, or `11`. Empty when the numbers are
+/// not one of those.
+pub fn windows_mark(major: u32, minor: u32, build: u32) -> &'static str {
+    match (major, minor) {
+        (5, 1) | (5, 2) => "XP",
+        (6, 0) => "Vista",
+        (6, 1) => "7",
+        (6, 2) => "8",
+        (6, 3) => "8.1",
+        (10, _) if build >= 22000 => "11",
+        (10, _) if build > 0 => "10",
+        _ => "",
+    }
+}
+
+/// `CurrentMajorVersionNumber`, `CurrentMinorVersionNumber`, and
+/// `CurrentBuildNumber` from `reg query` text. `CurrentVersion` (`6.1`) fills
+/// in when the major and minor values are absent, as they are before Windows 10.
+pub fn parse_windows_reg(text: &str) -> Option<(u32, u32, u32)> {
+    let mut major = None;
+    let mut minor = None;
+    let mut build = None;
+    let mut current = None;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else { continue };
+        let Some(_kind) = parts.next() else { continue };
+        let Some(value) = parts.next() else { continue };
+        match key {
+            "CurrentMajorVersionNumber" => major = parse_reg_int(value),
+            "CurrentMinorVersionNumber" => minor = parse_reg_int(value),
+            "CurrentBuildNumber" => build = value.parse().ok(),
+            "CurrentVersion" => current = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    if major.is_none() {
+        if let Some(cur) = current.as_deref() {
+            let mut bits = cur.split('.');
+            major = bits.next().and_then(|part| part.parse().ok());
+            minor = bits.next().and_then(|part| part.parse().ok());
+        }
+    }
+    Some((major?, minor.unwrap_or(0), build.unwrap_or(0)))
+}
+
+fn parse_reg_int(value: &str) -> Option<u32> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+/// `NAME` and `VERSION_ID` from `/etc/os-release`.
+pub fn os_release_pair(text: &str) -> (String, String) {
+    let mut name = String::new();
+    let mut version = String::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim().to_string();
+        match key {
+            "NAME" if name.is_empty() => name = value,
+            "VERSION_ID" => version = value,
+            _ => {}
+        }
+    }
+    (name, version)
+}
+
+/// The `<string>` after `<key>name</key>` in a macOS SystemVersion plist.
+pub fn plist_string(text: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let rest = text.split_once(&needle)?.1;
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = rest[start..].find("</string>")? + start;
+    let value = rest[start..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// `ro.build.version.release` from Android `build.prop`.
+pub fn android_release(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("ro.build.version.release=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn platform_os() -> (u8, String, String) {
+    let text = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let (major, minor, build) = parse_windows_reg(&text).unwrap_or((0, 0, 0));
+    let mark = windows_mark(major, minor, build);
+    let version = if mark.is_empty() {
+        if major == 0 {
+            String::new()
+        } else {
+            format!("{major}.{minor}")
+        }
+    } else {
+        mark.to_string()
+    };
+    (OS_WINDOWS, "Windows".into(), version)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_os() -> (u8, String, String) {
+    let text = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
+        .unwrap_or_default();
+    let version = plist_string(&text, "ProductVersion").unwrap_or_default();
+    (OS_MACOS, "macOS".into(), version)
+}
+
+#[cfg(target_os = "android")]
+fn platform_os() -> (u8, String, String) {
+    let text = std::fs::read_to_string("/system/build.prop").unwrap_or_default();
+    let version = android_release(&text).unwrap_or_default();
+    (OS_ANDROID, "Android".into(), version)
+}
+
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn platform_os() -> (u8, String, String) {
+    let text = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let (name, version) = os_release_pair(&text);
+    let name = if name.is_empty() {
+        "Linux".into()
+    } else {
+        name
+    };
+    (OS_LINUX, name, version)
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    target_os = "android",
+    target_os = "linux"
+)))]
+fn platform_os() -> (u8, String, String) {
+    (0, std::env::consts::OS.into(), String::new())
+}
+
 fn push_str(out: &mut Vec<u8>, text: &str, max: usize) {
     let bytes = clip_to(text, max);
     out.push(bytes.len() as u8);
@@ -416,6 +773,10 @@ pub trait OfferExtras: Send + Sync {
     fn capabilities(&self) -> Option<Capabilities>;
     /// A codestream of at most `budget` bytes, or `None`.
     fn thumbnail(&self, budget: usize) -> Option<Vec<u8>>;
+    /// This build and the operating system. The default is this process.
+    fn release(&self) -> Release {
+        local_release()
+    }
 }
 
 /// No capabilities and no picture. A version-3 offer still carries the driver byte.
@@ -576,7 +937,9 @@ pub fn discover_burst(nic: Option<&str>, generation: &AtomicU64, expected: u64) 
         drain(&mut l2, &udp, &pending, &mut acc, GAP, generation, expected);
     }
     if generation.load(Ordering::SeqCst) == expected {
-        drain(&mut l2, &udp, &pending, &mut acc, TAIL, generation, expected);
+        drain(
+            &mut l2, &udp, &pending, &mut acc, TAIL, generation, expected,
+        );
     }
     let mut found: Vec<Found> = acc.into_values().map(Acc::finish).collect();
     found.sort_by(|a, b| a.name.cmp(&b.name).then(a.key.cmp(&b.key)));
@@ -605,8 +968,7 @@ pub fn serve_with(
             Ok(Some(raw)) => {
                 if let Some(id_dst) = announce_for_us(&raw, src) {
                     let (id, dst) = id_dst;
-                    let payload =
-                        offer_payload(id, card, &info, extras, L2_PAYLOAD_LIMIT);
+                    let payload = offer_payload(id, card, &info, extras, L2_PAYLOAD_LIMIT);
                     let frame = offer_frame_with(src, dst, payload);
                     if let Err(err) = link.send(&frame.encode()) {
                         eprintln!("discovery reply: {err}");
@@ -649,7 +1011,10 @@ pub fn serve_udp(
     ] {
         match UdpSocket::bind(addr) {
             Ok(socket) => {
-                if socket.set_read_timeout(Some(Duration::from_millis(50))).is_ok() {
+                if socket
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .is_ok()
+                {
                     sockets.push(socket);
                 }
             }
@@ -718,15 +1083,19 @@ struct UdpProbe {
 
 impl UdpProbe {
     fn open(scope: u32) -> Option<Self> {
-        let v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok().and_then(|socket| {
-            socket.set_broadcast(true).ok()?;
-            socket.set_nonblocking(true).ok()?;
-            Some(socket)
-        });
-        let v6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok().and_then(|socket| {
-            socket.set_nonblocking(true).ok()?;
-            Some(socket)
-        });
+        let v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .ok()
+            .and_then(|socket| {
+                socket.set_broadcast(true).ok()?;
+                socket.set_nonblocking(true).ok()?;
+                Some(socket)
+            });
+        let v6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+            .ok()
+            .and_then(|socket| {
+                socket.set_nonblocking(true).ok()?;
+                Some(socket)
+            });
         if v4.is_none() && v6.is_none() {
             return None;
         }
@@ -757,6 +1126,7 @@ struct Acc {
     key: Mac,
     caps: Option<Capabilities>,
     thumbnail: Option<Vec<u8>>,
+    release: Option<Release>,
     via_l2: bool,
     via_udp: bool,
     name: String,
@@ -791,6 +1161,7 @@ impl Acc {
             key: self.key,
             caps: self.caps,
             thumbnail: self.thumbnail,
+            release: self.release,
             via_l2: self.via_l2,
             via_udp: self.via_udp,
         }
@@ -885,6 +1256,7 @@ fn note_offer(
         key,
         caps: None,
         thumbnail: None,
+        release: None,
         via_l2: false,
         via_udp: false,
         name: info.name.clone(),
@@ -916,9 +1288,16 @@ fn note_offer(
     if info.caps.is_some() {
         row.caps = info.caps;
     }
+    if info.release.is_some() {
+        row.release = info.release;
+    }
     // Keep the larger picture: the L2 and UDP replies may differ in room.
     if let Some(thumb) = info.thumbnail {
-        if row.thumbnail.as_ref().is_none_or(|old| old.len() < thumb.len()) {
+        if row
+            .thumbnail
+            .as_ref()
+            .is_none_or(|old| old.len() < thumb.len())
+        {
             row.thumbnail = Some(thumb);
         }
     }
@@ -939,6 +1318,7 @@ struct OfferBody {
     l2_backend: u8,
     caps: Option<Capabilities>,
     thumbnail: Option<Vec<u8>>,
+    release: Option<Release>,
 }
 
 fn announce_frame(src: Mac, id: u32) -> Frame {
@@ -1020,6 +1400,10 @@ pub fn offer_payload(
         if payload.len() + TLV_HEADER + record.len() <= limit {
             push_tlv(&mut payload, TLV_CAPS, &record);
         }
+    }
+    let release = extras.release().encode();
+    if payload.len() + TLV_HEADER + release.len() <= limit {
+        push_tlv(&mut payload, TLV_RELEASE, &release);
     }
     if let Some(budget) = thumbnail_budget(limit, payload.len()) {
         if let Some(thumb) = extras.thumbnail(budget) {
@@ -1201,6 +1585,7 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
     }
     let mut caps = None;
     let mut thumbnail = None;
+    let mut release = None;
     let (video, audio, l2_backend) = if version == VERSION {
         if !rest.is_empty() {
             return None;
@@ -1230,6 +1615,7 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
             match kind {
                 TLV_CAPS => caps = Capabilities::parse(value),
                 TLV_THUMBNAIL => thumbnail = Some(value.to_vec()),
+                TLV_RELEASE => release = Release::parse(value),
                 _ => {}
             }
         }
@@ -1248,6 +1634,7 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
             l2_backend,
             caps,
             thumbnail,
+            release,
         },
     ))
 }
@@ -1446,7 +1833,9 @@ mod tests {
                     name: "Controller (Xbox One For Windows) with a long name".into(),
                 })
                 .collect(),
-            audio_outputs: (0..6).map(|i| format!("Speakers {i} (High Definition Audio Device)")).collect(),
+            audio_outputs: (0..6)
+                .map(|i| format!("Speakers {i} (High Definition Audio Device)"))
+                .collect(),
             audio_inputs: vec!["Microphone".into()],
             codecs: String::new(),
         }
@@ -1566,7 +1955,10 @@ mod tests {
         newer[0] = CAPS_VERSION + 4;
         newer.extend([0xde, 0xad, 0xbe, 0xef]);
         let parsed = Capabilities::parse(&newer).unwrap();
-        assert_eq!(parsed.hostname, Capabilities::parse(&caps.encode()).unwrap().hostname);
+        assert_eq!(
+            parsed.hostname,
+            Capabilities::parse(&caps.encode()).unwrap().hostname
+        );
         assert_eq!(parsed.pads.len(), MAX_PADS);
         // A cut inside a required field is rejected, not half read.
         let core = Capabilities {
@@ -1658,13 +2050,18 @@ mod tests {
     fn codec_text_is_trailing_and_optional() {
         let caps = Capabilities {
             hostname: "box".into(),
-            codecs: "host-video pyrowave=pyrowave:0x0@0 mjpeg=jpeg:0x0@0\nhost-audio opus pcm\n".into(),
+            codecs: "host-video pyrowave=pyrowave:0x0@0 mjpeg=jpeg:0x0@0\nhost-audio opus pcm\n"
+                .into(),
             ..Capabilities::default()
         };
         let bytes = caps.encode();
         assert_eq!(Capabilities::parse(&bytes).unwrap().codecs, caps.codecs);
         // An older host stops after the audio lists.
-        let older = Capabilities { codecs: String::new(), ..caps.clone() }.encode();
+        let older = Capabilities {
+            codecs: String::new(),
+            ..caps.clone()
+        }
+        .encode();
         assert!(bytes.starts_with(&older));
         assert!(Capabilities::parse(&older).unwrap().codecs.is_empty());
     }
@@ -1700,21 +2097,39 @@ mod tests {
         assert_eq!(UDP6_PAYLOAD_LIMIT, 1452);
         assert_eq!(thumbnail_budget(1494, 200), Some(1291));
         assert_eq!(thumbnail_budget(1494, 1494), None);
-        assert_eq!(thumbnail_budget(1494, 1494 - TLV_HEADER - MIN_THUMBNAIL), Some(MIN_THUMBNAIL));
-        assert_eq!(thumbnail_budget(1494, 1494 - TLV_HEADER - MIN_THUMBNAIL + 1), None);
+        assert_eq!(
+            thumbnail_budget(1494, 1494 - TLV_HEADER - MIN_THUMBNAIL),
+            Some(MIN_THUMBNAIL)
+        );
+        assert_eq!(
+            thumbnail_budget(1494, 1494 - TLV_HEADER - MIN_THUMBNAIL + 1),
+            None
+        );
         assert_eq!(thumbnail_budget(100, 5000), None);
-        assert_eq!(udp_limit(&"10.0.0.1:4440".parse().unwrap()), UDP4_PAYLOAD_LIMIT);
-        assert_eq!(udp_limit(&"[::ffff:10.0.0.1]:4440".parse().unwrap()), UDP4_PAYLOAD_LIMIT);
-        assert_eq!(udp_limit(&"[fe80::1]:4440".parse().unwrap()), UDP6_PAYLOAD_LIMIT);
+        assert_eq!(
+            udp_limit(&"10.0.0.1:4440".parse().unwrap()),
+            UDP4_PAYLOAD_LIMIT
+        );
+        assert_eq!(
+            udp_limit(&"[::ffff:10.0.0.1]:4440".parse().unwrap()),
+            UDP4_PAYLOAD_LIMIT
+        );
+        assert_eq!(
+            udp_limit(&"[fe80::1]:4440".parse().unwrap()),
+            UDP6_PAYLOAD_LIMIT
+        );
     }
 
     #[test]
     fn offers_never_exceed_the_frame() {
-        let limits = [L2_PAYLOAD_LIMIT, UDP4_PAYLOAD_LIMIT, UDP6_PAYLOAD_LIMIT, 600, 200];
-        let shapes = [
-            (card(), info()),
-            (big_card(), big_info()),
+        let limits = [
+            L2_PAYLOAD_LIMIT,
+            UDP4_PAYLOAD_LIMIT,
+            UDP6_PAYLOAD_LIMIT,
+            600,
+            200,
         ];
+        let shapes = [(card(), info()), (big_card(), big_info())];
         // A thumbnail exactly as big as asked, one byte over, and none.
         for short_by in [Some(0), Some(-1), Some(10), None] {
             for caps in [None, Some(full_caps())] {
@@ -1757,7 +2172,10 @@ mod tests {
         let announce = announce_frame([0xd8, 0x5e, 0xd3, 0x88, 0x5e, 0x0e], EXT_MARK | 5);
         let bytes = announce.encode();
         // An older host reads the id and answers it like any other.
-        assert_eq!(decode_announce(&Frame::decode(&bytes).unwrap().payload), Some(EXT_MARK | 5));
+        assert_eq!(
+            decode_announce(&Frame::decode(&bytes).unwrap().payload),
+            Some(EXT_MARK | 5)
+        );
     }
 
     #[test]
@@ -1772,5 +2190,107 @@ mod tests {
         assert_eq!(one.std_ms, 0.0);
         assert_eq!(one.jitter_ms, 0.0);
         assert_eq!(Stats::from_samples(&[]).avg_ms, 0.0);
+    }
+
+    #[test]
+    fn release_names_the_build_and_the_operating_system() {
+        let rel = Release {
+            version: "0.1.0".into(),
+            os: OS_WINDOWS,
+            os_name: "Windows".into(),
+            os_version: "11".into(),
+        };
+        assert_eq!(Release::parse(&rel.encode()).unwrap(), rel);
+        assert_eq!(rel.os_label(), "Windows 11");
+        assert_eq!(rel.list_line(), "Windows 11 · version 0.1.0");
+        assert_eq!(
+            OsFace::from_os(OS_WINDOWS, "Windows", "11"),
+            OsFace::Windows11
+        );
+        assert_eq!(
+            OsFace::from_os(OS_WINDOWS, "Windows", "XP"),
+            OsFace::WindowsXp
+        );
+        assert_eq!(
+            OsFace::from_os(OS_WINDOWS, "Windows", "Vista"),
+            OsFace::WindowsVista
+        );
+        assert_eq!(
+            OsFace::from_os(OS_WINDOWS, "Windows", "7"),
+            OsFace::Windows7
+        );
+        assert_eq!(
+            OsFace::from_os(OS_WINDOWS, "Windows", "8"),
+            OsFace::Windows8
+        );
+        assert_eq!(
+            OsFace::from_os(OS_WINDOWS, "Windows", "8.1"),
+            OsFace::Windows81
+        );
+        assert_eq!(
+            OsFace::from_os(OS_WINDOWS, "Windows", "10"),
+            OsFace::Windows10
+        );
+        assert_eq!(OsFace::from_os(OS_MACOS, "macOS", "15.1"), OsFace::Mac);
+        assert_eq!(
+            OsFace::from_os(OS_ANDROID, "Android", "14"),
+            OsFace::Android
+        );
+        assert_eq!(
+            face_from_label(OS_WINDOWS, "Windows 8.1 Pro").0,
+            OsFace::Windows81
+        );
+        assert_eq!(face_from_label(OS_MACOS, "macOS 14.6.1").1, "14.6.1");
+        assert_eq!(windows_mark(10, 0, 26100), "11");
+        assert_eq!(windows_mark(10, 0, 19045), "10");
+        assert_eq!(windows_mark(6, 1, 7601), "7");
+        assert_eq!(windows_mark(6, 3, 9600), "8.1");
+        assert_eq!(windows_mark(5, 1, 2600), "XP");
+        assert_eq!(windows_mark(6, 0, 6002), "Vista");
+        assert_eq!(windows_mark(6, 2, 9200), "8");
+        assert_eq!(windows_mark(10, 0, 0), "");
+        let reg = "\
+CurrentMajorVersionNumber    REG_DWORD    0xa
+CurrentMinorVersionNumber    REG_DWORD    0x0
+CurrentBuildNumber    REG_SZ    26100
+";
+        assert_eq!(parse_windows_reg(reg), Some((10, 0, 26100)));
+        let xp = "\
+CurrentVersion    REG_SZ    5.1
+CurrentBuildNumber    REG_SZ    2600
+";
+        assert_eq!(parse_windows_reg(xp), Some((5, 1, 2600)));
+        assert_eq!(
+            os_release_pair("NAME=\"NixOS\"\nVERSION_ID=\"24.11\"\n"),
+            ("NixOS".into(), "24.11".into())
+        );
+        assert_eq!(
+            plist_string(
+                "<key>ProductVersion</key>\n<string>15.1</string>\n",
+                "ProductVersion"
+            ),
+            Some("15.1".into())
+        );
+        assert_eq!(
+            android_release("ro.build.version.release=14\n"),
+            Some("14".into())
+        );
+
+        let extras = Fixed {
+            caps: None,
+            short_by: None,
+        };
+        let payload = offer_payload(EXT_MARK | 3, &card(), &info(), &extras, L2_PAYLOAD_LIMIT);
+        let (_, body) = decode_offer(&payload).unwrap();
+        let sent = body.release.expect("offer carries the release");
+        assert_eq!(sent.version, env!("CARGO_PKG_VERSION"));
+        // An older reader skips the record. A hand-built one still decodes.
+        let mut marked = encode_header(VERSION_EXT, OFFER, EXT_MARK | 1);
+        write_body(&mut marked, &card(), &info());
+        marked.extend([0, 0, L2_NPCAP]);
+        push_tlv(&mut marked, TLV_RELEASE, &rel.encode());
+        push_tlv(&mut marked, 0x7f, b"later");
+        let (_, body) = decode_offer(&marked).unwrap();
+        assert_eq!(body.release.unwrap(), rel);
     }
 }

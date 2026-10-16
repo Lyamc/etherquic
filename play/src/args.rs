@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use etherquic::parse_mac;
 use etherquic_play::{
-    PadSlot, ScaleMode, SizeMatch, ViewOptions, CLIENT_MAC, DEFAULT_FPS, DEFAULT_MAX_WIDTH,
-    HOST_MAC, PAD_SLOTS, SERVICE_ID,
+    CursorMode, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, CLIENT_MAC, DEFAULT_FPS,
+    DEFAULT_MAX_WIDTH, HOST_MAC, PAD_SLOTS, SERVICE_ID,
 };
 
 pub struct Host {
@@ -110,27 +110,50 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
             "--parent-pipe" => flag(&mut i, &mut parent_pipe),
             "--scale" => {
                 let token = need(args, &mut i, "--scale")?;
-                view.scale = ScaleMode::from_token(&token).ok_or_else(|| format!("bad --scale {token}"))?;
+                view.scale =
+                    ScaleMode::from_token(&token).ok_or_else(|| format!("bad --scale {token}"))?;
+            }
+            "--cursor" => {
+                let token = need(args, &mut i, "--cursor")?;
+                view.cursor = CursorMode::from_token(&token)
+                    .ok_or_else(|| format!("bad --cursor {token}"))?;
+            }
+            "--look" => {
+                let token = need(args, &mut i, "--look")?;
+                view.look =
+                    Look::from_token(&token).ok_or_else(|| format!("bad --look {token}"))?;
             }
             "--size-match" => {
                 let token = need(args, &mut i, "--size-match")?;
-                view.size_match =
-                    SizeMatch::from_token(&token).ok_or_else(|| format!("bad --size-match {token}"))?;
+                view.size_match = SizeMatch::from_token(&token)
+                    .ok_or_else(|| format!("bad --size-match {token}"))?;
             }
             "--output-device" => view.output_device = Some(need(args, &mut i, "--output-device")?),
             "--pad" => view.pad_slots.push(pad(need(args, &mut i, "--pad")?)?),
             "--peer-mac" => peer_mac = Some(mac(need(args, &mut i, "--peer-mac")?)?),
             "--service-id" => service_id = number(need(args, &mut i, "--service-id")?)?,
             "--udp" => udp = Some(number(need(args, &mut i, "--udp")?)?),
-            "--video" => codecs.video = etherquic_play::CodecChoice::parse_video(&need(args, &mut i, "--video")?),
-            "--audio" => codecs.audio = etherquic_play::CodecChoice::parse_audio(&need(args, &mut i, "--audio")?),
+            "--video" => {
+                codecs.video =
+                    etherquic_play::CodecChoice::parse_video(&need(args, &mut i, "--video")?)
+            }
+            "--audio" => {
+                codecs.audio =
+                    etherquic_play::CodecChoice::parse_audio(&need(args, &mut i, "--audio")?)
+            }
             "--video-pin" => {
                 let token = need(args, &mut i, "--video-pin")?;
-                codecs.video_pin = Some(etherquic_play::PicturePref::from_token(&token).ok_or_else(|| format!("bad --video-pin {token}"))?);
+                codecs.video_pin = Some(
+                    etherquic_play::PicturePref::from_token(&token)
+                        .ok_or_else(|| format!("bad --video-pin {token}"))?,
+                );
             }
             "--audio-pin" => {
                 let token = need(args, &mut i, "--audio-pin")?;
-                codecs.audio_pin = Some(etherquic_play::AudioId::from_token(&token).ok_or_else(|| format!("bad --audio-pin {token}"))?);
+                codecs.audio_pin = Some(
+                    etherquic_play::AudioId::from_token(&token)
+                        .ok_or_else(|| format!("bad --audio-pin {token}"))?,
+                );
             }
             "--max-width" => codecs.max_width = number(need(args, &mut i, "--max-width")?)?,
             "--bitrate" => codecs.bitrate_kbps = number(need(args, &mut i, "--bitrate")?)?,
@@ -167,12 +190,17 @@ fn off(i: &mut usize, value: &mut bool) {
 
 /// `SLOT=NAME`: send the local controller NAME as host slot SLOT (0 to 3).
 fn pad(text: String) -> Result<PadSlot, String> {
-    let (slot, name) = text.split_once('=').ok_or_else(|| format!("bad --pad {text}, want SLOT=NAME"))?;
+    let (slot, name) = text
+        .split_once('=')
+        .ok_or_else(|| format!("bad --pad {text}, want SLOT=NAME"))?;
     let slot: u8 = slot.parse().map_err(|_| format!("bad --pad slot {slot}"))?;
     if slot >= PAD_SLOTS || name.is_empty() {
         return Err(format!("bad --pad {text}"));
     }
-    Ok(PadSlot { name: name.to_string(), slot })
+    Ok(PadSlot {
+        name: name.to_string(),
+        slot,
+    })
 }
 
 fn need(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -216,7 +244,9 @@ etherquic-play host [--nic IFACE] [--local-mac MAC] [--service-id 4433] [--max-w
 etherquic-play connect --peer-mac MAC [--nic IFACE] [--local-mac MAC] [--service-id 4433]
 etherquic-play connect --udp IP:PORT
   connect also takes: [--trace-input] [--scale fit|fill|stretch|native]
-    [--size-match independent|window-to-host] [--no-keyboard] [--no-mouse] [--no-pads]
+    [--cursor native|copy|remote] [--size-match independent|window-to-host]
+    [--look off|gameboy|pico8|cga|onebit|newsprint|endesga|sweetie|poster]
+    [--no-keyboard] [--no-mouse] [--no-pads]
     [--output-device NAME] [--pad SLOT=NAME]... [--parent-pipe]
     [--video av1-hw,h265-hw,h264-hw,pyrowave,mjpeg,h264-sw] [--audio opus,pcm]
     [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--bitrate KBPS]
@@ -233,15 +263,45 @@ mod tests {
 
     #[test]
     fn codec_flags_reach_the_offer_choice() {
-        let args = ["connect", "--udp", "1.2.3.4:5", "--video", "pyrowave,mjpeg,nope", "--audio", "opus,pcm", "--video-pin", "h264-sw", "--bitrate", "9000"];
-        let Ok(Command::Connect(c)) = parse(args.iter().map(|s| s.to_string())) else { panic!() };
-        assert_eq!(c.codecs.video, vec![etherquic_play::PicturePref::Pyrowave, etherquic_play::PicturePref::Mjpeg]);
-        assert_eq!(c.codecs.audio, vec![etherquic_play::AudioId::Opus, etherquic_play::AudioId::Pcm]);
-        assert_eq!(c.codecs.video_pin, Some(etherquic_play::PicturePref::H264Sw));
+        let args = [
+            "connect",
+            "--udp",
+            "1.2.3.4:5",
+            "--video",
+            "pyrowave,mjpeg,nope",
+            "--audio",
+            "opus,pcm",
+            "--video-pin",
+            "h264-sw",
+            "--bitrate",
+            "9000",
+        ];
+        let Ok(Command::Connect(c)) = parse(args.iter().map(|s| s.to_string())) else {
+            panic!()
+        };
+        assert_eq!(
+            c.codecs.video,
+            vec![
+                etherquic_play::PicturePref::Pyrowave,
+                etherquic_play::PicturePref::Mjpeg
+            ]
+        );
+        assert_eq!(
+            c.codecs.audio,
+            vec![etherquic_play::AudioId::Opus, etherquic_play::AudioId::Pcm]
+        );
+        assert_eq!(
+            c.codecs.video_pin,
+            Some(etherquic_play::PicturePref::H264Sw)
+        );
         assert_eq!(c.codecs.bitrate_kbps, 9000);
         let back = c.codecs.args();
-        assert!(back.windows(2).any(|w| w[0] == "--video" && w[1] == "pyrowave,mjpeg"));
-        assert!(back.windows(2).any(|w| w[0] == "--video-pin" && w[1] == "h264-sw"));
+        assert!(back
+            .windows(2)
+            .any(|w| w[0] == "--video" && w[1] == "pyrowave,mjpeg"));
+        assert!(back
+            .windows(2)
+            .any(|w| w[0] == "--video-pin" && w[1] == "h264-sw"));
     }
 
     fn connect(args: &[&str]) -> Connect {
@@ -263,22 +323,51 @@ mod tests {
     #[test]
     fn connect_takes_the_view_settings() {
         let c = connect(&[
-            "connect", "--udp", "[::1]:4434", "--trace-input", "--scale", "native", "--size-match",
-            "window-to-host", "--no-keyboard", "--no-pads", "--output-device", "MacBook Air Speakers",
-            "--pad", "1=Xbox Controller", "--parent-pipe",
+            "connect",
+            "--udp",
+            "[::1]:4434",
+            "--trace-input",
+            "--scale",
+            "native",
+            "--cursor",
+            "copy",
+            "--look",
+            "pico8",
+            "--size-match",
+            "window-to-host",
+            "--no-keyboard",
+            "--no-pads",
+            "--output-device",
+            "MacBook Air Speakers",
+            "--pad",
+            "1=Xbox Controller",
+            "--parent-pipe",
         ]);
         assert!(c.trace_input && c.parent_pipe);
         assert_eq!(c.view.scale, ScaleMode::Native);
+        assert_eq!(c.view.cursor, CursorMode::Copy);
+        assert_eq!(c.view.look, Look::Pico8);
         assert_eq!(c.view.size_match, SizeMatch::WindowToHost);
         assert!(!c.view.send_keyboard && c.view.send_mouse && !c.view.send_pads);
-        assert_eq!(c.view.output_device.as_deref(), Some("MacBook Air Speakers"));
-        assert_eq!(c.view.pad_slots, vec![PadSlot { name: "Xbox Controller".into(), slot: 1 }]);
+        assert_eq!(
+            c.view.output_device.as_deref(),
+            Some("MacBook Air Speakers")
+        );
+        assert_eq!(
+            c.view.pad_slots,
+            vec![PadSlot {
+                name: "Xbox Controller".into(),
+                slot: 1
+            }]
+        );
     }
 
     #[test]
     fn bad_view_settings_are_errors() {
         for args in [
             &["connect", "--udp", "1.2.3.4:1", "--scale", "zoom"][..],
+            &["connect", "--udp", "1.2.3.4:1", "--cursor", "zoom"][..],
+            &["connect", "--udp", "1.2.3.4:1", "--look", "zoom"][..],
             &["connect", "--udp", "1.2.3.4:1", "--pad", "4=X"][..],
             &["connect", "--udp", "1.2.3.4:1", "--pad", "nameonly"][..],
         ] {

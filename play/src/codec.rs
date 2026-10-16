@@ -138,7 +138,7 @@ const TABLE: &[CodecInfo] = &[
         hardware_encode_required: false,
         hardware_decode_required: false,
         gpu_compute_both_ends: true,
-        hardware: "GPU compute (Vulkan) on both ends plus the libpyrowave-shared library, not a video-encode ASIC",
+        hardware: "GPU compute on both ends. Direct3D 11 feature level 11_0 counts as hardware encode, not a video-encode ASIC",
     },
     CodecInfo {
         id: CodecId::Mjpeg,
@@ -292,7 +292,9 @@ impl AudioId {
     }
 
     pub fn from_token(token: &str) -> Option<Self> {
-        Self::order().into_iter().find(|codec| codec.token() == token)
+        Self::order()
+            .into_iter()
+            .find(|codec| codec.token() == token)
     }
 }
 
@@ -327,7 +329,8 @@ pub struct AudioSkip {
 /// them, or when the sender has no hardware encode. H.264 (HW) needs hardware
 /// encode on the sender. H.264 (SW) needs a CPU that can sustain it, and it is
 /// skipped when `skip_without_hardware_encode` is set. That switch also skips
-/// Pyrowave. MJPEG stays.
+/// CPU PyroWave. GPU PyroWave stays when the sender can encode it on a GPU.
+/// MJPEG stays.
 pub fn choose_codec(
     preference: &[PicturePref],
     local: &MachineCodecs,
@@ -346,7 +349,10 @@ pub fn choose_codec(
             skip_without_hardware_encode,
         ) {
             Ok(()) => return (Some(*pref), skipped),
-            Err(reason) => skipped.push(CodecSkip { pref: *pref, reason }),
+            Err(reason) => skipped.push(CodecSkip {
+                pref: *pref,
+                reason,
+            }),
         }
     }
     (None, skipped)
@@ -363,13 +369,16 @@ fn codec_gate(
     let decoder = if local_encodes { remote } else { local };
     match pref {
         PicturePref::Pyrowave => {
-            if skip_without_hardware_encode {
+            // Direct3D 11 and a non-CPU Vulkan device are hardware encode.
+            // The skip-without-hardware switch keeps this row. CPU PyroWave
+            // is the other preference.
+            if !(encoder.hardware_encode || encoder.gpu_compute) {
                 return Err("no hardware encode");
             }
-            if encoder.gpu_compute && decoder.gpu_compute {
+            if decoder.gpu_compute || decoder.hardware_decode {
                 Ok(())
             } else {
-                Err("no gpu compute on both ends")
+                Err("no gpu compute on the receiver")
             }
         }
         PicturePref::PyrowaveCpu => {
@@ -491,6 +500,7 @@ pub fn this_computer() -> MachineCodecs {
         (
             CodecId::Pyrowave,
             EndSupport {
+                hardware_encode: etherquic::pyrowave_hardware_encode(),
                 gpu_compute: gpu,
                 ..EndSupport::default()
             },
@@ -713,11 +723,7 @@ mod tests {
                 ..EndSupport::default()
             },
         )]);
-        let order = [
-            PicturePref::H264Hw,
-            PicturePref::H264Sw,
-            PicturePref::Mjpeg,
-        ];
+        let order = [PicturePref::H264Hw, PicturePref::H264Sw, PicturePref::Mjpeg];
         let (kept, skipped) = choose_codec(&order, &local, &cpu_only, false, false);
         assert_eq!(kept, Some(PicturePref::H264Sw));
         assert_eq!(skipped[0].pref, PicturePref::H264Hw);
@@ -776,6 +782,48 @@ mod tests {
         );
         assert_eq!(chosen, Some(AudioId::Pcm));
         assert_eq!(skipped[0].reason, "this computer has no opus");
+    }
+
+    #[test]
+    fn gpu_pyrowave_wins_the_default_order_when_asked_to_skip_software() {
+        let order = PicturePref::order();
+        let local = machine(&[(
+            CodecId::Pyrowave,
+            EndSupport {
+                gpu_compute: true,
+                ..EndSupport::default()
+            },
+        )]);
+        let remote = machine(&[(
+            CodecId::Pyrowave,
+            EndSupport {
+                hardware_encode: true,
+                gpu_compute: true,
+                ..EndSupport::default()
+            },
+        )]);
+        let (chosen, skipped) = choose_codec(&order, &local, &remote, false, true);
+        assert_eq!(chosen, Some(PicturePref::Pyrowave));
+        assert!(skipped.iter().any(|skip| skip.pref == PicturePref::H264Hw));
+        assert!(skipped
+            .iter()
+            .all(|skip| skip.pref != PicturePref::Pyrowave));
+
+        let cpu_remote = machine(&[(
+            CodecId::Pyrowave,
+            EndSupport {
+                gpu_compute: true,
+                ..EndSupport::default()
+            },
+        )]);
+        let (chosen, _) = choose_codec(
+            &[PicturePref::PyrowaveCpu, PicturePref::Mjpeg],
+            &local,
+            &cpu_remote,
+            false,
+            true,
+        );
+        assert_eq!(chosen, Some(PicturePref::Mjpeg));
     }
 
     #[test]

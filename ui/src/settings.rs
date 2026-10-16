@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use etherquic_play::{PadSlot, ScaleMode, SizeMatch, ViewOptions, PAD_SLOTS};
+use etherquic_play::{CursorMode, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, PAD_SLOTS};
 
 /// A heading in the Settings panel. Each one resets on its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -86,6 +86,9 @@ pub enum Field {
     SendKeyboard,
     SendMouse,
     SendPads,
+    ClipboardAsKeystrokes,
+    Cursor,
+    Look,
     PadSlots,
     OutputDevice,
     ShareDevice,
@@ -94,12 +97,15 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 10] = [
+    pub const ALL: [Field; 13] = [
         Self::Scale,
         Self::SizeMatch,
+        Self::Look,
         Self::SendKeyboard,
         Self::SendMouse,
         Self::SendPads,
+        Self::ClipboardAsKeystrokes,
+        Self::Cursor,
         Self::PadSlots,
         Self::OutputDevice,
         Self::ShareDevice,
@@ -109,8 +115,13 @@ impl Field {
 
     pub fn section(self) -> Section {
         match self {
-            Self::Scale | Self::SizeMatch => Section::Appearance,
-            Self::SendKeyboard | Self::SendMouse | Self::SendPads | Self::PadSlots => Section::Input,
+            Self::Scale | Self::SizeMatch | Self::Look => Section::Appearance,
+            Self::SendKeyboard
+            | Self::SendMouse
+            | Self::SendPads
+            | Self::ClipboardAsKeystrokes
+            | Self::Cursor
+            | Self::PadSlots => Section::Input,
             Self::OutputDevice | Self::ShareDevice => Section::Sound,
             Self::Network => Section::Network,
             Self::Language => Section::Language,
@@ -125,6 +136,11 @@ pub struct Settings {
     pub send_keyboard: bool,
     pub send_mouse: bool,
     pub send_pads: bool,
+    /// Paste clipboard text as keystrokes. Off sends that text as clipboard.
+    pub clipboard_as_keystrokes: bool,
+    pub cursor: CursorMode,
+    /// Host paints this before it encodes. Saved as `look=`.
+    pub look: Look,
     pub pad_slots: Vec<PadSlot>,
     /// Where remote sound plays. `None` is the system default.
     pub output_device: Option<String>,
@@ -144,6 +160,9 @@ impl Default for Settings {
             send_keyboard: view.send_keyboard,
             send_mouse: view.send_mouse,
             send_pads: view.send_pads,
+            clipboard_as_keystrokes: false,
+            cursor: view.cursor,
+            look: view.look,
             pad_slots: view.pad_slots,
             output_device: view.output_device,
             share_device: None,
@@ -162,6 +181,8 @@ impl Settings {
             send_keyboard: self.send_keyboard,
             send_mouse: self.send_mouse,
             send_pads: self.send_pads,
+            cursor: self.cursor,
+            look: self.look,
             pad_slots: self.pad_slots.clone(),
             output_device: self.output_device.clone(),
         }
@@ -186,6 +207,11 @@ impl Settings {
             Field::SendKeyboard => self.send_keyboard == other.send_keyboard,
             Field::SendMouse => self.send_mouse == other.send_mouse,
             Field::SendPads => self.send_pads == other.send_pads,
+            Field::ClipboardAsKeystrokes => {
+                self.clipboard_as_keystrokes == other.clipboard_as_keystrokes
+            }
+            Field::Cursor => self.cursor == other.cursor,
+            Field::Look => self.look == other.look,
             Field::PadSlots => self.pad_slots == other.pad_slots,
             Field::OutputDevice => self.output_device == other.output_device,
             Field::ShareDevice => self.share_device == other.share_device,
@@ -202,6 +228,11 @@ impl Settings {
             Field::SendKeyboard => self.send_keyboard = from.send_keyboard,
             Field::SendMouse => self.send_mouse = from.send_mouse,
             Field::SendPads => self.send_pads = from.send_pads,
+            Field::ClipboardAsKeystrokes => {
+                self.clipboard_as_keystrokes = from.clipboard_as_keystrokes
+            }
+            Field::Cursor => self.cursor = from.cursor,
+            Field::Look => self.look = from.look,
             Field::PadSlots => self.pad_slots = from.pad_slots.clone(),
             Field::OutputDevice => self.output_device = from.output_device.clone(),
             Field::ShareDevice => self.share_device = from.share_device.clone(),
@@ -299,12 +330,15 @@ fn clean(text: &str) -> String {
 
 pub fn render_settings(settings: &Settings) -> String {
     let mut out = format!(
-        "scale={}\nsize-match={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\n",
+        "scale={}\nsize-match={}\nlook={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\n",
         settings.scale.token(),
         settings.size_match.token(),
+        settings.look.token(),
         flag(settings.send_keyboard),
         flag(settings.send_mouse),
         flag(settings.send_pads),
+        flag(settings.clipboard_as_keystrokes),
+        settings.cursor.token(),
         clean(settings.output_device.as_deref().unwrap_or("")),
         clean(settings.share_device.as_deref().unwrap_or("")),
         settings.network.token(),
@@ -335,6 +369,9 @@ pub fn parse_settings(text: &str) -> Settings {
             "send-keyboard" => settings.send_keyboard = value != "0",
             "send-mouse" => settings.send_mouse = value != "0",
             "send-pads" => settings.send_pads = value != "0",
+            "clipboard-as-keystrokes" => settings.clipboard_as_keystrokes = value != "0",
+            "cursor" => settings.cursor = CursorMode::from_token(value).unwrap_or(settings.cursor),
+            "look" => settings.look = Look::from_token(value).unwrap_or(settings.look),
             "output-device" => settings.output_device = device(),
             "share-device" => settings.share_device = device(),
             "network" => {
@@ -498,6 +535,9 @@ mod tests {
             send_keyboard: false,
             send_mouse: true,
             send_pads: false,
+            clipboard_as_keystrokes: true,
+            cursor: CursorMode::Copy,
+            look: Look::Poster,
             output_device: Some("Speakers (USB)".into()),
             share_device: Some("Line In".into()),
             network: NetworkDriver::Npcap,
@@ -513,7 +553,7 @@ mod tests {
     #[test]
     fn unknown_or_bad_lines_keep_defaults() {
         let parsed = parse_settings(
-            "scale=zoom\nsize-match=host-to-window\nfuture=1\nnetwork=wifi\nlanguage=fr\npad-slot=x\npad-slot=9=Pad\n",
+            "scale=zoom\nsize-match=host-to-window\nlook=crt\nfuture=1\nnetwork=wifi\nlanguage=fr\npad-slot=x\npad-slot=9=Pad\n",
         );
         assert_eq!(parsed, Settings::default());
     }
@@ -583,7 +623,13 @@ mod tests {
             send_keyboard: false,
             send_mouse: false,
             send_pads: false,
-            pad_slots: vec![PadSlot { name: "Pad".into(), slot: 1 }],
+            clipboard_as_keystrokes: true,
+            cursor: CursorMode::Remote,
+            look: Look::Pico8,
+            pad_slots: vec![PadSlot {
+                name: "Pad".into(),
+                slot: 1,
+            }],
             output_device: Some("A".into()),
             share_device: Some("B".into()),
             network: NetworkDriver::Npcap,
@@ -591,7 +637,10 @@ mod tests {
         };
         let factory = Settings::default();
         for field in Field::ALL {
-            assert!(!changed.same(&factory, field), "{field:?} unchanged in the test");
+            assert!(
+                !changed.same(&factory, field),
+                "{field:?} unchanged in the test"
+            );
         }
         let mut settings = changed.clone();
         for section in Section::ALL {

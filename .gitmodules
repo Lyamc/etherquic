@@ -7,3 +7,15 @@
 [submodule "vendor/pyrowave-dx11"]
 	path = vendor/pyrowave-dx11
 	url = ../pyrowave-dx11.git
+[submodule "vendor/opus"]
+	path = vendor/opus
+	url = https://github.com/xiph/opus.git
+[submodule "vendor/pyrowave"]
+	path = vendor/pyrowave
+	url = https://github.com/Themaister/pyrowave.git
+[submodule "vendor/granite"]
+	path = vendor/granite
+	url = https://github.com/Themaister/Granite.git
+[submodule "vendor/libjxl"]
+	path = vendor/libjxl
+	url = https://github.com/libjxl/libjxl.git

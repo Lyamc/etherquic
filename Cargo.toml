@@ -1,6 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "ui",
+    "play",
+    "host",
+    "setup",
+    "media",
+    "audio",
+    "video",
+    "input",
+    "container",
+    "packaging",
+]
+# The root package is this manifest. Listing "." would mark every path under
+# it as an explicit member, and then exclude cannot keep vendor/quinn out.
+default-members = ["."]
+exclude = [
+    "vendor/quinn",
+    "vendor/rustls-rustcrypto",
+    "vendor/rustls-rustcrypto/examples-xsmall",
+    "vendor/rustls-rustcrypto/validation/consumer-no_std",
+    "vendor/softbuffer",
+    "vendor/xattr",
+]
+
+# The published gpui_http_client 0.2.2 has no install_tls_provider. The Lyamc
+# GPUI fork calls it from Application::new. Use the sibling crate that installs
+# Graviola instead of ring.
+[patch.crates-io]
+gpui_http_client = { path = "../../interfaces/gpui_http_client" }
+# xattr 0.2.3 reads libc::ENOATTR, which this libc no longer defines.
+# On Linux that value is ENODATA.
+xattr = { path = "vendor/xattr" }
+
 [package]
 name = "etherquic"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -10,6 +45,7 @@ publish = false
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_UI_Input",

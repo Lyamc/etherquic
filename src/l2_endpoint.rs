@@ -47,7 +47,11 @@ impl L2Net {
             "etherquic L2: backend={} ethertype=0x{ethertype:04x} mtu={mtu} adapter={}",
             io.name(),
             hw_mac
-                .map(|m| m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"))
+                .map(|m| m
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(":"))
                 .unwrap_or_else(|| "unknown".into())
         );
 
@@ -100,6 +104,34 @@ impl L2Net {
             hw_mac,
             adapter,
         }))
+    }
+
+    /// One fabric, no adapter. Outbound frames are delivered back into that fabric.
+    ///
+    /// A host and a player that share this net talk without opening a NIC.
+    pub fn memory() -> Arc<Self> {
+        let ethertype = crate::ETHERTYPE_QUIC;
+        let fabric = Fabric::with_ether_type(1500, ethertype);
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let fabric_rx = fabric.clone();
+        thread::Builder::new()
+            .name("etherquic-l2-memory".into())
+            .spawn(move || {
+                while let Ok(bytes) = rx.recv() {
+                    if let Ok(frame) = Frame::decode_filtered(&bytes, ethertype) {
+                        fabric_rx.inject(frame);
+                    }
+                }
+            })
+            .expect("memory l2 thread");
+        Arc::new(Self {
+            fabric,
+            out: tx,
+            ethertype,
+            l2_backend: 0,
+            hw_mac: None,
+            adapter: None,
+        })
     }
 
     pub fn ethertype(&self) -> u16 {

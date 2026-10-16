@@ -45,7 +45,11 @@ pub fn drag_to(start: f32, dy: f32, max_offset: f32, travel: f32) -> f32 {
 /// A click on the track above or below the thumb moves one page that way.
 pub fn page(scrolled: f32, viewport: f32, max_offset: f32, down: bool) -> f32 {
     let step = (viewport * 0.9).max(1.0);
-    let next = if down { scrolled + step } else { scrolled - step };
+    let next = if down {
+        scrolled + step
+    } else {
+        scrolled - step
+    };
     next.clamp(0.0, max_offset.max(0.0))
 }
 

@@ -96,6 +96,44 @@ pub struct PadSlot {
 /// Highest slot a host takes. XInput has four.
 pub const PAD_SLOTS: u8 = 4;
 
+/// Which cursor the picture window shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorMode {
+    /// This computer's cursor. Its shape follows the remote desktop: a hand
+    /// on a link, arrows on a window edge.
+    #[default]
+    Native,
+    /// The remote cursor's picture, used as this computer's cursor.
+    Copy,
+    /// This computer's cursor is hidden. The remote cursor is drawn, including
+    /// where it sits.
+    Remote,
+}
+
+impl CursorMode {
+    pub const ALL: [CursorMode; 3] = [Self::Native, Self::Copy, Self::Remote];
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Copy => "copy",
+            Self::Remote => "remote",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.token() == token)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Native cursor",
+            Self::Copy => "Copy remote cursor",
+            Self::Remote => "Remote cursor",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewOptions {
     pub scale: ScaleMode,
@@ -103,6 +141,9 @@ pub struct ViewOptions {
     pub send_keyboard: bool,
     pub send_mouse: bool,
     pub send_pads: bool,
+    pub cursor: CursorMode,
+    /// Painted on the host before the picture is encoded.
+    pub look: etherquic::look::Look,
     pub pad_slots: Vec<PadSlot>,
     /// Output device by name. `None` is the default device. Read when sound starts.
     pub output_device: Option<String>,
@@ -116,6 +157,8 @@ impl Default for ViewOptions {
             send_keyboard: true,
             send_mouse: true,
             send_pads: true,
+            cursor: CursorMode::Native,
+            look: etherquic::look::Look::Off,
             pad_slots: Vec::new(),
             output_device: None,
         }
@@ -258,9 +301,15 @@ mod tests {
     #[test]
     fn native_centres_or_crops() {
         let small = place(ScaleMode::Native, 800, 600, 1280, 720);
-        assert_eq!((small.w, small.h, small.dst_x, small.dst_y), (800, 600, 240, 60));
+        assert_eq!(
+            (small.w, small.h, small.dst_x, small.dst_y),
+            (800, 600, 240, 60)
+        );
         let big = place(ScaleMode::Native, 2560, 1440, 1280, 720);
-        assert_eq!((big.w, big.h, big.crop_x, big.crop_y), (1280, 720, 640, 360));
+        assert_eq!(
+            (big.w, big.h, big.crop_x, big.crop_y),
+            (1280, 720, 640, 360)
+        );
         let none = place(ScaleMode::Native, 0, 0, 0, 0);
         assert_eq!((none.w, none.h), (1, 1));
     }
@@ -282,8 +331,14 @@ mod tests {
     #[test]
     fn pads_keep_pinned_slots() {
         let pins = vec![
-            PadSlot { name: "Xbox".into(), slot: 1 },
-            PadSlot { name: "DualSense".into(), slot: 0 },
+            PadSlot {
+                name: "Xbox".into(),
+                slot: 1,
+            },
+            PadSlot {
+                name: "DualSense".into(),
+                slot: 0,
+            },
         ];
         assert_eq!(slot_for(&pins, "Xbox", &[]), 1);
         assert_eq!(slot_for(&pins, "DualSense", &[1]), 0);
@@ -300,6 +355,9 @@ mod tests {
         }
         for size in SizeMatch::ALL {
             assert_eq!(SizeMatch::from_token(size.token()), Some(size));
+        }
+        for cursor in CursorMode::ALL {
+            assert_eq!(CursorMode::from_token(cursor.token()), Some(cursor));
         }
         assert!(!SizeMatch::HostToWindow.available());
     }

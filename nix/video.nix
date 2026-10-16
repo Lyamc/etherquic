@@ -25,9 +25,9 @@ rustPlatform.buildRustPackage {
       && !(lib.hasInfix "/.git/" p);
   };
 
-  cargoLock.lockFile = ../video/Cargo.lock;
-  cargoRoot = "video";
-  buildAndTestSubdir = "video";
+  cargoLock.lockFile = ../Cargo.lock;
+  cargoBuildFlags = [ "-p" "etherquic-video" ];
+  cargoTestFlags = [ "-p" "etherquic-video" ];
 
   nativeBuildInputs = [
     pkg-config

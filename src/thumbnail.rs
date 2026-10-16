@@ -26,8 +26,8 @@ pub struct Rgb {
 /// Box-filter `rgba` down to `width` (aspect kept). Never upscales.
 pub fn downscale(rgba: &[u8], src_w: u32, src_h: u32, width: u32) -> Rgb {
     let width = width.clamp(1, src_w.max(1));
-    let height = ((src_h as u64 * width as u64 + src_w as u64 / 2) / src_w.max(1) as u64)
-        .max(1) as u32;
+    let height =
+        ((src_h as u64 * width as u64 + src_w as u64 / 2) / src_w.max(1) as u64).max(1) as u32;
     let mut data = Vec::with_capacity((width * height * 3) as usize);
     for y in 0..height {
         let y0 = (y as u64 * src_h as u64 / height as u64) as u32;
@@ -98,7 +98,9 @@ pub fn cjxl_path() -> Option<PathBuf> {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
     {
         let path = dir.join(exe);
         if path.is_file() {
@@ -126,7 +128,13 @@ pub fn encode_cjxl(cjxl: &Path, picture: &Rgb, distance: f32) -> Option<Vec<u8>>
     let status = std::process::Command::new(cjxl)
         .arg(&input)
         .arg(&output)
-        .args(["--modular=1", "--progressive", "--container=0", "--effort=7", "--quiet"])
+        .args([
+            "--modular=1",
+            "--progressive",
+            "--container=0",
+            "--effort=7",
+            "--quiet",
+        ])
         .arg(format!("--distance={distance:.3}"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -140,4 +148,3 @@ pub fn encode_cjxl(cjxl: &Path, picture: &Rgb, distance: f32) -> Option<Vec<u8>>
     let _ = std::fs::remove_file(&output);
     bytes
 }
-

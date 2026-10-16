@@ -58,7 +58,7 @@ switch ($Access) {
     'attended' { $flags += '--attended' }
 }
 $flags += @('--payload', $here)
-$out = & $setup @args 2>&1 | Out-String
+$out = & $setup @flags 2>&1 | Out-String
 $code = $LASTEXITCODE
 Log "etherquic-setup $($flags -join ' ') exit ${code}: $out"
 exit $code

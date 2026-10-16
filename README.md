@@ -9,6 +9,7 @@ QUIC over Ethernet. Quinn sees datagrams, an opaque peer, and a max payload. It 
 | QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule, `rustls-pure`, pin `a201190` |
 | TLS | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule, pin `9cba6e9` (AES-128-GCM for QUIC) |
 | PyroWave on Direct3D 11 | [Lyamc/pyrowave-dx11](https://github.com/Lyamc/pyrowave-dx11) submodule `vendor/pyrowave-dx11`, tag `v0.1.0`. Windows loads `pyrowave_d3d11.dll` when Vulkan is missing or only a CPU device answered |
+| Windows codecs | Submodules built into the MSI by `packaging/windows/build-codecs.ps1`: [xiph/opus](https://github.com/xiph/opus) `v1.6.1`, [Themaister/pyrowave](https://github.com/Themaister/pyrowave) `a0d2e71` with [Granite](https://github.com/Themaister/Granite) `fb178c8`, and [libjxl](https://github.com/libjxl/libjxl) `v0.12.0` (`cjxl`). Lavapipe is the pinned [mesa-dist-win](https://github.com/pal1000/mesa-dist-win) `26.2.4` release; the `vulkan-1.dll` shim is compiled from this tree |
 | L2, first choice | NDIS filter `membrane_ndis`, device `\\.\MembraneNdis`. [Install](docs/windows-membrane-ndis.md) |
 | L2, fallback | libpcap / Npcap (`src/pcap_link.rs`) when that device is not open |
 | Tests | in-memory `Fabric` |
@@ -17,19 +18,19 @@ EtherType `0x88B6`. A frame carries destination service, source service, and pay
 
 ## Clone
 
-The QUIC, TLS, and Direct3D 11 PyroWave trees are submodules. Relative URLs (`../quinn.git`, `../rustls-rustcrypto.git`, `../pyrowave-dx11.git`) follow the clone's protocol. Initialize them before `nix-build`.
+The QUIC, TLS, and Direct3D 11 PyroWave trees are submodules. Relative URLs (`../quinn.git`, `../rustls-rustcrypto.git`, `../pyrowave-dx11.git`) follow the clone's protocol. Opus, PyroWave, Granite, and libjxl are upstream submodules used by the Windows installer. Initialize them before `nix-build` or `build-msi.ps1`.
 
 ```bash
 git clone --recurse-submodules git@github.com:Lyamc/etherquic.git
-git submodule update --init
+git submodule update --init --recursive
 ```
 
 ## Send a file
 
 ```bash
 cargo build --release --manifest-path video/Cargo.toml
-sudo setcap cap_net_raw,cap_net_admin=ep ./video/target/release/etherquic-video-send
-./video/target/release/etherquic-video-send \
+sudo setcap cap_net_raw,cap_net_admin=ep ./target/release/etherquic-video-send
+./target/release/etherquic-video-send \
   --nic IFACE --local-mac SENDER_MAC --peer-mac PEER_MAC --file video.mp4
 ```
 
@@ -67,7 +68,9 @@ cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- host --nic IFA
 cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- connect --nic IFACE --peer-mac 02:00:00:00:00:01
 ```
 
-`etherquic` is the window: `host` and `connect`. The `ui` feature is the GPUI front end. Host and Connect run the live desktop from `etherquic-play`: the picture, the audio, and keyboard, mouse, and gamepad.
+`cargo test` runs the root `etherquic` package. `cargo test --workspace` runs every member. Builds share `target/` at the repo root.
+
+`etherquic` is the window: `host` and `connect`. The `ui` feature is the GPUI front end. Host and Connect call the play library inside `etherquic.exe`: the picture, the audio, and keyboard, mouse, and gamepad.
 
 ## Capture
 
@@ -77,13 +80,30 @@ Preferences has Capture. It writes `ether.pcap` and `app.pcap` under `$XDG_STATE
 
 | Crate | What it does |
 | --- | --- |
-| [`ui`](ui/README.md) | Window. Taskbar button only while hosting. |
-| [`play`](play/README.md) | Desktop, audio, and input on one connection. |
-| [`input`](input/README.md) | Keyboard, mouse, gamepad. Service 4435, priority 20. |
-| [`audio`](audio/README.md) | Opus as LOC objects. Service 4434, priority 10. |
-| [`video`](video/README.md) | One file, one stream. Service 4433, priority 0. |
-| [`container`](container/README.md) | LOC objects. |
+| [`ui`](ui/README.md) | Window. Taskbar button only while hosting. Host and Connect call the play library in this process. |
+| [`play`](play/README.md) | Desktop session: picture, audio, and input on one connection. |
+| [`input`](input/README.md) | Lab tool. Keyboard, mouse, and gamepad file. Service 4435, priority 20. |
+| [`audio`](audio/README.md) | Lab tool. Opus as LOC objects. Service 4434, priority 10. |
+| [`video`](video/README.md) | Lab tool. One file, one stream, raw bytes. Service 4433, priority 0. |
+| [`container`](container/README.md) | LOC objects. The audio lab tool uses them. |
 
-On one connection the higher priority is sent first: input, then audio, then video.
+`input`, `audio`, and `video` are lab tools. They are useful, and they are not the remote-desktop session. On a lab-tool connection the higher priority is sent first: input, then audio, then video. The video tool listens on service 4433, the same service a host uses, so the two contend on a machine that is also hosting.
 
-Why Quinn can stay unaware of Ethernet: [plan.md](plan.md).
+Why Quinn can stay unaware of Ethernet: [plan.md](plan.md). Workspace, lab tools, and the later `--desk` note: [docs/workspace-plan.md](docs/workspace-plan.md).
+
+## Not supported yet
+
+Checked items are in the window or on the live session. The rest are not.
+
+- [x] File transfer
+- [x] Tabbed connections
+- [ ] Automatic fullscreen
+- [ ] Fullscreen on a virtual desktop, the way a Mac space lets you switch
+- [ ] User logins and auth
+- [x] Sending the clipboard
+- [x] Sending clipboard as keystrokes
+- [ ] Connection menus, like Parsec
+- [ ] Performance tuning
+- [x] Chat, with All, Team, and one person or destination
+
+More of this remote-desktop surface is not built yet. The video file tool above sends one stream of one file. A live session can also hand the other peer one named file, which is a different path.

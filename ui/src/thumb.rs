@@ -2,8 +2,8 @@
 //! monitor and input lines for the host picker.
 
 use etherquic::discover::{
-    Capabilities, PadInfo, INPUT_KEYBOARD, INPUT_MOUSE, INPUT_PEN, INPUT_TOUCH, OS_LINUX,
-    OS_MACOS, OS_WINDOWS, PAD_API_DINPUT, PAD_API_EVDEV, PAD_API_WGI, PAD_API_XINPUT,
+    Capabilities, PadInfo, INPUT_KEYBOARD, INPUT_MOUSE, INPUT_PEN, INPUT_TOUCH, OS_ANDROID,
+    OS_LINUX, OS_MACOS, OS_WINDOWS, PAD_API_DINPUT, PAD_API_EVDEV, PAD_API_WGI, PAD_API_XINPUT,
     PAD_KIND_STICK, PAD_KIND_WHEEL, VPAD_UINPUT, VPAD_VIGEM,
 };
 
@@ -31,7 +31,11 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<Thumb> {
         InitializeResult::Initialized(image) => image,
         InitializeResult::NeedMoreData(_) => return None,
     };
-    if image.width() == 0 || image.height() == 0 || image.width() > MAX_SIDE || image.height() > MAX_SIDE {
+    if image.width() == 0
+        || image.height() == 0
+        || image.width() > MAX_SIDE
+        || image.height() > MAX_SIDE
+    {
         return None;
     }
     let complete = image.is_loading_done();
@@ -98,6 +102,7 @@ pub fn caps_details(caps: &Capabilities) -> Vec<String> {
         OS_WINDOWS => "Windows",
         OS_LINUX => "Linux",
         OS_MACOS => "macOS",
+        OS_ANDROID => "Android",
         _ => "",
     };
     let label = if caps.os_label.is_empty() || caps.os_label == os {
@@ -182,7 +187,11 @@ fn pad_line(pad: &PadInfo) -> String {
         PAD_API_EVDEV => "evdev",
         _ => "",
     };
-    let name = if pad.name.is_empty() { kind } else { pad.name.as_str() };
+    let name = if pad.name.is_empty() {
+        kind
+    } else {
+        pad.name.as_str()
+    };
     if api.is_empty() {
         format!("{name} ({kind})")
     } else {
@@ -286,7 +295,10 @@ mod tests {
         assert_eq!(lines[1], "Monitor 1: 2560×1440 @ 144 Hz at 0,0 · primary");
         assert_eq!(lines[2], "Monitor 2: 1920×1080 @ 59.94 Hz at 2560,0");
         assert_eq!(lines[3], "Inputs: keyboard, mouse");
-        assert_eq!(lines[4], "Controller: Xbox Controller (gamepad, Windows.Gaming.Input)");
+        assert_eq!(
+            lines[4],
+            "Controller: Xbox Controller (gamepad, Windows.Gaming.Input)"
+        );
         assert_eq!(lines[5], "Virtual gamepad: ViGEmBus");
     }
 }

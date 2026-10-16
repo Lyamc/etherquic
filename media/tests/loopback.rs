@@ -80,7 +80,8 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
             }
         });
         let options = HostOptions { fps: 30, caps, log: Arc::new(|line: &str| eprintln!("host: {line}")) };
-        let result = host::run(streams, negotiated, slot, pcm_rx, options).await;
+        let (_cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
+        let result = host::run(streams, negotiated, slot, pcm_rx, options, cursor_rx).await;
         let _ = feeder.join();
         result
     });

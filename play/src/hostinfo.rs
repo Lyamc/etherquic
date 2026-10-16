@@ -17,15 +17,13 @@ use std::time::{Duration, Instant};
 
 use etherquic::discover::{
     Capabilities, OfferExtras, PadInfo, INPUT_KEYBOARD, INPUT_MOUSE, INPUT_PEN, INPUT_TOUCH,
-    OS_LINUX, OS_MACOS, OS_WINDOWS, PAD_API_EVDEV, PAD_KIND_GAMEPAD, PAD_KIND_STICK,
-    PAD_KIND_WHEEL,
+    PAD_API_EVDEV, PAD_KIND_GAMEPAD, PAD_KIND_STICK, PAD_KIND_WHEEL,
 };
 
 /// How often the capabilities and the picture are refreshed.
 pub const REFRESH: Duration = Duration::from_secs(30);
 pub use etherquic::thumbnail::{
-    cjxl_path, downscale, encode_cjxl, fit_to_budget, Rgb, DISTANCE_MAX, DISTANCE_MIN,
-    THUMB_WIDTHS,
+    cjxl_path, downscale, encode_cjxl, fit_to_budget, Rgb, DISTANCE_MAX, DISTANCE_MIN, THUMB_WIDTHS,
 };
 
 /// Keyboard, mouse, touch, pen, and joysticks from `/proc/bus/input/devices`.
@@ -132,9 +130,15 @@ pub fn gather_capabilities(pads: Vec<PadInfo>) -> Capabilities {
                             .round()
                             .clamp(0.0, u16::MAX as f32)
                             as u16,
-                        x: monitor.x().unwrap_or(0).clamp(i16::MIN as i32, i16::MAX as i32)
+                        x: monitor
+                            .x()
+                            .unwrap_or(0)
+                            .clamp(i16::MIN as i32, i16::MAX as i32)
                             as i16,
-                        y: monitor.y().unwrap_or(0).clamp(i16::MIN as i32, i16::MAX as i32)
+                        y: monitor
+                            .y()
+                            .unwrap_or(0)
+                            .clamp(i16::MIN as i32, i16::MAX as i32)
                             as i16,
                         primary: monitor.is_primary().unwrap_or(false),
                     })
@@ -165,23 +169,8 @@ pub fn gather_capabilities(pads: Vec<PadInfo>) -> Capabilities {
 }
 
 fn os_identity() -> (u8, String) {
-    if cfg!(windows) {
-        (OS_WINDOWS, "Windows".into())
-    } else if cfg!(target_os = "macos") {
-        (OS_MACOS, "macOS".into())
-    } else if cfg!(target_os = "linux") {
-        let pretty = std::fs::read_to_string("/etc/os-release")
-            .ok()
-            .and_then(|text| {
-                text.lines()
-                    .find_map(|line| line.strip_prefix("PRETTY_NAME="))
-                    .map(|value| value.trim_matches('"').to_string())
-            })
-            .unwrap_or_else(|| "Linux".into());
-        (OS_LINUX, pretty)
-    } else {
-        (0, std::env::consts::OS.into())
-    }
+    let rel = etherquic::discover::local_release();
+    (rel.os, rel.os_label())
 }
 
 fn hostname() -> String {
@@ -336,7 +325,9 @@ fn refresh_loop(extras: &HostExtras, stop: &AtomicBool) {
     // The first refresh then carries the real encoders.
     let _ = etherquic_media::caps::probe();
     let pictures = thumbnails_wanted(
-        std::env::var("ETHERQUIC_DISCOVERY_THUMBNAIL").ok().as_deref(),
+        std::env::var("ETHERQUIC_DISCOVERY_THUMBNAIL")
+            .ok()
+            .as_deref(),
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
     );
     let cjxl = if pictures { cjxl_path() } else { None };

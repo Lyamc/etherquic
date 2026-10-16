@@ -23,24 +23,27 @@ mod session;
 #[cfg(feature = "ui")]
 mod settings;
 mod share;
+mod tabs;
 mod thumb;
 
 #[cfg(feature = "ui")]
 pub use hosts::{
     ago, clean_name, hosts_path, load_hosts, matches_filter, store_hosts, HostAddr, HostBook,
-    HostEntry, Presence, Roster, RosterRow, Sighting, RECENT_CAP,
+    HostEntry, Presence, Roster, RosterRow, Sighting, ThisMachine, RECENT_CAP,
 };
-pub use link::{list_nics, Link, NicChoice};
 #[cfg(feature = "ui")]
 pub use link::{last_session, live_view, set_host_audio_device, CodecOffer};
+pub use link::{list_nics, Link, NicChoice};
 #[cfg(feature = "ui")]
 pub use prefs::{
-    apply_override, codec_choice_for, negotiated_from_status, predicted_pair, Predicted, audio_announce, chosen_audio, chosen_video, move_to_front, audio_for, audio_hint, audio_match_line, backend_hint,
-    backend_label, backend_line, capture_rate, default_audio, default_video, fps_headline,
-    listed_top, load_connections, load_preferences, local_video_line, mac_key, remote_backend_line,
-    remote_hardware_line, resolve_fps, store_connections, store_preferences, swap_earlier,
-    swap_later, top_selection, video_announce, video_hint, video_match_line, Applied,
-    ConnectionOverride, ConnectionPrefs, FrameRate, Preferences, FPS_CHOICES, SOFTWARE_FPS,
+    apply_override, audio_announce, audio_for, audio_hint, audio_match_line, backend_hint,
+    backend_label, backend_line, capture_rate, chosen_audio, chosen_video, codec_choice_for,
+    default_audio, default_video, fps_headline, listed_top, load_connections, load_preferences,
+    local_video_line, mac_key, move_to_front, negotiated_from_status, predicted_pair,
+    remote_backend_line, remote_hardware_line, resolve_fps, store_connections, store_preferences,
+    swap_earlier, swap_later, top_selection, video_announce, video_hint, video_match_line, Applied,
+    ConnectionOverride, ConnectionPrefs, FrameRate, Predicted, Preferences, FPS_CHOICES,
+    SOFTWARE_FPS,
 };
 pub use session::{
     active_layer, dial_target, format_mac, lanes, taskbar_for, DialTarget, HexMac, Lane, Layer,
@@ -53,4 +56,5 @@ pub use settings::{
     Part, Section, Settings,
 };
 pub use share::{qr_grid, this_pc, QrGrid, Share, ShareRow};
+pub use tabs::{ConnectionTab, ConnectionTabs};
 pub use thumb::{caps_details, caps_summary, decode_thumbnail, Thumb};

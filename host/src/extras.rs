@@ -184,9 +184,10 @@ pub fn capabilities(frame: Option<(u32, u32)>) -> Capabilities {
             }]
         })
         .unwrap_or_default();
+    let rel = etherquic::discover::local_release();
     Capabilities {
-        os: OS_WINDOWS,
-        os_label: "Windows".into(),
+        os: rel.os,
+        os_label: rel.os_label(),
         hostname: std::env::var("COMPUTERNAME").unwrap_or_default(),
         nic_mac: None,
         monitors,
@@ -235,7 +236,11 @@ mod tests {
     #[test]
     fn no_frame_yet_means_no_picture_but_caps_still_answer() {
         let stop = Arc::new(AtomicBool::new(false));
-        let extras = HostExtras::start(Arc::new(Mutex::new(None)), [2, 0, 0, 0, 0, 7], Arc::clone(&stop));
+        let extras = HostExtras::start(
+            Arc::new(Mutex::new(None)),
+            [2, 0, 0, 0, 0, 7],
+            Arc::clone(&stop),
+        );
         thread::sleep(Duration::from_millis(400));
         let caps = extras.capabilities().expect("caps");
         assert_eq!(caps.nic_mac, Some([2, 0, 0, 0, 0, 7]));

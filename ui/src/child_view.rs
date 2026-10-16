@@ -16,7 +16,11 @@ use std::time::{Duration, Instant};
 
 use etherquic_play::ViewOptions;
 
-const PLAY_EXE: &str = if cfg!(windows) { "etherquic-play.exe" } else { "etherquic-play" };
+const PLAY_EXE: &str = if cfg!(windows) {
+    "etherquic-play.exe"
+} else {
+    "etherquic-play"
+};
 
 /// Where to dial and how the window behaves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +55,8 @@ pub fn connect_args(c: &ChildConnect) -> Vec<String> {
     }
     let v = &c.view;
     args.extend(["--scale".into(), v.scale.token().into()]);
+    args.extend(["--cursor".into(), v.cursor.token().into()]);
+    args.extend(["--look".into(), v.look.token().into()]);
     if v.size_match.available() {
         args.extend(["--size-match".into(), v.size_match.token().into()]);
     }
@@ -98,13 +104,19 @@ pub fn play_binary() -> Option<PathBuf> {
     find_play(beside, &path_dirs, &dev)
 }
 
-fn find_play(beside: Option<PathBuf>, path_dirs: &[PathBuf], target_dirs: &[PathBuf]) -> Option<PathBuf> {
+fn find_play(
+    beside: Option<PathBuf>,
+    path_dirs: &[PathBuf],
+    target_dirs: &[PathBuf],
+) -> Option<PathBuf> {
     beside
         .into_iter()
         .chain(path_dirs.iter().map(|dir| dir.join(PLAY_EXE)))
-        .chain(target_dirs.iter().flat_map(|dir| {
-            ["release", "debug"].map(|profile| dir.join(profile).join(PLAY_EXE))
-        }))
+        .chain(
+            target_dirs.iter().flat_map(|dir| {
+                ["release", "debug"].map(|profile| dir.join(profile).join(PLAY_EXE))
+            }),
+        )
         .find(|path| path.is_file())
 }
 
@@ -124,7 +136,14 @@ pub fn classify(line: &str) -> Line {
     match line.strip_prefix("etherquic-play: ") {
         Some(rest) => {
             const TRACE: [&str; 9] = [
-                "frame ", "audio ", "playing ", "picture ", "session ", "stats ", "offer ", "decoder ",
+                "frame ",
+                "audio ",
+                "playing ",
+                "picture ",
+                "session ",
+                "stats ",
+                "offer ",
+                "decoder ",
                 "the host does not negotiate",
             ];
             if TRACE.iter().any(|t| rest.starts_with(t)) {
@@ -146,7 +165,11 @@ pub fn exit_error(code: Option<i32>, problem: Option<&str>) -> Option<String> {
             Some(problem) => problem.to_string(),
             None => format!("etherquic-play exited with code {code}"),
         }),
-        None => Some(problem.unwrap_or("etherquic-play was stopped by a signal").to_string()),
+        None => Some(
+            problem
+                .unwrap_or("etherquic-play was stopped by a signal")
+                .to_string(),
+        ),
     }
 }
 
@@ -254,15 +277,26 @@ mod tests {
     #[test]
     fn codec_choice_reaches_the_child() {
         let mut connect = udp();
-        connect.codecs.video = vec![etherquic_play::PicturePref::Pyrowave, etherquic_play::PicturePref::Mjpeg];
+        connect.codecs.video = vec![
+            etherquic_play::PicturePref::Pyrowave,
+            etherquic_play::PicturePref::Mjpeg,
+        ];
         connect.codecs.video_pin = Some(etherquic_play::PicturePref::Pyrowave);
         let args = connect_args(&connect);
         let at = args.iter().position(|a| a == "--video").expect("--video");
         assert_eq!(args[at + 1], "pyrowave,mjpeg");
-        let at = args.iter().position(|a| a == "--video-pin").expect("--video-pin");
+        let at = args
+            .iter()
+            .position(|a| a == "--video-pin")
+            .expect("--video-pin");
         assert_eq!(args[at + 1], "pyrowave");
         assert!(args.ends_with(&["--parent-pipe".to_string()]));
-        assert_eq!(classify("etherquic-play: session video pyrowave encoder pyrowave 1280x720 30 fps 0 kbit/s"), Line::Trace);
+        assert_eq!(
+            classify(
+                "etherquic-play: session video pyrowave encoder pyrowave 1280x720 30 fps 0 kbit/s"
+            ),
+            Line::Trace
+        );
     }
 
     #[test]
@@ -283,27 +317,55 @@ mod tests {
         c.view.scale = ScaleMode::Fill;
         c.view.send_mouse = false;
         c.view.output_device = Some("Speakers".into());
-        c.view.pad_slots = vec![PadSlot { name: "Pad".into(), slot: 2 }];
+        c.view.pad_slots = vec![PadSlot {
+            name: "Pad".into(),
+            slot: 2,
+        }];
         let args = connect_args(&c).join(" ");
-        assert!(args.starts_with("connect --peer-mac 02:00:00:00:00:01 --nic en0 --service-id 4433"));
-        for part in ["--trace-input", "--scale fill", "--no-mouse", "--output-device Speakers", "--pad 2=Pad"] {
+        assert!(
+            args.starts_with("connect --peer-mac 02:00:00:00:00:01 --nic en0 --service-id 4433")
+        );
+        for part in [
+            "--trace-input",
+            "--scale fill",
+            "--cursor native",
+            "--look off",
+            "--no-mouse",
+            "--output-device Speakers",
+            "--pad 2=Pad",
+        ] {
             assert!(args.contains(part), "{part} in {args}");
         }
     }
 
     #[test]
     fn stderr_lines_become_status_or_errors() {
-        assert_eq!(classify("Dialing 192.168.0.58:4434."), Line::Status("Dialing 192.168.0.58:4434.".into()));
-        assert_eq!(classify("etherquic-play: frame 1280x720 jpeg 15026 bytes"), Line::Trace);
-        assert_eq!(classify("etherquic-play: timed out"), Line::Problem("timed out".into()));
+        assert_eq!(
+            classify("Dialing 192.168.0.58:4434."),
+            Line::Status("Dialing 192.168.0.58:4434.".into())
+        );
+        assert_eq!(
+            classify("etherquic-play: frame 1280x720 jpeg 15026 bytes"),
+            Line::Trace
+        );
+        assert_eq!(
+            classify("etherquic-play: timed out"),
+            Line::Problem("timed out".into())
+        );
         assert_eq!(classify("   "), Line::Trace);
     }
 
     #[test]
     fn exit_codes_become_errors() {
         assert_eq!(exit_error(Some(0), Some("ignored")), None);
-        assert_eq!(exit_error(Some(1), Some("timed out")), Some("timed out".into()));
-        assert_eq!(exit_error(Some(3), None), Some("etherquic-play exited with code 3".into()));
+        assert_eq!(
+            exit_error(Some(1), Some("timed out")),
+            Some("timed out".into())
+        );
+        assert_eq!(
+            exit_error(Some(3), None),
+            Some("etherquic-play exited with code 3".into())
+        );
         assert!(exit_error(None, None).is_some());
     }
 

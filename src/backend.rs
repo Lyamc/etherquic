@@ -140,6 +140,22 @@ pub fn pyrowave_ready(vulkan: bool, library: bool) -> bool {
     pyrowave_ready_with(vulkan, library, d3d11_encoder_present())
 }
 
+/// PyroWave encode on a GPU, so the default order treats it as hardware.
+///
+/// On Windows that is `pyrowave_d3d11.dll` plus a hardware feature-level 11_0
+/// device, or an NVIDIA GPU with `libpyrowave-shared`. CPU Vulkan is the
+/// `pyrowave-cpu` row and is not hardware encode.
+pub fn pyrowave_hardware_encode() -> bool {
+    #[cfg(windows)]
+    {
+        d3d11_encoder_present() || (nvidia_present() && pyrowave_library_present())
+    }
+    #[cfg(not(windows))]
+    {
+        gpu_compute_present() && pyrowave_library_present()
+    }
+}
+
 /// `pyrowave_d3d11.dll` next to this program, in the install directory, or
 /// named by `ETHERQUIC_PYROWAVE_D3D11`, and a hardware FL 11_0 device.
 fn d3d11_encoder_present() -> bool {
@@ -183,7 +199,10 @@ fn hardware_feature_level_11() -> bool {
     #[link(name = "kernel32")]
     extern "system" {
         fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
-        fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut core::ffi::c_void,
+            name: *const u8,
+        ) -> *mut core::ffi::c_void;
         fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
     }
     type CreateDevice = unsafe extern "system" fn(
@@ -323,7 +342,7 @@ pub fn offer_from(
     let video = vec![
         row(
             VIDEO_PYROWAVE,
-            false,
+            pyrowave_hardware_encode(),
             false,
             false,
             pyrowave_ready(gpu, pyrowave_library_present()),

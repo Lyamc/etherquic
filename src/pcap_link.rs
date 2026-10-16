@@ -66,6 +66,26 @@ pub fn interface_info(want: Option<&str>) -> Result<InterfaceInfo> {
     })
 }
 
+/// Every usable address Npcap or libpcap lists, on every adapter.
+/// Empty when the devices cannot be listed.
+pub fn local_ips() -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+    let Ok(devs) = pcap::Device::list() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for dev in devs {
+        for address in &dev.addresses {
+            match address.addr {
+                IpAddr::V4(ip) if usable_v4(ip) && !ipv4.contains(&ip) => ipv4.push(ip),
+                IpAddr::V6(ip) if usable_v6(ip) && !ipv6.contains(&ip) => ipv6.push(ip),
+                _ => {}
+            }
+        }
+    }
+    (ipv4, ipv6)
+}
+
 fn choose_device(devs: Vec<pcap::Device>, want: Option<&str>) -> Result<pcap::Device> {
     if let Some(want) = want {
         return devs
@@ -134,7 +154,10 @@ pub fn read_hw_mac(name: &str) -> Option<Mac> {
     }
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("/sbin/ifconfig").arg(name).output().ok()?;
+        let out = std::process::Command::new("/sbin/ifconfig")
+            .arg(name)
+            .output()
+            .ok()?;
         ifconfig_ether(&String::from_utf8_lossy(&out.stdout))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
@@ -148,7 +171,9 @@ pub fn read_hw_mac(name: &str) -> Option<Mac> {
 pub fn ifconfig_ether(text: &str) -> Option<Mac> {
     text.lines().find_map(|line| {
         let mut words = line.split_whitespace();
-        (words.next() == Some("ether")).then(|| words.next().and_then(parse_mac)).flatten()
+        (words.next() == Some("ether"))
+            .then(|| words.next().and_then(parse_mac))
+            .flatten()
     })
 }
 
@@ -268,7 +293,13 @@ mod tests {
                     \toptions=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>\n\
                     \tether 3a:13:6f:4b:73:53\n\
                     \tinet 192.168.0.30 netmask 0xffffff00 broadcast 192.168.0.255\n";
-        assert_eq!(ifconfig_ether(text), Some([0x3a, 0x13, 0x6f, 0x4b, 0x73, 0x53]));
-        assert_eq!(ifconfig_ether("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n"), None);
+        assert_eq!(
+            ifconfig_ether(text),
+            Some([0x3a, 0x13, 0x6f, 0x4b, 0x73, 0x53])
+        );
+        assert_eq!(
+            ifconfig_ether("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n"),
+            None
+        );
     }
 }

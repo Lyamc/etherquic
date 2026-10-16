@@ -6,11 +6,15 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use etherquic::{udp_client_endpoint_on, udp_server_endpoint, L2Net, ETHERTYPE_QUIC};
 use etherquic_input::{Axes, Body, Buttons, Event, KeySource, PAD_SOUTH, PAD_UP};
-use etherquic_play::{decode_jpeg, encode_jpeg, fit_rgba, play, serve, AudioChunk};
+use etherquic_play::etherquic_media::host::FrameSlot;
+use etherquic_play::etherquic_media::negotiate::{Audio, Limit, Offer, Video};
+use etherquic_play::etherquic_media::{Frame, Sink};
+use etherquic_play::{fit_rgba, play, serve, AudioChunk, HostMedia, PlayerMedia};
 use quinn::Endpoint;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -91,7 +95,11 @@ async fn exchange(
         px
     };
     let picture = fit_rgba(&rgba, 4, 4, 1280)?;
-    let jpeg = encode_jpeg(&picture, 80)?;
+    let frame = Frame {
+        width: picture.width,
+        height: picture.height,
+        rgb: picture.rgb,
+    };
     let tone = AudioChunk {
         sample_rate: 8_000,
         channels: 1,
@@ -132,26 +140,53 @@ async fn exchange(
         },
     };
 
-    let (video_tx, video_rx) = mpsc::channel(1);
+    let frames = FrameSlot::new();
+    let host_frames = frames.clone();
     let (audio_tx, audio_rx) = mpsc::channel(1);
     let (input_tx, mut input_rx) = mpsc::channel(1);
-    let (got_video_tx, mut got_video_rx) = mpsc::channel(1);
-    let (got_audio_tx, mut got_audio_rx) = mpsc::channel(1);
     let (player_tx, player_rx) = mpsc::channel(1);
+    let (heard_tx, mut heard_rx) = mpsc::channel(1);
+    let (shown_tx, shown_rx) = std::sync::mpsc::channel();
 
     let host = tokio::spawn(async move {
         let incoming = server.accept().await.ok_or("no player")?;
         let conn = incoming.await?;
-        serve(conn, video_rx, audio_rx, input_tx, None).await?;
+        let media = HostMedia {
+            frames: host_frames,
+            audio: audio_rx,
+            fps: 10,
+            log: Arc::new(|_: &str| {}),
+            cursor: tokio::sync::watch::channel(None).1,
+        };
+        serve(conn, media, input_tx, None).await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     });
     let player = tokio::spawn(async move {
         let conn = client.connect(server_addr, "localhost")?.await?;
-        play(conn, got_video_tx, got_audio_tx, player_rx, None).await?;
+        let sink: Sink<Frame> = Arc::new(move |frame| shown_tx.send(frame).is_ok());
+        let (events, keep) = mpsc::unbounded_channel();
+        // The session reports codec events here. This test only checks the picture.
+        std::mem::forget(keep);
+        let media = PlayerMedia {
+            offer: Offer {
+                version: 1,
+                video: vec![Video::Mjpeg],
+                audio: vec![Audio::Pcm],
+                max: Limit::NONE,
+                bitrate_kbps: 0,
+                failed: Vec::new(),
+                knows_pyrowave_cpu: true,
+                look: etherquic::look::Look::Off,
+            },
+            frames: sink,
+            events,
+            look: tokio::sync::watch::channel(etherquic::look::Look::Off).1,
+        };
+        play(conn, media, heard_tx, player_rx, None).await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     });
 
-    video_tx.send(jpeg.clone()).await?;
+    frames.put(frame.clone());
     audio_tx.send(tone.clone()).await?;
     player_tx
         .send(vec![key.clone(), pointer.clone(), pad.clone()])
@@ -160,13 +195,17 @@ async fn exchange(
     let got_events = timeout(Duration::from_secs(10), input_rx.recv())
         .await?
         .ok_or("host got no input")?;
-    let got_jpeg = timeout(Duration::from_secs(10), got_video_rx.recv())
-        .await?
-        .ok_or("player got no picture")?;
-    let got_tone = timeout(Duration::from_secs(10), got_audio_rx.recv())
+    let shown = timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || shown_rx.recv()),
+    )
+    .await?
+    .map_err(|error| error.to_string())?
+    .map_err(|_| "player got no picture")?;
+    let got_tone = timeout(Duration::from_secs(10), heard_rx.recv())
         .await?
         .ok_or("player got no audio")?;
-    drop(video_tx);
+    frames.close();
     drop(audio_tx);
     drop(player_tx);
 
@@ -174,10 +213,9 @@ async fn exchange(
     assert_eq!(got_tone.sample_rate, tone.sample_rate);
     assert_eq!(got_tone.channels, tone.channels);
     assert_eq!(got_tone.pcm, tone.pcm);
-    assert_eq!(got_jpeg, jpeg);
-    let shown = decode_jpeg(&got_jpeg)?;
-    assert_eq!(shown.width, picture.width);
-    assert_eq!(shown.height, picture.height);
+    assert_eq!(shown.width, frame.width);
+    assert_eq!(shown.height, frame.height);
+    assert!(shown.rgb[0] > shown.rgb[1] && shown.rgb[0] > shown.rgb[2]);
 
     timeout(Duration::from_secs(10), host)
         .await??

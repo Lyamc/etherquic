@@ -50,7 +50,11 @@ impl CodecChoice {
             &self.audio_rows(),
             self.video_pin.map(video_row),
             self.audio_pin.map(audio_row),
-            Limit { width: self.max_width, height: 0, fps: 0 },
+            Limit {
+                width: self.max_width,
+                height: 0,
+                fps: 0,
+            },
             self.bitrate_kbps,
         )
     }
@@ -83,11 +87,15 @@ impl CodecChoice {
 
     /// Parse the comma lists [`CodecChoice::args`] writes. Unknown tokens are skipped.
     pub fn parse_video(list: &str) -> Vec<PicturePref> {
-        list.split(',').filter_map(|t| PicturePref::from_token(t.trim())).collect()
+        list.split(',')
+            .filter_map(|t| PicturePref::from_token(t.trim()))
+            .collect()
     }
 
     pub fn parse_audio(list: &str) -> Vec<AudioId> {
-        list.split(',').filter_map(|t| AudioId::from_token(t.trim())).collect()
+        list.split(',')
+            .filter_map(|t| AudioId::from_token(t.trim()))
+            .collect()
     }
 }
 
@@ -103,7 +111,13 @@ pub struct SessionLine {
 
 impl SessionLine {
     pub fn new(peer: String, negotiates: bool) -> SessionLine {
-        SessionLine { peer, negotiates, video: None, audio: None, stats: None }
+        SessionLine {
+            peer,
+            negotiates,
+            video: None,
+            audio: None,
+            stats: None,
+        }
     }
 
     /// Record an event. True when the status line should be redrawn.
@@ -113,6 +127,7 @@ impl SessionLine {
             PlayerEvent::Audio(config) => self.audio = Some(config.clone()),
             PlayerEvent::Stats(stats) => self.stats = Some(stats.clone()),
             PlayerEvent::VideoFailed { .. } | PlayerEvent::AudioFailed { .. } => {}
+            PlayerEvent::Cursor(_) => return false,
         }
         true
     }
@@ -121,7 +136,10 @@ impl SessionLine {
         match &self.video {
             Some(config) => {
                 let name = config.video.map(Video::name).unwrap_or("?");
-                format!("{name} {}x{} ({})", config.width, config.height, config.encoder)
+                format!(
+                    "{name} {}x{} ({})",
+                    config.width, config.height, config.encoder
+                )
             }
             None if !self.negotiates => "MJPEG".into(),
             None => "video starting".into(),
@@ -151,12 +169,27 @@ impl SessionLine {
     }
 
     pub fn text(&self) -> String {
-        let legacy = if self.negotiates { "" } else { " (the host does not negotiate codecs)" };
-        format!("Viewing {} · {} · {}{}{legacy}.", self.peer, self.video_name(), self.audio_name(), self.rate())
+        let legacy = if self.negotiates {
+            ""
+        } else {
+            " (the host does not negotiate codecs)"
+        };
+        format!(
+            "Viewing {} · {} · {}{}{legacy}.",
+            self.peer,
+            self.video_name(),
+            self.audio_name(),
+            self.rate()
+        )
     }
 
     pub fn short(&self) -> String {
-        format!("{} · {}{}", self.video_name(), self.audio_name(), self.rate())
+        format!(
+            "{} · {}{}",
+            self.video_name(),
+            self.audio_name(),
+            self.rate()
+        )
     }
 
     /// A stderr line for logs and test scripts.
@@ -170,7 +203,11 @@ impl SessionLine {
                 config.height,
                 config.fps,
                 config.bitrate_kbps,
-                if config.reason.is_empty() { String::new() } else { format!(" ({})", config.reason) }
+                if config.reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", config.reason)
+                }
             )),
             PlayerEvent::Audio(config) => Some(format!(
                 "session audio {} encoder {} {} Hz {} ch",
@@ -187,8 +224,13 @@ impl SessionLine {
                 stats.fps,
                 stats.video_mbps
             )),
-            PlayerEvent::VideoFailed { video, reason } => Some(format!("decoder {} failed: {reason}", video.token())),
-            PlayerEvent::AudioFailed { audio, reason } => Some(format!("audio decoder {} failed: {reason}", audio.token())),
+            PlayerEvent::VideoFailed { video, reason } => {
+                Some(format!("decoder {} failed: {reason}", video.token()))
+            }
+            PlayerEvent::AudioFailed { audio, reason } => {
+                Some(format!("audio decoder {} failed: {reason}", audio.token()))
+            }
+            PlayerEvent::Cursor(_) => None,
         }
     }
 }

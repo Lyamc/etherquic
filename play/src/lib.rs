@@ -12,24 +12,45 @@
 
 mod ack;
 mod capture;
+mod chat;
+mod clipboard;
 mod codec;
-pub mod negotiated;
+mod desk_io;
 pub mod hostinfo;
+mod keystrokes;
+pub mod negotiated;
 mod outbox;
 mod pad;
 mod picture;
+mod picture_hub;
+mod pipes;
 mod pointer;
 mod session;
 mod svc;
+mod transfer;
 pub mod view_options;
 mod wire;
 
 pub use capture::{desktop_audio, DesktopAudio};
+pub use chat::{submit_chat, Audience, ChatMessage, Participant, Routed};
+pub use clipboard::{
+    request_text_paste, submit_clipboard, take_text_paste_requests, text_paste, text_paste_watched,
+    watch_text_paste, TextPaste,
+};
 pub use codec::{
     catalog, choose_audio, choose_codec, codec_name, recommend, this_audio, this_computer, AudioId,
     AudioMachine, AudioSkip, CodecId, CodecInfo, CodecSkip, CodecSupport, EndSupport,
     MachineCodecs, PicturePref,
 };
+pub use desk_io::{
+    queue_chat, queue_clipboard, queue_file, send_text_paste, set_desk_roster, take_host_mail,
+    take_player_mail, DeskMail, NoteSide,
+};
+pub use etherquic::look::Look;
+pub use etherquic_media;
+pub use keystrokes::{focus_sends_keyboard, keystroke_events, paste_chord, submit_keystrokes};
+pub use negotiated::{CodecChoice, SessionLine};
+pub use outbox::Gate;
 pub use pad::{
     gamepad_event, pad_report, set_dpad, set_pad_axis, set_pad_button, xinput_buttons,
     xinput_stick_y, PadAxis, PadButton, PadReport,
@@ -38,14 +59,19 @@ pub use picture::{
     blit_rgb, decode_jpeg, decode_picture, encode_jpeg, encode_picture, fit_rgba, Picture,
     PictureCodec,
 };
+pub use picture_hub::{
+    close_picture, hold_picture, open_picture, shown_picture, switch_picture, PictureSeat,
+};
+pub use pipes::Pipes;
 pub use pointer::{ei_absolute, place_pointer, wayland_wheel, PointerPlace};
-pub use session::{play, resample, serve, AudioChunk, HostMedia, PlayerMedia};
-pub use etherquic_media;
-pub use negotiated::{CodecChoice, SessionLine};
+pub use session::{
+    play, play_session, resample, serve, serve_session, AudioChunk, HostMedia, PlayerMedia,
+};
 pub use svc::{drop_jitter_enhancement, SvcLayer};
+pub use transfer::{submit_file, NamedFile};
 pub use view_options::{
-    live, place, slot_for, snapshot, to_remote, LiveView, PadSlot, Placement, ScaleMode, SizeMatch,
-    ViewOptions, PAD_SLOTS,
+    live, place, slot_for, snapshot, to_remote, CursorMode, LiveView, PadSlot, Placement,
+    ScaleMode, SizeMatch, ViewOptions, PAD_SLOTS,
 };
 pub use wire::{AUDIO_MAGIC, INPUT_MAGIC, VIDEO_MAGIC};
 
@@ -99,7 +125,11 @@ mod seat_ei;
 mod seat_wl;
 
 #[cfg(feature = "desktop")]
-pub use client_desk::{connect_view, ConnectSession};
+pub use client_desk::{
+    connect_view, queue_keystroke_string, queue_window_keystrokes, ConnectSession,
+};
+#[cfg(feature = "desktop")]
+pub use host_desk::set_input_recorder;
 #[cfg(feature = "desktop")]
 pub use host_desk::{audio_devices, display_hz, host_desktop, HostSession};
 

@@ -45,7 +45,11 @@ pub const UDP_PORT_TRIES: u16 = 16;
 
 fn std_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
@@ -99,7 +103,12 @@ pub fn udp_listeners(port: u16, cert_pem: &Path, key_pem: &Path) -> UdpListeners
         } else {
             format!("{families} on {candidate}: another program uses UDP {port}.")
         };
-        return UdpListeners { v4, v6, port: candidate, note };
+        return UdpListeners {
+            v4,
+            v6,
+            port: candidate,
+            note,
+        };
     }
     let why = if taken { "is in use" } else { "did not open" };
     eprintln!("etherquic: udp {port}: {last_error}");
@@ -252,7 +261,11 @@ mod tests {
         assert_ne!(announced, port);
         let listeners = udp_listeners(port, &cert, &key);
         assert_eq!(listeners.port, announced, "{}", listeners.note);
-        assert!(listeners.note.contains("another program"), "{}", listeners.note);
+        assert!(
+            listeners.note.contains("another program"),
+            "{}",
+            listeners.note
+        );
         let server = listeners.v4.as_ref().expect("IPv4 listener");
         let alpn = handshake(listeners.port, server).await.unwrap();
         assert_eq!(alpn, crate::negotiate::ALPN_NEGOTIATE);
@@ -266,7 +279,10 @@ mod tests {
         let listeners = udp_listeners(port, &cert, &key);
         assert_eq!(listeners.port, port, "{}", listeners.note);
         let server = listeners.v4.as_ref().expect("IPv4 listener");
-        assert_eq!(handshake(port, server).await.unwrap(), crate::negotiate::ALPN_NEGOTIATE);
+        assert_eq!(
+            handshake(port, server).await.unwrap(),
+            crate::negotiate::ALPN_NEGOTIATE
+        );
     }
 
     /// A player built before negotiation lists only `etherquic`. The new
@@ -279,9 +295,8 @@ mod tests {
         let server = listeners.v4.as_ref().expect("IPv4 listener");
         let mut rustls_client = tls::load_client_config(true).unwrap();
         rustls_client.alpn_protocols = vec![tls::ALPN_ETHERQUIC.to_vec()];
-        let client_config = ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(rustls_client).unwrap(),
-        ));
+        let client_config =
+            ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_client).unwrap()));
         let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let dial = client
             .connect_with(

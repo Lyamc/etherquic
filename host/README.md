@@ -1,6 +1,6 @@
 # etherquic-host
 
-Headless host for one player, or a client that connects to one. It does not capture the screen, encode video, or inject input. Session 0 has no desktop, so the service is not the GPUI console.
+Headless host for one player, or a client that connects to one. The service process does not capture the screen, encode video, or inject input. Session 0 has no desktop, so the service is not the GPUI console. `--desk` is the console-session helper that captures, encodes, and injects. That helper keeps its own path, separate from the play session inside `etherquic.exe`.
 
 ```powershell
 etherquic-host.exe --client --peer 02:11:22:33:44:55
@@ -11,7 +11,7 @@ etherquic-host.exe --console
 
 `--client` connects out and holds the session until Ctrl+C or the host closes it. It does not install a service. Its local MAC is a second locally administered address derived from the machine id, so it does not collide with the host service on the same PC. `--nic` and `--service` override the adapter and the service id (default 4433).
 
-The Windows service `etherquic-service` (LocalSystem, delayed auto-start) listens on service **4433**. The service manager starts the exe with no arguments.
+The Windows service `etherquic-service` (LocalSystem, delayed auto-start) listens on service **4433**. On UDP it binds that port, or the next free one when another program holds 4433, up to 16 ports later. When only 4433 is taken, the announced port is 4434. 4434 is also the audio lab tool's service. The service manager starts the exe with no arguments.
 
 | `host.conf` `unattended` | Incoming player |
 |--------------------------|-----------------|

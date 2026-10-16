@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -24,14 +24,50 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::ack::TraceClock;
+use crate::desk_io::{self, NoteSide};
 use crate::outbox::Gate;
+use crate::picture_hub::{self, PictureSeat};
 use crate::{
-    blit_rgb, format_mac, play, resample, session_end_status, AudioChunk, Picture,
-    Status,
+    blit_rgb, format_mac, play_session, resample, session_end_status, AudioChunk, Picture, Status,
 };
+
+/// Keystroke strings waiting for the picture window. Drained on the window
+/// thread. Sending does not require the window to be focused.
+static PENDING_KEYSTROKES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Queue a string of keys for the open picture window.
+///
+/// The focused keyboard path still drops keys while the window is in the
+/// background. This queue does not.
+pub fn queue_keystroke_string(text: &str) {
+    if let Some(id) = picture_hub::shown_picture() {
+        if desk_io::send_keys(id, text) {
+            return;
+        }
+    }
+    if let Ok(mut queue) = PENDING_KEYSTROKES.lock() {
+        queue.push(text.to_string());
+    }
+}
+
+/// Queue keystrokes for the window thread, which releases held modifiers first.
+///
+/// False when no picture is on screen, and nothing is queued.
+pub fn queue_window_keystrokes(text: &str) -> bool {
+    if text.is_empty() || picture_hub::shown_picture().is_none() {
+        return false;
+    }
+    if let Ok(mut queue) = PENDING_KEYSTROKES.lock() {
+        queue.push(text.to_string());
+    } else {
+        return false;
+    }
+    picture_hub::wake_picture();
+    true
+}
 
 /// What `connect` dials. The NIC is already open when `udp` is absent.
 pub struct ConnectSession {
@@ -46,6 +82,9 @@ pub struct ConnectSession {
     pub view: crate::LiveView,
     /// Codec order, pins and limits for the offer.
     pub codecs: crate::CodecChoice,
+    /// Set to this session's picture id before the view blocks.
+    /// The window uses it to switch which desktop is on screen.
+    pub picture: Arc<AtomicU64>,
 }
 
 /// Wayland only allows a winit loop on the main thread unless the builder opts in.
@@ -78,44 +117,59 @@ struct ViewRequest {
     view: crate::LiveView,
     stamps: Arc<Mutex<HashMap<u64, Instant>>>,
     title: Arc<Mutex<String>>,
+    cursor: Arc<Mutex<etherquic::cursor::CursorView>>,
     proxy: std::sync::mpsc::Sender<Result<EventLoopProxy<()>, String>>,
     done: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn window_sender() -> Result<std::sync::mpsc::Sender<ViewRequest>, String> {
-    static SLOT: OnceLock<std::sync::mpsc::Sender<ViewRequest>> = OnceLock::new();
-    static INIT: Mutex<()> = Mutex::new(());
-    if let Some(sender) = SLOT.get() {
-        return Ok(sender.clone());
-    }
-    let _guard = INIT.lock().unwrap_or_else(|poison| poison.into_inner());
-    if let Some(sender) = SLOT.get() {
-        return Ok(sender.clone());
-    }
-    let (sender, receiver) = std::sync::mpsc::channel();
-    thread::Builder::new()
-        .name("etherquic-play-window".into())
-        .spawn(move || window_thread(receiver))
-        .map_err(|err| err.to_string())?;
-    let _ = SLOT.set(sender.clone());
-    Ok(sender)
+static WINDOW_PROXY: Mutex<Option<EventLoopProxy<()>>> = Mutex::new(None);
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn window_proxy() -> Option<EventLoopProxy<()>> {
+    WINDOW_PROXY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn window_thread(receiver: std::sync::mpsc::Receiver<ViewRequest>) {
+fn ensure_window_thread() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = thread::Builder::new()
+            .name("etherquic-play-window".into())
+            .spawn(window_thread);
+    });
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn window_thread() {
     let mut event_loop = match player_event_loop() {
         Ok(event_loop) => event_loop,
         Err(err) => {
-            let message = err.to_string();
-            while let Ok(request) = receiver.recv() {
-                let _ = request.proxy.send(Err(message.clone()));
-            }
+            eprintln!("etherquic-play: picture window: {err}");
             return;
         }
     };
-    while let Ok(request) = receiver.recv() {
-        run_view(&mut event_loop, request);
+    let proxy = event_loop.create_proxy();
+    {
+        let wake = proxy.clone();
+        picture_hub::set_picture_waker(Box::new(move || {
+            let _ = wake.send_event(());
+        }));
+        *WINDOW_PROXY
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(proxy);
+    }
+    loop {
+        picture_hub::wait_for_picture();
+        let mut app = App::for_hub();
+        if !app.bind_shown() {
+            continue;
+        }
+        let _ = event_loop.run_app_on_demand(&mut app);
+        app.drop_window();
     }
 }
 
@@ -142,12 +196,21 @@ fn run_view(event_loop: &mut EventLoop<()>, request: ViewRequest) {
             opened: Instant::now(),
             stamps: request.stamps,
             title: request.title,
+            remote_cursor: request.cursor,
+            cursor_mode: crate::CursorMode::Native,
+            cursor_seq: 0,
+            cursor_visible: true,
+            cursor_icon: None,
+            cursor_image: 0,
             shortcuts: None,
             modifiers: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             letterbox: crate::place(crate::ScaleMode::Fit, 0, 0, 1, 1),
             view: request.view,
             fitted: (0, 0),
+            hub: false,
+            bound_id: 0,
+            phase: Phase::Idle,
         };
         let result = event_loop
             .run_app_on_demand(&mut app)
@@ -197,7 +260,9 @@ async fn wake_window(
     stop: Arc<AtomicBool>,
     pads_stop: Arc<AtomicBool>,
     title: Arc<Mutex<String>>,
+    cursor: Arc<Mutex<etherquic::cursor::CursorView>>,
 ) {
+    let mut seen = 0u64;
     loop {
         tokio::time::sleep(Duration::from_millis(30)).await;
         if stop.load(Ordering::SeqCst) {
@@ -207,7 +272,9 @@ async fn wake_window(
         }
         let ready = frames.lock().map(|slot| slot.is_some()).unwrap_or(false);
         let titled = title.lock().map(|slot| !slot.is_empty()).unwrap_or(false);
-        if ready || titled {
+        let seq = cursor.lock().map(|slot| slot.seq).unwrap_or(seen);
+        if ready || titled || seq != seen {
+            seen = seq;
             let _ = proxy.send_event(());
         }
     }
@@ -238,6 +305,7 @@ pub fn connect_view(
         .enable_all()
         .build()?;
     let frames = Arc::new(Mutex::new(None::<Picture>));
+    let cursors = etherquic::cursor::share();
     let (audio_tx, audio_rx) = std::sync::mpsc::channel::<AudioChunk>();
     let playback = thread::Builder::new()
         .name("etherquic-play-playback".into())
@@ -246,7 +314,8 @@ pub fn connect_view(
             move || play_audio(audio_rx, output)
         })?;
     // One slot. The gate keeps the latest pointer and every key, and keys leave first.
-    let (input_tx, input_rx) = mpsc::channel::<Vec<Event>>(1);
+    let (input_tx, input_rx) = mpsc::channel::<Vec<Event>>(32);
+    let key_input = input_tx.clone();
     let gate = Arc::new(Gate::new());
     let forward_gate = Arc::clone(&gate);
     rt.spawn(async move {
@@ -295,6 +364,7 @@ pub fn connect_view(
         .name("etherquic-play-gamepad".into())
         .spawn(move || crate::player_pad::run(pad_input, pad_flag, pad_view))?;
     let net_frames = frames.clone();
+    let net_cursors = Arc::clone(&cursors);
     let dial_stop = Arc::clone(&stop);
     let dial_status = Arc::clone(&status);
     let trace_input = connect.trace_input;
@@ -302,6 +372,39 @@ pub fn connect_view(
     let title = Arc::new(Mutex::new(String::new()));
     let dial_stamps = Arc::clone(&stamps);
     let dial_title = Arc::clone(&title);
+    #[cfg(not(target_os = "macos"))]
+    let picture_id = {
+        let id = picture_hub::open_picture(
+            "player",
+            PictureSeat {
+                id: 0,
+                frames: Arc::clone(&frames),
+                input: Arc::clone(&gate),
+                stop: Arc::clone(&stop),
+                trace: trace_input,
+                view: Arc::clone(&window_view),
+                stamps: Arc::clone(&stamps),
+                title: Arc::clone(&title),
+                cursor: Arc::clone(&cursors),
+            },
+        );
+        connect.picture.store(id, Ordering::SeqCst);
+        let (key_tx, mut key_rx) = mpsc::unbounded_channel::<String>();
+        desk_io::attach_keys(id, key_tx);
+        rt.spawn(async move {
+            while let Some(text) = key_rx.recv().await {
+                if crate::submit_keystrokes(&key_input, &text).await.is_err() {
+                    break;
+                }
+            }
+        });
+        id
+    };
+    #[cfg(target_os = "macos")]
+    let picture_id = {
+        let _ = key_input;
+        0u64
+    };
     rt.spawn(async move {
         if let Err(error) = connect_player(
             net,
@@ -313,6 +416,8 @@ pub fn connect_view(
             dial_status,
             dial_stamps,
             dial_title,
+            picture_id,
+            net_cursors,
         )
         .await
         {
@@ -330,6 +435,7 @@ pub fn connect_view(
         view: window_view,
         stamps: Arc::clone(&stamps),
         title: Arc::clone(&title),
+        cursor: Arc::clone(&cursors),
         proxy: proxy_tx,
         done: done_tx,
     };
@@ -337,6 +443,7 @@ pub fn connect_view(
     let wake_stop = Arc::clone(&stop);
     let wake_pads = Arc::clone(&pads_stop);
     let wake_title = Arc::clone(&title);
+    let wake_cursors = Arc::clone(&cursors);
     #[cfg(target_os = "macos")]
     {
         // The window runs on this thread, so the waker picks up the proxy itself.
@@ -345,27 +452,56 @@ pub fn connect_view(
                 Ok(Ok(Ok(proxy))) => proxy,
                 _ => return,
             };
-            wake_window(proxy, wake_frames, wake_stop, wake_pads, wake_title).await;
+            wake_window(
+                proxy,
+                wake_frames,
+                wake_stop,
+                wake_pads,
+                wake_title,
+                Arc::clone(&wake_cursors),
+            )
+            .await;
         });
         run_view_here(request);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        window_sender()
-            .map_err(view_error)?
-            .send(request)
-            .map_err(|_| view_error("the picture window stopped"))?;
-        let proxy = proxy_rx
+        // The picture window rebinds to whichever seat is shown. This session
+        // waits on its own seat, so closing it does not join the window thread
+        // while another desktop is on screen.
+        let _ = (request, proxy_rx, done_rx);
+        ensure_window_thread();
+        let picture_stop = Arc::clone(&stop);
+        rt.spawn(async move {
+            let proxy = loop {
+                if picture_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(proxy) = window_proxy() {
+                    break proxy;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            wake_window(
+                proxy,
+                wake_frames,
+                wake_stop,
+                wake_pads,
+                wake_title,
+                Arc::clone(&wake_cursors),
+            )
+            .await;
+        });
+        picture_hub::hold_picture(picture_id, &stop);
+        desk_io::detach_keys(picture_id);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        done_rx
             .recv()
             .map_err(|_| view_error("the picture window stopped"))?
             .map_err(view_error)?;
-        // The spawn above has no proxy. A second task watches the same slot and Stop.
-        rt.spawn(wake_window(proxy, wake_frames, wake_stop, wake_pads, wake_title));
     }
-    done_rx
-        .recv()
-        .map_err(|_| view_error("the picture window stopped"))?
-        .map_err(view_error)?;
     // Keep the runtime until the window loop returns, then join the side threads.
     drop(rt);
     release_view(pads_stop, playback, gamepad);
@@ -378,6 +514,14 @@ fn release_view(pads_stop: Arc<AtomicBool>, playback: JoinHandle<()>, gamepad: J
     let _ = gamepad.join();
 }
 
+struct DetachPlayer(u64);
+
+impl Drop for DetachPlayer {
+    fn drop(&mut self) {
+        desk_io::detach_player(self.0);
+    }
+}
+
 async fn connect_player(
     net: Option<Arc<L2Net>>,
     connect: ConnectSession,
@@ -388,7 +532,14 @@ async fn connect_player(
     status: Status,
     stamps: Arc<Mutex<HashMap<u64, Instant>>>,
     title: Arc<Mutex<String>>,
+    picture_id: u64,
+    cursors: Arc<Mutex<etherquic::cursor::CursorView>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (cmd_tx, pipes, outbound, inbound) = desk_io::open_notes(desk_io::desk_roster());
+    desk_io::attach_player(picture_id, cmd_tx);
+    let _detach = DetachPlayer(picture_id);
+    tokio::spawn(desk_io::pump_outbound(outbound));
+    tokio::spawn(desk_io::pump_inbound(NoteSide::Player, inbound));
     let (endpoint, peer, peer_text) = if let Some(addr) = connect.udp {
         let bind = if addr.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
@@ -480,11 +631,28 @@ async fn connect_player(
     });
     let watch = conn.clone();
     let negotiates = etherquic::negotiates(&conn);
-    let offer = connect.codecs.offer();
+    let mut offer = connect.codecs.offer();
+    let view_look = connect.view.clone();
+    let initial_look = crate::snapshot(&view_look).look;
+    offer.look = initial_look;
+    let (look_tx, look_rx) = tokio::sync::watch::channel(initial_look);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if look_tx.send(crate::snapshot(&view_look).look).is_err() {
+                break;
+            }
+        }
+    });
     if negotiates {
         let video: Vec<&str> = offer.video.iter().map(|row| row.token()).collect();
         let audio: Vec<&str> = offer.audio.iter().map(|row| row.token()).collect();
-        eprintln!("etherquic-play: offer video [{}] audio [{}]", video.join(" "), audio.join(" "));
+        eprintln!(
+            "etherquic-play: offer video [{}] audio [{}] look {}",
+            video.join(" "),
+            audio.join(" "),
+            offer.look.token()
+        );
     } else {
         eprintln!("etherquic-play: the host does not negotiate codecs; MJPEG and PCM");
     }
@@ -504,19 +672,32 @@ async fn connect_player(
         offer,
         frames: sink,
         events: event_tx,
+        look: look_rx,
     };
-    let mut session = tokio::spawn(async move { play(conn, media, audio_tx, input, acks).await });
+    let mut session =
+        tokio::spawn(async move { play_session(conn, media, audio_tx, input, acks, pipes).await });
     let codec_status = Arc::clone(&status);
     let codec_title = Arc::clone(&title);
     let quiet_stats = connect.trace_input;
     let pictures = tokio::spawn(async move {
         let mut line = crate::SessionLine::new(peer_text.clone(), negotiates);
         while let Some(event) = event_rx.recv().await {
+            if let etherquic_media::player::PlayerEvent::Cursor(update) = &event {
+                cursors
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .apply(update.clone());
+                // The hub window redraws from this. The macOS picture loop is
+                // woken by `wake_window`, which watches the same sequence.
+                picture_hub::wake_picture();
+            }
             let show = line.apply(&event);
             if let Some(log) = line.log_line(&event) {
                 eprintln!("etherquic-play: {log}");
             }
-            if show && !(quiet_stats && matches!(event, etherquic_media::player::PlayerEvent::Stats(_))) {
+            if show
+                && !(quiet_stats && matches!(event, etherquic_media::player::PlayerEvent::Stats(_)))
+            {
                 let text = line.text();
                 codec_status(&text);
                 if let Ok(mut title) = codec_title.lock() {
@@ -716,11 +897,57 @@ struct App {
     title: Arc<Mutex<String>>,
     shortcuts: Option<ShortcutHold>,
     modifiers: ModifiersState,
+    /// Local pointer, in window pixels. This is what we send to the host.
     cursor: (f64, f64),
+    remote_cursor: Arc<Mutex<etherquic::cursor::CursorView>>,
+    cursor_mode: crate::CursorMode,
+    cursor_seq: u64,
+    cursor_visible: bool,
+    cursor_icon: Option<CursorIcon>,
+    /// `image_id` of the custom cursor installed for Copy mode. `0` means none.
+    cursor_image: u32,
     letterbox: crate::Placement,
     view: crate::LiveView,
     /// Picture size the window was last fitted to, for "window matches host".
     fitted: (u32, u32),
+    /// When set, this window draws whichever seat [`picture_hub`] has shown.
+    hub: bool,
+    bound_id: u64,
+    /// Idle until the HWND exists, Showing while it is on screen, Closing
+    /// after close until Windows has destroyed it, then Closed.
+    phase: Phase,
+}
+
+/// Picture-window lifecycle. Close moves to Closing and keeps the event
+/// loop pumping until the HWND is destroyed. Exiting in the same turn as
+/// dropping the window posts a destroy message that nobody reads, and
+/// Windows then marks the window Not Responding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Showing,
+    Closing,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseAction {
+    /// A close is already in progress.
+    Ignore,
+    /// Another picture is still open. Keep this HWND and draw that one.
+    Rebind,
+    /// Nothing left to show. Drop the window and wait for it to be destroyed.
+    Destroy,
+}
+
+impl Phase {
+    fn action(self, other_seat: bool) -> CloseAction {
+        match self {
+            Phase::Closing | Phase::Closed => CloseAction::Ignore,
+            Phase::Idle | Phase::Showing if other_seat => CloseAction::Rebind,
+            Phase::Idle | Phase::Showing => CloseAction::Destroy,
+        }
+    }
 }
 
 /// Blocks compositor shortcuts while the picture window is focused, so the
@@ -772,41 +999,32 @@ fn block_shortcuts(block: bool) {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.stop.load(Ordering::SeqCst) {
-            event_loop.exit();
+        if matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return;
+        }
+        if self.hub {
+            self.follow_board(event_loop);
+            if matches!(self.phase, Phase::Closing | Phase::Closed) || self.bound_id == 0 {
+                return;
+            }
+        } else if self.stop.load(Ordering::SeqCst) {
+            self.begin_close(event_loop);
             return;
         }
         if self.window.is_some() {
             return;
         }
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("etherquic-play")
-                        .with_active(true)
-                        .with_inner_size(PhysicalSize::new(1280, 720)),
-                )
-                .expect("window"),
-        );
-        window.focus_window();
-        let context = Context::new(window.clone()).expect("softbuffer context");
-        let surface = Surface::new(&context, window.clone()).expect("softbuffer surface");
-        window.request_redraw();
-        self.window = Some(window);
-        self.context = Some(context);
-        self.surface = Some(surface);
+        self.open_window(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                // Destroy the surface before leaving the loop. The compositor
-                // treats a close that is not answered as a frozen window.
-                self.drop_window();
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => self.begin_close(event_loop),
+            WindowEvent::Destroyed => self.note_destroyed(event_loop),
             WindowEvent::Focused(focused) => {
+                if !self.live() {
+                    return;
+                }
                 self.focused = focused;
                 if focused {
                     if self.shortcuts.is_none() {
@@ -819,19 +1037,50 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.draw(event_loop),
             WindowEvent::Resized(_) => self.draw(event_loop),
             WindowEvent::ModifiersChanged(modifiers) => {
+                if !self.live() {
+                    return;
+                }
                 self.send_modifiers(modifiers.state());
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.repeat || !self.focused {
+                if !self.live() {
+                    return;
+                }
+                if self.focused
+                    && crate::text_paste_watched()
+                    && crate::paste_chord(
+                        cfg!(target_os = "macos"),
+                        self.modifiers.control_key(),
+                        self.modifiers.alt_key(),
+                        self.modifiers.super_key(),
+                        key_is_v(&event.logical_key),
+                    )
+                {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        crate::request_text_paste();
+                    }
+                    return;
+                }
+                if !crate::focus_sends_keyboard(
+                    self.focused,
+                    event.repeat,
+                    crate::snapshot(&self.view).send_keyboard,
+                ) {
                     return;
                 }
                 self.send_key(&event.logical_key, event.state == ElementState::Pressed);
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if !self.live() {
+                    return;
+                }
                 self.cursor = (position.x, position.y);
                 self.send_pointer(0, 0);
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if !self.live() {
+                    return;
+                }
                 let bit = match button {
                     MouseButton::Left => Buttons::LEFT,
                     MouseButton::Right => Buttons::RIGHT,
@@ -846,6 +1095,9 @@ impl ApplicationHandler for App {
                 self.send_pointer(0, 0);
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if !self.live() {
+                    return;
+                }
                 let (x, y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x.round() as i16, y.round() as i16),
                     MouseScrollDelta::PixelDelta(px) => {
@@ -859,21 +1111,19 @@ impl ApplicationHandler for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
-        if self.stop.load(Ordering::SeqCst) {
-            event_loop.exit();
-            return;
-        }
+        self.follow_board(event_loop);
         self.take_frame();
         self.apply_title();
+        self.drain_keystroke_strings();
+        self.sync_cursor(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.stop.load(Ordering::SeqCst) {
-            event_loop.exit();
-            return;
-        }
+        self.follow_board(event_loop);
         self.take_frame();
         self.apply_title();
+        self.drain_keystroke_strings();
+        self.sync_cursor(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -884,6 +1134,186 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn for_hub() -> Self {
+        Self {
+            frames: Arc::new(Mutex::new(None)),
+            input: Arc::new(Gate::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            window: None,
+            context: None,
+            surface: None,
+            picture: None,
+            buttons: 0,
+            focused: false,
+            trace: false,
+            clock: TraceClock::default(),
+            opened: Instant::now(),
+            stamps: Arc::new(Mutex::new(HashMap::new())),
+            title: Arc::new(Mutex::new(String::new())),
+            shortcuts: None,
+            modifiers: ModifiersState::empty(),
+            cursor: (0.0, 0.0),
+            remote_cursor: etherquic::cursor::share(),
+            cursor_mode: crate::CursorMode::Native,
+            cursor_seq: 0,
+            cursor_visible: true,
+            cursor_icon: None,
+            cursor_image: 0,
+            letterbox: crate::place(crate::ScaleMode::Fit, 0, 0, 1, 1),
+            view: crate::live(crate::ViewOptions::default()),
+            fitted: (0, 0),
+            hub: true,
+            bound_id: 0,
+            phase: Phase::Idle,
+        }
+    }
+
+    fn apply_seat(&mut self, seat: PictureSeat) {
+        self.bound_id = seat.id;
+        self.frames = seat.frames;
+        self.input = seat.input;
+        self.stop = seat.stop;
+        self.trace = seat.trace;
+        self.view = seat.view;
+        self.stamps = seat.stamps;
+        self.title = seat.title;
+        self.remote_cursor = Arc::clone(&seat.cursor);
+        // A value the next sample cannot match, so the new seat's cursor is applied.
+        self.cursor_seq = u64::MAX;
+        self.cursor_icon = None;
+        self.cursor_image = 0;
+        self.picture = None;
+        self.buttons = 0;
+    }
+
+    fn bind_shown(&mut self) -> bool {
+        let Some(seat) = picture_hub::screen_seat() else {
+            return false;
+        };
+        self.apply_seat(seat);
+        true
+    }
+
+    /// Rebind when the shown picture changes. Closing the bound seat does not
+    /// wait for any other session, and it does not exit while an HWND is
+    /// still on screen.
+    fn follow_board(&mut self, event_loop: &ActiveEventLoop) {
+        if matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return;
+        }
+        if !self.hub {
+            if self.stop.load(Ordering::SeqCst) {
+                self.begin_close(event_loop);
+            }
+            return;
+        }
+        if self.bound_id != 0 && self.stop.load(Ordering::SeqCst) {
+            self.begin_close(event_loop);
+            return;
+        }
+        match picture_hub::screen_seat() {
+            None if self.window.is_some() => self.begin_close(event_loop),
+            None => event_loop.exit(),
+            Some(seat) if seat.id != self.bound_id => {
+                self.apply_seat(seat);
+                self.phase = Phase::Showing;
+                self.sync_cursor(event_loop);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn live(&self) -> bool {
+        self.phase == Phase::Showing
+    }
+
+    fn open_window(&mut self, event_loop: &ActiveEventLoop) {
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("etherquic-play")
+                        .with_active(true)
+                        .with_inner_size(PhysicalSize::new(1280, 720)),
+                )
+                .expect("window"),
+        );
+        window.focus_window();
+        let context = Context::new(window.clone()).expect("softbuffer context");
+        let surface = Surface::new(&context, window.clone()).expect("softbuffer surface");
+        self.window = Some(window);
+        self.context = Some(context);
+        self.surface = Some(surface);
+        self.phase = Phase::Showing;
+        self.sync_cursor(event_loop);
+        // Paint before returning. Until the first present, Windows leaves the
+        // client area on the default grey background.
+        self.draw(event_loop);
+    }
+
+    /// Close the picture on screen. Another open session keeps this window.
+    /// The last one drops the HWND and waits until Windows reports it gone.
+    fn begin_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self.phase.action(false) == CloseAction::Ignore {
+            return;
+        }
+        let other = if self.hub && self.bound_id != 0 {
+            let id = self.bound_id;
+            self.bound_id = 0;
+            let _ = picture_hub::close_picture_quietly(id);
+            picture_hub::screen_seat()
+        } else {
+            if !self.hub {
+                self.stop.store(true, Ordering::SeqCst);
+            }
+            None
+        };
+        match self.phase.action(other.is_some()) {
+            CloseAction::Ignore => {}
+            CloseAction::Rebind => {
+                if let Some(seat) = other {
+                    self.apply_seat(seat);
+                    self.picture = None;
+                    self.phase = Phase::Showing;
+                    self.sync_cursor(event_loop);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            CloseAction::Destroy => {
+                // Release the DC on this thread, then drop the window. Drop
+                // only posts a destroy message. The loop has to keep running
+                // until that message is handled.
+                self.phase = Phase::Closing;
+                self.surface.take();
+                self.context.take();
+                self.shortcuts.take();
+                if self.window.take().is_none() {
+                    self.phase = Phase::Closed;
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+
+    fn note_destroyed(&mut self, event_loop: &ActiveEventLoop) {
+        self.surface.take();
+        self.context.take();
+        self.window.take();
+        self.shortcuts.take();
+        if self.hub && self.bind_shown() {
+            self.phase = Phase::Idle;
+            self.open_window(event_loop);
+            return;
+        }
+        self.phase = Phase::Closed;
+        event_loop.exit();
+    }
+
     fn drop_window(&mut self) {
         // The surface has to go first. Shortcut release talks to the session
         // bus and must not run while the compositor is still waiting for close.
@@ -894,6 +1324,10 @@ impl App {
     }
 
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.live() {
+            return;
+        }
+        self.take_frame();
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -923,7 +1357,13 @@ impl App {
         buffer.fill(0);
         if let Some(picture) = &self.picture {
             let scale = crate::snapshot(&self.view).scale;
-            let place = crate::place(scale, picture.width, picture.height, size.width, size.height);
+            let place = crate::place(
+                scale,
+                picture.width,
+                picture.height,
+                size.width,
+                size.height,
+            );
             self.letterbox = place;
             let mut view = vec![0u32; (place.view_w as usize) * (place.view_h as usize)];
             blit_rgb(picture, &mut view, place.view_w, place.view_h);
@@ -936,8 +1376,156 @@ impl App {
                     }
                 }
             }
+            if crate::snapshot(&self.view).cursor == crate::CursorMode::Remote {
+                let paint = {
+                    let drawn = self
+                        .remote_cursor
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    if !drawn.visible {
+                        None
+                    } else if drawn.width > 0 && !drawn.bgra.is_empty() {
+                        Some((
+                            drawn.bgra.clone(),
+                            u32::from(drawn.width),
+                            u32::from(drawn.height),
+                            i32::from(drawn.hotspot_x),
+                            i32::from(drawn.hotspot_y),
+                            drawn.x,
+                            drawn.y,
+                        ))
+                    } else {
+                        let stand_in = etherquic::cursor::fallback(drawn.shape);
+                        Some((
+                            stand_in.bgra,
+                            u32::from(stand_in.width),
+                            u32::from(stand_in.height),
+                            i32::from(stand_in.hotspot_x),
+                            i32::from(stand_in.hotspot_y),
+                            drawn.x,
+                            drawn.y,
+                        ))
+                    }
+                };
+                if let Some((bgra, bw, bh, hx, hy, x, y)) = paint {
+                    let place = etherquic::cursor::Placed {
+                        src_w: picture.width,
+                        src_h: picture.height,
+                        view_w: self.letterbox.view_w,
+                        view_h: self.letterbox.view_h,
+                        crop_x: self.letterbox.crop_x,
+                        crop_y: self.letterbox.crop_y,
+                        dst_x: self.letterbox.dst_x,
+                        dst_y: self.letterbox.dst_y,
+                    };
+                    let sprite = etherquic::cursor::sprite_box(place, x, y, hx, hy, bw, bh);
+                    etherquic::cursor::paint_sprite(
+                        &mut buffer,
+                        size.width,
+                        size.height,
+                        sprite,
+                        &bgra,
+                        bw,
+                        bh,
+                    );
+                }
+            }
         }
         let _ = buffer.present();
+    }
+
+    /// Native and Copy keep the local cursor and change its shape from the
+    /// host. Remote hides it; the picture pass draws the host cursor instead.
+    fn sync_cursor(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.live() {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let mode = crate::snapshot(&self.view).cursor;
+        let (seq, shape, image_id, width, height, hotspot_x, hotspot_y, bgra) = {
+            let guard = self
+                .remote_cursor
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if mode == self.cursor_mode && guard.seq == self.cursor_seq {
+                return;
+            }
+            let need_bitmap = mode == crate::CursorMode::Copy
+                && guard.width > 0
+                && !guard.bgra.is_empty()
+                && (guard.image_id != self.cursor_image
+                    || self.cursor_mode != crate::CursorMode::Copy);
+            let bgra = if need_bitmap {
+                guard.bgra.clone()
+            } else {
+                Vec::new()
+            };
+            (
+                guard.seq,
+                guard.shape,
+                guard.image_id,
+                guard.width,
+                guard.height,
+                guard.hotspot_x,
+                guard.hotspot_y,
+                bgra,
+            )
+        };
+        let was_remote = self.cursor_mode == crate::CursorMode::Remote;
+        match mode {
+            crate::CursorMode::Native => {
+                if !self.cursor_visible {
+                    window.set_cursor_visible(true);
+                }
+                let icon = shape_icon(shape);
+                if self.cursor_icon != Some(icon) || self.cursor_image != 0 || !self.cursor_visible
+                {
+                    window.set_cursor(icon);
+                    self.cursor_image = 0;
+                }
+                self.cursor_icon = Some(icon);
+                self.cursor_visible = true;
+            }
+            crate::CursorMode::Copy => {
+                if !self.cursor_visible {
+                    window.set_cursor_visible(true);
+                }
+                if !bgra.is_empty()
+                    && install_cursor(
+                        event_loop, &window, &bgra, width, height, hotspot_x, hotspot_y,
+                    )
+                {
+                    self.cursor_image = image_id;
+                    self.cursor_icon = None;
+                } else {
+                    let same_bitmap = self.cursor_mode == crate::CursorMode::Copy
+                        && self.cursor_image != 0
+                        && self.cursor_image == image_id;
+                    if !same_bitmap {
+                        let icon = shape_icon(shape);
+                        if self.cursor_icon != Some(icon) || self.cursor_image != 0 {
+                            window.set_cursor(icon);
+                        }
+                        self.cursor_icon = Some(icon);
+                        self.cursor_image = 0;
+                    }
+                }
+                self.cursor_visible = true;
+            }
+            crate::CursorMode::Remote => {
+                if self.cursor_visible {
+                    window.set_cursor_visible(false);
+                    self.cursor_visible = false;
+                }
+            }
+        }
+        if mode == crate::CursorMode::Remote || was_remote {
+            window.request_redraw();
+        }
+        self.cursor_mode = mode;
+        self.cursor_seq = seq;
     }
 
     fn take_frame(&mut self) {
@@ -958,7 +1546,13 @@ impl App {
             let scale = crate::snapshot(&self.view).scale;
             if let Some(picture) = &self.picture {
                 let size = window.inner_size();
-                let place = crate::place(scale, picture.width, picture.height, size.width, size.height);
+                let place = crate::place(
+                    scale,
+                    picture.width,
+                    picture.height,
+                    size.width,
+                    size.height,
+                );
                 if place != self.letterbox {
                     window.request_redraw();
                 }
@@ -999,6 +1593,67 @@ impl App {
             if let Some(window) = &self.window {
                 window.set_title(&title);
             }
+        }
+    }
+
+    /// A typed string. This does not look at focus, so it still sends when the
+    /// picture window is in the background. The key handler above does not.
+    ///
+    /// Held modifiers are released for the string and pressed again after it,
+    /// so a Ctrl+V paste types the characters rather than chords.
+    fn drain_keystroke_strings(&mut self) {
+        let pending = PENDING_KEYSTROKES
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+        let lift = crate::snapshot(&self.view).send_keyboard && self.modifiers_held();
+        if lift {
+            self.chord_break(false);
+        }
+        for text in pending {
+            let events = crate::keystroke_events(&text);
+            if !events.is_empty() {
+                self.emit(events);
+            }
+        }
+        if lift {
+            self.chord_break(true);
+        }
+    }
+
+    fn modifiers_held(&self) -> bool {
+        self.modifiers.shift_key()
+            || self.modifiers.control_key()
+            || self.modifiers.alt_key()
+            || self.modifiers.super_key()
+    }
+
+    /// `restore` presses the held modifiers again. Otherwise it releases them.
+    /// `self.modifiers` stays the physical state.
+    fn chord_break(&mut self, restore: bool) {
+        let held = [
+            (self.modifiers.shift_key(), 0xffe1),
+            (self.modifiers.control_key(), 0xffe3),
+            (self.modifiers.alt_key(), 0xffe9),
+            (self.modifiers.super_key(), 0xffeb),
+        ];
+        let events = held
+            .into_iter()
+            .filter(|(down, _)| *down)
+            .map(|(_, code)| Event {
+                time_us: 0,
+                body: Body::Key {
+                    down: restore,
+                    source: KeySource::Keysym,
+                    code,
+                },
+            })
+            .collect::<Vec<_>>();
+        if !events.is_empty() {
+            self.emit(events);
         }
     }
 
@@ -1067,6 +1722,68 @@ impl App {
     }
 }
 
+fn shape_icon(shape: etherquic::cursor::CursorShape) -> CursorIcon {
+    use etherquic::cursor::CursorShape;
+    match shape {
+        CursorShape::Arrow | CursorShape::Custom => CursorIcon::Default,
+        CursorShape::Hand => CursorIcon::Pointer,
+        CursorShape::IBeam => CursorIcon::Text,
+        CursorShape::Wait => CursorIcon::Wait,
+        CursorShape::Cross => CursorIcon::Crosshair,
+        CursorShape::SizeNs => CursorIcon::NsResize,
+        CursorShape::SizeWe => CursorIcon::EwResize,
+        CursorShape::SizeNwse => CursorIcon::NwseResize,
+        CursorShape::SizeNesw => CursorIcon::NeswResize,
+        CursorShape::SizeAll => CursorIcon::Move,
+        CursorShape::No => CursorIcon::NotAllowed,
+        CursorShape::Help => CursorIcon::Help,
+        CursorShape::UpArrow => CursorIcon::NResize,
+        CursorShape::AppStarting => CursorIcon::Progress,
+    }
+}
+
+fn clamp_hotspot(hot: i16, edge: u16) -> u16 {
+    let last = edge.saturating_sub(1);
+    if hot <= 0 {
+        0
+    } else {
+        u16::try_from(hot).unwrap_or(u16::MAX).min(last)
+    }
+}
+
+fn install_cursor(
+    event_loop: &ActiveEventLoop,
+    window: &Window,
+    bgra: &[u8],
+    width: u16,
+    height: u16,
+    hotspot_x: i16,
+    hotspot_y: i16,
+) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let rgba = etherquic::cursor::bgra_to_rgba(bgra);
+    let Ok(source) = CustomCursor::from_rgba(
+        rgba,
+        width,
+        height,
+        clamp_hotspot(hotspot_x, width),
+        clamp_hotspot(hotspot_y, height),
+    ) else {
+        return false;
+    };
+    window.set_cursor(event_loop.create_custom_cursor(source));
+    true
+}
+
+fn key_is_v(key: &Key) -> bool {
+    match key {
+        Key::Character(text) => text.eq_ignore_ascii_case("v"),
+        _ => false,
+    }
+}
+
 fn keysym(key: &Key) -> Option<u32> {
     match key {
         Key::Character(text) => {
@@ -1120,46 +1837,15 @@ fn named_keysym(key: NamedKey) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CloseAction, Phase};
 
     #[test]
-    fn the_picture_window_can_close_and_open_again() {
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-            return;
-        }
-        for _ in 0..2 {
-            let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
-            let (done_tx, done_rx) = std::sync::mpsc::channel();
-            let stop = Arc::new(AtomicBool::new(false));
-            let close = Arc::clone(&stop);
-            window_sender()
-                .expect("window thread")
-                .send(ViewRequest {
-                    frames: Arc::new(Mutex::new(None)),
-                    input: Arc::new(Gate::new()),
-                    stop: Arc::clone(&stop),
-                    trace: false,
-                    view: crate::live(crate::ViewOptions::default()),
-                    stamps: Arc::new(Mutex::new(HashMap::new())),
-                    title: Arc::new(Mutex::new(String::new())),
-                    proxy: proxy_tx,
-                    done: done_tx,
-                })
-                .expect("send");
-            let proxy = proxy_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("proxy")
-                .expect("event loop");
-            // Let resumed create the window, then close it the way Stop does.
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(400));
-                close.store(true, Ordering::SeqCst);
-                let _ = proxy.send_event(());
-            });
-            done_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("done")
-                .expect("run");
-        }
+    fn close_keeps_pumping_until_the_window_is_destroyed() {
+        assert_eq!(Phase::Showing.action(true), CloseAction::Rebind);
+        assert_eq!(Phase::Showing.action(false), CloseAction::Destroy);
+        assert_eq!(Phase::Idle.action(false), CloseAction::Destroy);
+        assert_eq!(Phase::Closing.action(false), CloseAction::Ignore);
+        assert_eq!(Phase::Closing.action(true), CloseAction::Ignore);
+        assert_eq!(Phase::Closed.action(true), CloseAction::Ignore);
     }
 }

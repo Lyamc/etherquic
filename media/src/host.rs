@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 use crate::audio::AudioEncoder;
 use crate::negotiate::{
     choose_audio, choose_video, Audio, HostCaps, Offer, StreamConfig, Video, AUDIO2_MAGIC,
-    OFFER_MAGIC, RECORD_DATA, VIDEO2_MAGIC,
+    OFFER_MAGIC, RECORD_CURSOR, RECORD_DATA, VIDEO2_MAGIC,
 };
 use crate::video::{EncodeSetup, VideoEncoder};
 use crate::{wire, yuv, Frame, Log, Pcm};
@@ -74,7 +74,9 @@ impl FrameSlot {
     /// The newest frame after `seen`, waiting up to `timeout`.
     pub fn wait(&self, seen: u64, timeout: Duration) -> Wait {
         let (lock, cond) = &*self.inner;
-        let Ok(mut state) = lock.lock() else { return Wait::Closed };
+        let Ok(mut state) = lock.lock() else {
+            return Wait::Closed;
+        };
         let deadline = Instant::now() + timeout;
         loop {
             if state.closed {
@@ -101,7 +103,10 @@ impl FrameSlot {
 pub enum Negotiated {
     /// The peer did not agree on `etherquic/2`, or sent no offer: MJPEG and PCM.
     Legacy,
-    V2 { offer: Offer, offers: RecvStream },
+    V2 {
+        offer: Offer,
+        offers: RecvStream,
+    },
 }
 
 impl Negotiated {
@@ -113,7 +118,9 @@ impl Negotiated {
 /// With `etherquic/2` the player's first stream is its offer. Anything else
 /// (or nothing within five seconds) is treated as a player that cannot
 /// negotiate. A non-offer stream is handed back so the caller can still use it.
-pub async fn accept_offer(conn: &Connection) -> Result<(Negotiated, Option<(RecvStream, [u8; 4])>), String> {
+pub async fn accept_offer(
+    conn: &Connection,
+) -> Result<(Negotiated, Option<(RecvStream, [u8; 4])>), String> {
     if !etherquic::negotiates(conn) {
         return Ok((Negotiated::Legacy, None));
     }
@@ -129,9 +136,17 @@ pub async fn accept_offer(conn: &Connection) -> Result<(Negotiated, Option<(Recv
     if &magic != OFFER_MAGIC {
         return Ok((Negotiated::Legacy, Some((recv, magic))));
     }
-    let record = wire::read_record(&mut recv, OFFER_MAGIC).await?.ok_or("offer stream ended")?;
+    let record = wire::read_record(&mut recv, OFFER_MAGIC)
+        .await?
+        .ok_or("offer stream ended")?;
     let offer = Offer::decode(&record)?;
-    Ok((Negotiated::V2 { offer, offers: recv }, None))
+    Ok((
+        Negotiated::V2 {
+            offer,
+            offers: recv,
+        },
+        None,
+    ))
 }
 
 /// The two host-to-player media streams.
@@ -142,12 +157,20 @@ pub struct Streams {
 }
 
 pub async fn open_streams(conn: &Connection, v2: bool) -> Result<Streams, String> {
-    let (vm, am) = if v2 { (VIDEO2_MAGIC, AUDIO2_MAGIC) } else { (LEGACY_VIDEO_MAGIC, LEGACY_AUDIO_MAGIC) };
+    let (vm, am) = if v2 {
+        (VIDEO2_MAGIC, AUDIO2_MAGIC)
+    } else {
+        (LEGACY_VIDEO_MAGIC, LEGACY_AUDIO_MAGIC)
+    };
     let mut video = conn.open_uni().await.map_err(|e| e.to_string())?;
-    video.set_priority(etherquic::PRIORITY_VIDEO).map_err(|e| e.to_string())?;
+    video
+        .set_priority(etherquic::PRIORITY_VIDEO)
+        .map_err(|e| e.to_string())?;
     wire::write_magic(&mut video, vm).await?;
     let mut audio = conn.open_uni().await.map_err(|e| e.to_string())?;
-    audio.set_priority(etherquic::PRIORITY_AUDIO).map_err(|e| e.to_string())?;
+    audio
+        .set_priority(etherquic::PRIORITY_AUDIO)
+        .map_err(|e| e.to_string())?;
     wire::write_magic(&mut audio, am).await?;
     Ok(Streams { video, audio, v2 })
 }
@@ -174,8 +197,13 @@ pub async fn run(
     frames: FrameSlot,
     audio: mpsc::Receiver<Pcm>,
     options: HostOptions,
+    mut cursor: watch::Receiver<Option<Vec<u8>>>,
 ) -> Result<(), String> {
-    let Streams { video: mut video_send, audio: audio_send, v2 } = streams;
+    let Streams {
+        video: mut video_send,
+        audio: audio_send,
+        v2,
+    } = streams;
     let (offer_tx, offer_rx) = watch::channel::<Option<Offer>>(None);
     let mut offer_task = None;
     if let Negotiated::V2 { offer, mut offers } = negotiated {
@@ -186,7 +214,12 @@ pub async fn run(
                 match wire::read_record(&mut offers, OFFER_MAGIC).await {
                     Ok(Some(record)) => match Offer::decode(&record) {
                         Ok(next) => {
-                            log(&format!("player sent a new offer: video {:?} failed {:?}", tokens(&next.video), tokens(&next.failed)));
+                            log(&format!(
+                                "player sent a new offer: video {:?} failed {:?} look {}",
+                                tokens(&next.video),
+                                tokens(&next.failed),
+                                next.look.token()
+                            ));
                             let _ = offer_tx.send(Some(next));
                         }
                         Err(error) => log(&format!("bad offer: {error}")),
@@ -209,14 +242,34 @@ pub async fn run(
         .map_err(|e| e.to_string())?;
 
     let video_task = tokio::spawn(async move {
-        while let Some(out) = out_rx.recv().await {
-            let result = match out {
-                VideoOut::Config(bytes) if v2 => wire::write_record(&mut video_send, VIDEO2_MAGIC, &bytes).await,
-                VideoOut::Config(_) => Ok(()),
-                VideoOut::Data(bytes) if v2 => wire::write_typed(&mut video_send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await,
-                VideoOut::Data(bytes) => wire::write_record(&mut video_send, LEGACY_VIDEO_MAGIC, &bytes).await,
-            };
-            result?;
+        let mut cursor_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                changed = cursor.changed(), if cursor_open => {
+                    match changed {
+                        Ok(()) => {
+                            let bytes = cursor.borrow_and_update().clone();
+                            if v2 {
+                                if let Some(bytes) = bytes {
+                                    wire::write_typed(&mut video_send, VIDEO2_MAGIC, RECORD_CURSOR, &bytes).await?;
+                                }
+                            }
+                        }
+                        Err(_) => cursor_open = false,
+                    }
+                }
+                out = out_rx.recv() => {
+                    let Some(out) = out else { break };
+                    let result = match out {
+                        VideoOut::Config(bytes) if v2 => wire::write_record(&mut video_send, VIDEO2_MAGIC, &bytes).await,
+                        VideoOut::Config(_) => Ok(()),
+                        VideoOut::Data(bytes) if v2 => wire::write_typed(&mut video_send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await,
+                        VideoOut::Data(bytes) => wire::write_record(&mut video_send, LEGACY_VIDEO_MAGIC, &bytes).await,
+                    };
+                    result?;
+                }
+            }
         }
         finish(&mut video_send).await
     });
@@ -268,9 +321,17 @@ fn video_pump(
     let mut tick_bytes = 0u64;
     loop {
         if offer_rx.has_changed().unwrap_or(false) {
-            offer = offer_rx.borrow_and_update().clone();
-            active = None;
-            reason = "the player sent a new offer".into();
+            let next = offer_rx.borrow_and_update().clone();
+            let keep_encoder = match (&offer, &next) {
+                (Some(current), Some(incoming)) => current.same_codecs(incoming),
+                (None, None) => true,
+                _ => false,
+            };
+            offer = next;
+            if !keep_encoder {
+                active = None;
+                reason = "the player sent a new offer".into();
+            }
         }
         let frame = match frames.wait(seen, Duration::from_millis(250)) {
             Wait::Frame(seq, frame) => {
@@ -281,9 +342,18 @@ fn video_pump(
             Wait::Timeout => continue,
             Wait::Closed => break,
         };
-        let (max_w, max_h) = offer.as_ref().map(|o| (o.max.width, o.max.height)).unwrap_or((0, 0));
-        let frame = yuv::fit(&frame, max_w, max_h);
-        if active.as_ref().map(|a| a.size != (frame.width, frame.height)).unwrap_or(true) {
+        let (max_w, max_h) = offer
+            .as_ref()
+            .map(|o| (o.max.width, o.max.height))
+            .unwrap_or((0, 0));
+        let mut frame = yuv::fit(&frame, max_w, max_h);
+        let look = offer.as_ref().map(|item| item.look).unwrap_or_default();
+        etherquic::look::apply(&mut frame.rgb, frame.width, frame.height, look);
+        if active
+            .as_ref()
+            .map(|a| a.size != (frame.width, frame.height))
+            .unwrap_or(true)
+        {
             // The old encoder (and an ffmpeg reader thread) ends before the
             // next config record, so no stale bytes follow it.
             drop(active.take());
@@ -291,7 +361,12 @@ fn video_pump(
                 let (video, encoder_name) = match &offer {
                     None => (Video::Mjpeg, "jpeg".to_string()),
                     Some(offer) => {
-                        let pick = choose_video(offer, &options.caps, &excluded, Some((frame.width, frame.height)));
+                        let pick = choose_video(
+                            offer,
+                            &options.caps,
+                            &excluded,
+                            Some((frame.width, frame.height)),
+                        );
                         (pick.row, pick.encoder)
                     }
                 };
@@ -312,7 +387,13 @@ fn video_pump(
                 });
                 match VideoEncoder::open(&setup, sink) {
                     Ok((encoder, kbps)) => {
-                        let mut config = StreamConfig::video(video, &encoder_name, frame.width, frame.height, options.fps);
+                        let mut config = StreamConfig::video(
+                            video,
+                            &encoder_name,
+                            frame.width,
+                            frame.height,
+                            options.fps,
+                        );
                         config.bitrate_kbps = kbps;
                         config.reason = std::mem::take(&mut reason);
                         if first_config {
@@ -326,17 +407,36 @@ fn video_pump(
                             frame.width,
                             frame.height,
                             options.fps,
-                            if kbps > 0 { format!(" {kbps} kbit/s") } else { String::new() },
-                            if config.reason.is_empty() { String::new() } else { format!(", because {}", config.reason) },
+                            if kbps > 0 {
+                                format!(" {kbps} kbit/s")
+                            } else {
+                                String::new()
+                            },
+                            if config.reason.is_empty() {
+                                String::new()
+                            } else {
+                                format!(", because {}", config.reason)
+                            },
                         ));
-                        if v2 && out.blocking_send(VideoOut::Config(config.encode())).is_err() {
+                        if v2
+                            && out
+                                .blocking_send(VideoOut::Config(config.encode()))
+                                .is_err()
+                        {
                             return;
                         }
-                        active = Some(Active { encoder, video, size: (frame.width, frame.height) });
+                        active = Some(Active {
+                            encoder,
+                            video,
+                            size: (frame.width, frame.height),
+                        });
                         break;
                     }
                     Err(error) => {
-                        log(&format!("{} encoder failed to start: {error}", video.name()));
+                        log(&format!(
+                            "{} encoder failed to start: {error}",
+                            video.name()
+                        ));
                         if video == Video::Mjpeg {
                             log("MJPEG cannot start; the picture stops.");
                             return;
@@ -347,12 +447,17 @@ fn video_pump(
                 }
             }
         }
-        let Some(current) = active.as_mut() else { continue };
+        let Some(current) = active.as_mut() else {
+            continue;
+        };
         match current.encoder.push(&frame) {
             Ok(true) => frames_in += 1,
             Ok(false) => return,
             Err(error) => {
-                log(&format!("{} encoder failed mid-session: {error}", current.video.name()));
+                log(&format!(
+                    "{} encoder failed mid-session: {error}",
+                    current.video.name()
+                ));
                 if current.video == Video::Mjpeg {
                     continue;
                 }
@@ -401,7 +506,11 @@ async fn audio_loop(
             offer = offer_rx.borrow_and_update().clone();
             encoder = None;
         }
-        if encoder.as_ref().map(|(enc, _)| enc.changed(&pcm)).unwrap_or(true) {
+        if encoder
+            .as_ref()
+            .map(|(enc, _)| enc.changed(&pcm))
+            .unwrap_or(true)
+        {
             encoder = None;
             let mut reason = String::new();
             while encoder.is_none() {
@@ -411,17 +520,28 @@ async fn audio_loop(
                 };
                 match AudioEncoder::open(pick.row, pcm.sample_rate, pcm.channels) {
                     Ok((enc, rate, channels)) => {
-                        let mut config = StreamConfig::audio(pick.row, &pick.encoder, rate, channels);
+                        let mut config =
+                            StreamConfig::audio(pick.row, &pick.encoder, rate, channels);
                         config.reason = std::mem::take(&mut reason);
                         if pick.row == Audio::Opus {
                             config.bitrate_kbps = (crate::opus::DEFAULT_BITRATE / 1000) as u32;
                         }
-                        log(&format!("audio {} {} Hz {} ch (capture {} Hz {} ch)", pick.row.name(), rate, channels, pcm.sample_rate, pcm.channels));
+                        log(&format!(
+                            "audio {} {} Hz {} ch (capture {} Hz {} ch)",
+                            pick.row.name(),
+                            rate,
+                            channels,
+                            pcm.sample_rate,
+                            pcm.channels
+                        ));
                         wire::write_record(&mut send, AUDIO2_MAGIC, &config.encode()).await?;
                         encoder = Some((enc, pick.row));
                     }
                     Err(error) => {
-                        log(&format!("{} audio encoder failed: {error}", pick.row.name()));
+                        log(&format!(
+                            "{} audio encoder failed: {error}",
+                            pick.row.name()
+                        ));
                         if pick.row == Audio::Pcm {
                             return Err(error);
                         }
@@ -431,7 +551,9 @@ async fn audio_loop(
                 }
             }
         }
-        let Some((enc, row)) = encoder.as_mut() else { continue };
+        let Some((enc, row)) = encoder.as_mut() else {
+            continue;
+        };
         match enc.push(&pcm) {
             Ok(packets) => {
                 for packet in packets {
@@ -439,7 +561,10 @@ async fn audio_loop(
                 }
             }
             Err(error) => {
-                log(&format!("{} audio encoder failed mid-session: {error}", row.name()));
+                log(&format!(
+                    "{} audio encoder failed mid-session: {error}",
+                    row.name()
+                ));
                 excluded.push(*row);
                 encoder = None;
             }

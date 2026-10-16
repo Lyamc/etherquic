@@ -26,6 +26,8 @@ pub const KIND_WAKE: u8 = 6;
 pub const KIND_RELEASE: u8 = 7;
 /// Helper to service: one raw RGB frame, `u32le` width and height first.
 pub const KIND_RAW: u8 = 8;
+/// Helper to service: the cursor record body.
+pub const KIND_CURSOR: u8 = 9;
 
 /// Same 15 bytes as `etherquic-play`'s `EACK` record.
 pub const ACK_KEY: u8 = 1;
@@ -64,7 +66,10 @@ impl Rgb {
         let height = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
         let rgb = payload[8..].to_vec();
         if width == 0 || height == 0 || rgb.len() != width as usize * height as usize * 3 {
-            return Err(format!("raw frame {width}x{height} has {} bytes", rgb.len()));
+            return Err(format!(
+                "raw frame {width}x{height} has {} bytes",
+                rgb.len()
+            ));
         }
         Ok(Rgb { width, height, rgb })
     }
@@ -140,6 +145,8 @@ pub enum Message {
     /// Helper to service: width u32le, height u32le, packed RGB. The service
     /// encodes it with the codec the player negotiated.
     Raw(Vec<u8>),
+    /// Helper to service: the cursor record body.
+    Cursor(Vec<u8>),
 }
 
 impl Message {
@@ -153,6 +160,7 @@ impl Message {
             Self::Wake => (KIND_WAKE, &[][..]),
             Self::Release => (KIND_RELEASE, &[][..]),
             Self::Raw(bytes) => (KIND_RAW, bytes),
+            Self::Cursor(bytes) => (KIND_CURSOR, bytes),
         }
     }
 
@@ -169,6 +177,7 @@ impl Message {
             KIND_WAKE => Self::Wake,
             KIND_RELEASE => Self::Release,
             KIND_RAW => Self::Raw(payload.to_vec()),
+            KIND_CURSOR => Self::Cursor(payload.to_vec()),
             other => return Err(format!("unknown desk message {other}")),
         })
     }
@@ -212,11 +221,7 @@ pub fn fit_rgba(rgba: &[u8], width: u32, height: u32, max_width: u32) -> Result<
         for px in rgba[..expect].chunks_exact(4) {
             rgb.extend_from_slice(&px[..3]);
         }
-        return Ok(Rgb {
-            width,
-            height,
-            rgb,
-        });
+        return Ok(Rgb { width, height, rgb });
     }
     let mut rgb = vec![0u8; (tw as usize) * (th as usize) * 3];
     for y in 0..th {
@@ -244,12 +249,7 @@ pub fn encode_jpeg(picture: &Rgb, quality: u8) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::new();
     Encoder::new(&mut out, quality.clamp(1, 100))
-        .encode(
-            &picture.rgb[..expect],
-            width,
-            height,
-            ColorType::Rgb,
-        )
+        .encode(&picture.rgb[..expect], width, height, ColorType::Rgb)
         .map_err(|error| error.to_string())?;
     Ok(out)
 }
@@ -313,7 +313,11 @@ mod tests {
 
     #[test]
     fn wake_and_release_are_empty_frames() {
-        let rgb = Rgb { width: 2, height: 2, rgb: (0..12).collect() };
+        let rgb = Rgb {
+            width: 2,
+            height: 2,
+            rgb: (0..12).collect(),
+        };
         assert_eq!(Rgb::from_raw(&rgb.raw_payload()).unwrap(), rgb);
         assert!(Rgb::from_raw(&[2, 0, 0, 0, 2, 0, 0, 0, 1]).is_err());
         for (message, kind) in [(Message::Wake, KIND_WAKE), (Message::Release, KIND_RELEASE)] {
@@ -327,13 +331,23 @@ mod tests {
     }
 
     #[test]
+    fn cursor_message_keeps_its_bytes() {
+        let message = Message::Cursor(vec![1, 2, 3, 4]);
+        let (kind, payload) = message.parts();
+        assert_eq!(kind, KIND_CURSOR);
+        let bytes = frame(kind, payload).unwrap();
+        assert_eq!(Message::decode(bytes[0], &bytes[5..]).unwrap(), message);
+    }
+
     fn pointer_center_is_the_middle_pixel() {
         assert_eq!(place_pointer(32_767, 32_768, 1920, 1080), (960, 540));
     }
 
     #[test]
     fn jpeg_of_a_solid_frame_is_non_empty() {
-        let rgba = [255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        let rgba = [
+            255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+        ];
         let picture = fit_rgba(&rgba, 2, 2, 1280).unwrap();
         assert_eq!((picture.width, picture.height), (2, 2));
         let jpeg = encode_jpeg(&picture, 40).unwrap();

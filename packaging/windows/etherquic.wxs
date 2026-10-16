@@ -25,6 +25,9 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
+    <Icon Id="etherquic.ico" SourceFile="$(var.Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="etherquic.ico" />
+
     <Property Id="MEMBRANE" Value="1" />
     <Property Id="ACCESS" Secure="yes" />
     <Property Id="ARPCOMMENTS" Value="etherquic host service, Membrane L2 filter and the etherquic app" />
@@ -45,7 +48,8 @@
 
     <Component Id="StartMenu" Directory="ProgramMenuFolder" Bitness="always64">
       <Shortcut Id="AppShortcut" Name="etherquic" Description="Find and play etherquic hosts"
-                Target="[INSTALLFOLDER]etherquic.exe" WorkingDirectory="INSTALLFOLDER" />
+                Target="[INSTALLFOLDER]etherquic.exe" WorkingDirectory="INSTALLFOLDER"
+                Icon="etherquic.ico" />
       <RegistryValue Root="HKLM" Key="Software\EtherQuic\etherquic" Name="StartMenu"
                      Type="integer" Value="1" KeyPath="yes" />
     </Component>

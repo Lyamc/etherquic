@@ -134,6 +134,7 @@ async fn main() -> Result<(), String> {
                 }
             }
             PlayerEvent::AudioFailed { audio, reason } => println!("audio decoder {} failed: {reason}", audio.token()),
+            PlayerEvent::Cursor(_) => {}
         }
     }
     let n = samples.len().max(1) as f64;

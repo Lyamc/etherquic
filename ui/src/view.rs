@@ -3,7 +3,9 @@
 //! The host card shows a QR code of this PC so a phone can read the address,
 //! the service, and the port. The taskbar button is applied from a deferred
 //! callback so the Win32 call is not inside the render borrow. It runs only
-//! when the desired state changes.
+//! when the desired state changes. Alt-Tab still lists the window. On Windows
+//! the notification area keeps an icon from `assets/etherquic.svg` on the
+//! taskbar. Closing the window hides it there.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -17,35 +19,35 @@ use etherquic::{BackendProbe, MediaBackend};
 use etherquic_play::{
     display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
 };
+use etherquic_play::{CursorMode, Look, ScaleMode, SizeMatch, PAD_SLOTS};
 use etherquic_ui::{
     active_layer, apply_override, audio_for, audio_hint, audio_match_line, backend_hint,
     backend_label, backend_line, capture_rate, dial_target, format_mac, lanes, list_nics,
     listed_top, load_connections, load_preferences, local_video_line, mac_key, qr_grid,
     remote_backend_line, remote_hardware_line, store_connections, store_preferences, swap_earlier,
     swap_later, this_pc, top_selection, video_hint, video_match_line, Applied, ConnectionOverride,
-    ConnectionPrefs, DialTarget, FrameRate, HexMac, Layer, Link, NicChoice, Preferences, QrGrid,
-    Role, Share, CLIENT_MAC, FPS_CHOICES, HOST_MAC, SOFTWARE_FPS,
+    ConnectionPrefs, ConnectionTabs, DialTarget, FrameRate, HexMac, Layer, Link, NicChoice,
+    Preferences, QrGrid, Role, Share, CLIENT_MAC, FPS_CHOICES, HOST_MAC, SOFTWARE_FPS,
 };
-use etherquic_ui::{codec_choice_for, last_session, predicted_pair, Predicted};
+use etherquic_ui::{
+    ago, caps_details, caps_summary, decode_thumbnail, load_hosts, matches_filter, scrollbar,
+    store_hosts, HostAddr, HostBook, Presence, Roster, Sighting, ThisMachine,
+};
 use etherquic_ui::{
     backends as backend_list, chosen_audio, chosen_video, default_audio, default_video,
     load_defaults, load_settings, move_to_front, store_defaults, store_settings, BackendState,
     Field, NetworkDriver, Part, RosterRow, Section, Settings,
 };
-use etherquic_play::{ScaleMode, SizeMatch, PAD_SLOTS};
-use etherquic_ui::{
-    caps_details, caps_summary, decode_thumbnail,
-    ago, load_hosts, matches_filter, scrollbar, store_hosts, HostAddr, HostBook, Presence, Roster,
-    Sighting,
-};
+use etherquic_ui::{codec_choice_for, last_session, predicted_pair, Predicted};
 
+use crate::badge::os_badge;
 use crate::scan::Scan;
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds,
-    ClickEvent, Context, Div, FocusHandle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, img, ImageSource, ObjectFit, RenderImage,
-    anchored, deferred,
+    anchored, canvas, deferred, div, fill, img, point, prelude::*, px, rgb, size, AnyElement, App,
+    Application, Bounds, ClickEvent, Context, Div, FocusHandle, FontWeight, ImageSource,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 
 const BG: u32 = 0x12141a;
@@ -69,6 +71,9 @@ const ACTIONS_W: f32 = 236.;
 /// Discovery thumbnails show at 16:9 in this box.
 const THUMB_W: f32 = 64.;
 const THUMB_H: f32 = 36.;
+/// Operating-system mark beside the thumbnail.
+const BADGE_W: f32 = 34.;
+const LEAD_W: f32 = BADGE_W + 6. + THUMB_W;
 const HOST_ROW_H: f32 = 64.0;
 /// Two lines of status. Longer text is clipped so the page under it never moves.
 const STATUS_H: f32 = 40.0;
@@ -76,12 +81,13 @@ const STATUS_H: f32 = 40.0;
 const DEVICES_SHOWN: usize = 4;
 
 const USAGE: &str = "\
-etherquic
-etherquic host [--nic IFACE]
-etherquic connect --peer-mac MAC [--nic IFACE]
-etherquic connect --udp IP:PORT
+etherquic [--console]
+etherquic host [--nic IFACE] [--console]
+etherquic connect --peer-mac MAC [--nic IFACE] [--console]
+etherquic connect --udp IP:PORT [--console]
 
 host shares this machine. connect joins one.
+--console opens a console. A launch from a terminal uses that terminal.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,7 +108,7 @@ struct Launch {
 
 impl Launch {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let args: Vec<String> = args.collect();
+        let args: Vec<String> = args.filter(|arg| arg != "--console").collect();
         if args.is_empty() {
             return Ok(Self {
                 command: Command::Window,
@@ -173,6 +179,42 @@ fn mac_from_text(text: &str) -> Result<HexMac, String> {
     Ok(mac)
 }
 
+/// Put the window in the notification area once it has an HWND.
+fn install_tray(window: &mut Window, cx: &mut Context<Desk>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(hwnd) = crate::taskbar::hwnd_of(window) else {
+        return;
+    };
+    if !crate::tray::install(hwnd) {
+        DONE.store(true, Ordering::Relaxed);
+        return;
+    }
+    DONE.store(true, Ordering::Relaxed);
+    window.on_window_should_close(cx, |_window, _cx| {
+        if crate::tray::quit_requested() || !crate::tray::installed() {
+            true
+        } else {
+            crate::tray::hide_main();
+            false
+        }
+    });
+    cx.spawn(async move |_desk, cx| loop {
+        gpui::Timer::after(Duration::from_millis(80)).await;
+        if crate::tray::take_quit() {
+            crate::tray::remove();
+            if cx.update(|app| app.quit()).is_err() {
+                break;
+            }
+            break;
+        }
+    })
+    .detach();
+}
+
 pub fn run() {
     let launch = match Launch::parse(std::env::args().skip(1)) {
         Ok(launch) => launch,
@@ -189,20 +231,35 @@ pub fn run() {
         })
         .detach();
 
-        let bounds = WindowBounds::centered(size(px(960.), px(880.)), cx);
+        let screen = cx
+            .primary_display()
+            .map(|display| crate::place::from_bounds(display.bounds()));
+        let fit = crate::place::fit(screen);
+        let open = fit.opening;
+        let outer = fit.outer;
         let launch = launch.clone();
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(bounds),
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(open.x), px(open.y)),
+                    size: size(px(open.w), px(open.h)),
+                })),
                 titlebar: Some(TitlebarOptions {
                     title: Some("etherquic".into()),
                     ..Default::default()
                 }),
                 app_id: Some("etherquic".into()),
-                window_min_size: Some(size(px(760.), px(560.))),
+                window_min_size: Some(size(px(open.min_w), px(open.min_h))),
                 ..Default::default()
             },
-            move |_window, cx| {
+            move |window, cx| {
+                if let Some(outer) = outer {
+                    if let Some(hwnd) = crate::taskbar::hwnd_of(window) {
+                        // After this builder returns, the window is stored and
+                        // this snap can update the viewport.
+                        cx.defer(move |_cx| crate::place::snap_outer(hwnd, outer));
+                    }
+                }
                 let launch = launch.clone();
                 cx.new(|cx| Desk::new(cx, launch))
             },
@@ -214,6 +271,12 @@ pub fn run() {
 
 struct Desk {
     link: Link,
+    /// Every connection the window is keeping. `link` is the current one.
+    tabs: ConnectionTabs,
+    /// Connections that are open and not current. Their sessions keep running.
+    parked: HashMap<u64, Link>,
+    /// Sessions told to leave. Reaped after the worker exits, not on the click.
+    ending: Vec<Link>,
     nics: Vec<NicChoice>,
     nic_error: Option<String>,
     nic: Option<String>,
@@ -232,6 +295,8 @@ struct Desk {
     share_text: String,
     share: Share,
     qr: Option<QrGrid>,
+    /// This process: etherquic version and the operating system. Read once.
+    ours: etherquic::discover::Release,
     /// Global order. The first codec a discovered computer can run is the match.
     video_pref: Vec<PicturePref>,
     /// Rows switched off in Settings. A pin still uses them.
@@ -259,6 +324,8 @@ struct Desk {
     bar_sig: [f32; 4],
     book: HostBook,
     roster: Roster,
+    /// This computer. Its own service is left out of the host list.
+    here: ThisMachine,
     roster_burst: u64,
     tab: HostTab,
     filter: String,
@@ -327,6 +394,9 @@ impl Desk {
         let backend = etherquic::pick_backend(&saved.opus, &backends);
         let mut desk = Self {
             link: Link::idle(),
+            tabs: ConnectionTabs::new(),
+            parked: HashMap::new(),
+            ending: Vec::new(),
             nics,
             nic_error,
             nic: launch.nic.clone(),
@@ -342,6 +412,7 @@ impl Desk {
             share_text: String::new(),
             share: Share::blank(),
             qr: None,
+            ours: etherquic::discover::local_release(),
             video_pref: saved.video,
             video_off: saved.video_off,
             audio_pref: saved.audio,
@@ -359,6 +430,7 @@ impl Desk {
             tab: HostTab::Discovered,
             book: load_hosts(),
             roster: Roster::default(),
+            here: ThisMachine::detect(),
             roster_burst: 0,
             filter: String::new(),
             filter_focus: cx.focus_handle(),
@@ -397,7 +469,12 @@ impl Desk {
         desk.refresh_devices(cx);
         desk.apply_settings(false);
         desk.refresh_share();
-        if !desk.book.saved.is_empty() {
+        if desk
+            .book
+            .saved
+            .iter()
+            .any(|entry| !desk.here.owns_addr(&entry.addr))
+        {
             desk.tab = HostTab::Saved;
         }
         desk.message = match launch.command {
@@ -410,17 +487,24 @@ impl Desk {
                     let peer = peer.unwrap_or(HOST_MAC);
                     desk.pending_recent = Some((
                         addr.to_string(),
-                        HostAddr::Ip { ip: addr.ip(), port: addr.port() },
+                        HostAddr::Ip {
+                            ip: addr.ip(),
+                            port: addr.port(),
+                        },
                     ));
                     let trace = desk.applied(peer).trace_input;
                     let codecs = desk.codec_offer(Some(peer));
-                    desk.link.connect(launch.nic, peer, trace, 0, Some(addr), codecs).err()
+                    desk.link
+                        .connect(launch.nic, peer, trace, 0, Some(addr), codecs)
+                        .err()
                 }
                 (None, Some(peer)) => {
                     desk.pending_recent = Some((format_mac(peer), HostAddr::Mac(peer)));
                     let trace = desk.applied(peer).trace_input;
                     let codecs = desk.codec_offer(Some(peer));
-                    desk.link.connect(launch.nic, peer, trace, 0, None, codecs).err()
+                    desk.link
+                        .connect(launch.nic, peer, trace, 0, None, codecs)
+                        .err()
                 }
                 (None, None) => Some("Peer address needs 12 hex digits.".into()),
             },
@@ -432,7 +516,46 @@ impl Desk {
             }
         }
         desk.start_poll(cx);
+        desk.watch_pastes(cx);
         desk
+    }
+
+    fn watch_pastes(&self, cx: &mut Context<Self>) {
+        etherquic_play::watch_text_paste();
+        cx.spawn(async move |this, cx| loop {
+            gpui::Timer::after(Duration::from_millis(40)).await;
+            if etherquic_play::take_text_paste_requests() == 0 {
+                continue;
+            }
+            if this
+                .update(cx, |desk, cx| {
+                    desk.paste_local_clipboard(cx);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Send this computer's clipboard text into the open view.
+    /// The keystroke switch types it. Otherwise it goes out as clipboard text.
+    fn paste_local_clipboard(&mut self, cx: &App) {
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        if text.is_empty() {
+            self.message = Some("Clipboard has no text.".into());
+            return;
+        }
+        if let Err(err) =
+            etherquic_play::send_text_paste(&text, self.settings.clipboard_as_keystrokes)
+        {
+            self.message = Some(format!("Paste did not send: {err}"));
+        }
     }
 
     fn start_poll(&self, cx: &mut Context<Self>) {
@@ -440,7 +563,7 @@ impl Desk {
             gpui::Timer::after(Duration::from_millis(400)).await;
             if this
                 .update(cx, |desk, cx| {
-                    desk.link.reap();
+                    desk.reap_links();
                     desk.refresh_share();
                     cx.notify();
                 })
@@ -465,35 +588,124 @@ impl Desk {
         cx.defer(move |_cx| crate::taskbar::apply(hwnd, want));
     }
 
-    fn on_host(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn reap_links(&mut self) {
         self.link.reap();
-        if self.link.role() == Role::Client {
+        for link in self.parked.values_mut() {
+            link.reap();
+        }
+        self.ending.retain_mut(|link| {
+            link.reap();
+            link.running()
+        });
+    }
+
+    /// Park the current session and open a new current tab. The parked
+    /// session keeps running.
+    fn begin_tab(&mut self, label: String) -> u64 {
+        if let Some(id) = self.tabs.active_id() {
+            let old = std::mem::replace(&mut self.link, Link::idle());
+            self.parked.insert(id, old);
+        }
+        let id = self.tabs.open(label);
+        self.show_picture();
+        id
+    }
+
+    fn show_picture(&self) {
+        etherquic_play::switch_picture(self.link.picture_id());
+    }
+
+    /// The new tab did not start. Put the previous session back.
+    fn abort_tab(&mut self, id: u64) {
+        let _ = self.tabs.close(id);
+        self.link = Link::idle();
+        if let Some(prev) = self.tabs.active_id() {
+            if let Some(link) = self.parked.remove(&prev) {
+                self.link = link;
+            }
+        }
+        self.show_picture();
+    }
+
+    fn switch_connection(&mut self, id: u64) {
+        let Some(current) = self.tabs.active_id() else {
+            return;
+        };
+        if current == id || !self.tabs.switch(id) {
             return;
         }
+        let incoming = self.parked.remove(&id).unwrap_or_else(Link::idle);
+        let outgoing = std::mem::replace(&mut self.link, incoming);
+        self.parked.insert(current, outgoing);
+        self.show_picture();
+    }
+
+    fn close_connection(&mut self, id: u64) {
+        let active = self.tabs.active_id();
+        if !self.tabs.close(id) {
+            return;
+        }
+        if active == Some(id) {
+            self.link.release();
+            let closing = std::mem::replace(&mut self.link, Link::idle());
+            self.ending.push(closing);
+            if let Some(next) = self.tabs.active_id() {
+                if let Some(link) = self.parked.remove(&next) {
+                    self.link = link;
+                }
+            }
+        } else if let Some(mut link) = self.parked.remove(&id) {
+            link.release();
+            self.ending.push(link);
+        }
+        self.show_picture();
+        self.message = None;
+    }
+
+    fn on_host(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.reap_links();
         if self.link.role() == Role::Host {
-            self.link.stop();
+            if let Some(id) = self.tabs.active_id() {
+                self.close_connection(id);
+            } else {
+                self.link.stop();
+            }
             self.message = None;
             cx.notify();
             return;
         }
-        match self.link.host(self.nic.clone(), self.backend, self.capture_fps()) {
+        let id = self.begin_tab("This computer".into());
+        match self
+            .link
+            .host(self.nic.clone(), self.backend, self.capture_fps())
+        {
             Ok(()) => self.message = None,
-            Err(err) => self.message = Some(err),
+            Err(err) => {
+                self.abort_tab(id);
+                self.message = Some(err);
+            }
         }
         cx.notify();
     }
 
     fn on_connect(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.link.reap();
-        if self.link.role() == Role::Host {
-            return;
-        }
+        self.reap_links();
         if self.link.role() == Role::Client {
-            self.link.stop();
+            if let Some(id) = self.tabs.active_id() {
+                self.close_connection(id);
+            } else {
+                self.link.stop();
+            }
             self.message = None;
             cx.notify();
             return;
         }
+        self.open_typed_connection(cx);
+    }
+
+    /// Start another player connection. A host session that is already open
+    /// stays open on its own tab.
+    fn open_typed_connection(&mut self, cx: &mut Context<Self>) {
         if let Some(HostAddr::Ip { ip, port }) = self.direct {
             self.connect_direct(ip, port, cx);
             return;
@@ -521,9 +733,8 @@ impl Desk {
             DialTarget::L2 => None,
             DialTarget::Udp(addr) => Some(addr),
             DialTarget::NeedsNic => {
-                self.message = Some(
-                    "That IPv6 address is link-local. Pick the adapter, not Auto.".into(),
-                );
+                self.message =
+                    Some("That IPv6 address is link-local. Pick the adapter, not Auto.".into());
                 cx.notify();
                 return;
             }
@@ -547,6 +758,7 @@ impl Desk {
                 .unwrap_or_else(|| format_mac(peer))
         });
         let codecs = self.codec_offer(Some(peer));
+        let id = self.begin_tab(name.clone());
         match self
             .link
             .connect(self.nic.clone(), peer, trace, host_l2, udp, codecs)
@@ -555,7 +767,10 @@ impl Desk {
                 self.message = None;
                 self.pending_recent = Some((name, used));
             }
-            Err(err) => self.message = Some(err),
+            Err(err) => {
+                self.abort_tab(id);
+                self.message = Some(err);
+            }
         }
         cx.notify();
     }
@@ -577,9 +792,8 @@ impl Desk {
             DialTarget::Udp(addr) => Some(addr),
             DialTarget::L2 => None,
             DialTarget::NeedsNic => {
-                self.message = Some(
-                    "That IPv6 address is link-local. Pick the adapter, not Auto.".into(),
-                );
+                self.message =
+                    Some("That IPv6 address is link-local. Pick the adapter, not Auto.".into());
                 cx.notify();
                 return;
             }
@@ -596,12 +810,19 @@ impl Desk {
             .or_else(|| known.as_ref().map(|row| row.title()))
             .unwrap_or_else(|| addr.display());
         let codecs = self.codec_offer((peer != [0; 6]).then_some(peer));
-        match self.link.connect(self.nic.clone(), peer, trace, 0, udp, codecs) {
+        let id = self.begin_tab(name.clone());
+        match self
+            .link
+            .connect(self.nic.clone(), peer, trace, 0, udp, codecs)
+        {
             Ok(()) => {
                 self.message = None;
                 self.pending_recent = Some((name, addr));
             }
-            Err(err) => self.message = Some(err),
+            Err(err) => {
+                self.abort_tab(id);
+                self.message = Some(err);
+            }
         }
         cx.notify();
     }
@@ -686,15 +907,72 @@ impl Desk {
         }
     }
 
+    fn connection_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.tabs.active_id();
+        let tabs: Vec<(u64, String, bool)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.id, tab.label.clone(), Some(tab.id) == active))
+            .collect();
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .w_full()
+            .children(tabs.into_iter().map(|(id, label, on)| {
+                let title = label.clone();
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("conn-tab-{id}")))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(if on { 0x243044 } else { 0x1a1e27 }))
+                            .text_color(rgb(TEXT))
+                            .child(title)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |desk, _, _, cx| {
+                                    desk.switch_connection(id);
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("conn-tab-x-{id}")))
+                            .px_1()
+                            .text_color(rgb(MUTED))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |desk, _, _, cx| {
+                                    cx.stop_propagation();
+                                    desk.close_connection(id);
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+            }))
+    }
+
     fn host_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let hosting = self.link.role() == Role::Host;
-        let enabled = self.link.role() != Role::Client;
+        let enabled = true;
         let label = if hosting { "Stop hosting" } else { "Host" };
         let edge = if hosting { HOST_GREEN } else { CARD_EDGE };
         let capture = self.capture_fps();
         let open = self.open.host;
         let rates = open.then(|| self.global_fps_row("host-fps", cx));
-        let qr = open.then(|| phone_share(&self.qr));
+        let ours = self.ours.clone();
+        let grid = self.qr.clone();
+        let qr = open.then(move || phone_share(&grid, &ours));
         div()
             .flex()
             .flex_col()
@@ -721,7 +999,7 @@ impl Desk {
             .child(disclosure(
                 "host-more",
                 "Hosting options",
-                format!("{capture} fps · phone code"),
+                format!("{capture} fps · version {}", self.ours.version),
                 open,
                 cx.listener(|desk, _, _, cx| {
                     desk.open.host = !desk.open.host;
@@ -740,7 +1018,7 @@ impl Desk {
 
     fn connect_card(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let playing = self.link.role() == Role::Client;
-        let enabled = self.link.role() != Role::Host;
+        let enabled = true;
         let label = if playing { "Disconnect" } else { "Connect" };
         let edge = if playing { PLAYER_BLUE } else { CARD_EDGE };
         let focused = self.focus.is_focused(window);
@@ -896,10 +1174,14 @@ impl Desk {
             .as_ref()
             .and_then(|row| self.thumbnail_image(row.key, row.thumbnail.as_deref()));
         let summary = match &row {
-            Some(row) => row_summary(row.caps.as_ref()),
+            Some(row) => row_summary(row.caps.as_ref(), row.release.as_ref()),
             None => "Not heard on this network yet".into(),
         };
-        (thumb_slot(picture), summary)
+        let (caps, release) = match &row {
+            Some(row) => (row.caps.clone(), row.release.clone()),
+            None => (None, None),
+        };
+        (host_lead(picture, caps.as_ref(), release.as_ref()), summary)
     }
 
     /// The host Connect will dial, by name when one was picked.
@@ -951,8 +1233,14 @@ impl Desk {
                 .find(|device| device.l2_mac == mac)
                 .cloned()
         });
-        let v4 = device.as_ref().map(|device| device.ipv4.clone()).unwrap_or_default();
-        let v6 = device.as_ref().map(|device| device.ipv6.clone()).unwrap_or_default();
+        let v4 = device
+            .as_ref()
+            .map(|device| device.ipv4.clone())
+            .unwrap_or_default();
+        let v6 = device
+            .as_ref()
+            .map(|device| device.ipv6.clone())
+            .unwrap_or_default();
         let active = active_layer(self.layer, &v4, &v6);
         let mut chips = div()
             .flex()
@@ -1052,32 +1340,60 @@ impl Desk {
         let now = now_secs();
         let idle = self.link.role() == Role::Idle;
         let filter = self.filter.clone();
-        let mut list = div().flex().flex_col().gap_1().w_full().min_w_0().flex_none();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w_0()
+            .flex_none();
         let mut shown = 0usize;
         let mut empty = String::new();
         match self.tab {
             HostTab::Saved => {
                 for index in self.book.saved_order() {
                     let entry = self.book.saved[index].clone();
+                    if self.here.owns_addr(&entry.addr) {
+                        continue;
+                    }
                     let address = format!("{} · {}", entry.addr.display(), entry.addr.kind());
                     if !matches_filter(&filter, &[&entry.name, &address]) {
                         continue;
                     }
                     shown += 1;
                     let presence = self.roster.presence(&entry.addr);
-                    let row = self.saved_row(index, entry.name.clone(), entry.addr, address, presence, now, idle, window, cx);
+                    let row = self.saved_row(
+                        index,
+                        entry.name.clone(),
+                        entry.addr,
+                        address,
+                        presence,
+                        now,
+                        idle,
+                        window,
+                        cx,
+                    );
                     list = list.child(row);
                 }
                 if shown == 0 {
-                    empty = if self.book.saved.is_empty() {
-                        "Nothing saved yet. Use Add host, or Save on a Recent or Discovered host.".into()
-                    } else {
+                    empty = if self
+                        .book
+                        .saved
+                        .iter()
+                        .any(|entry| !self.here.owns_addr(&entry.addr))
+                    {
                         "No saved host matches the filter.".into()
+                    } else {
+                        "Nothing saved yet. Use Add host, or Save on a Recent or Discovered host."
+                            .into()
                     };
                 }
             }
             HostTab::Recent => {
                 for (index, entry) in self.book.recent.clone().into_iter().enumerate() {
+                    if self.here.owns_addr(&entry.addr) {
+                        continue;
+                    }
                     let address = format!("{} · {}", entry.addr.display(), entry.addr.kind());
                     if !matches_filter(&filter, &[&entry.name, &address]) {
                         continue;
@@ -1119,7 +1435,13 @@ impl Desk {
                                 cx.notify();
                             }),
                         ))
-                        .child(self.connect_chip(format!("recent-go-{index}"), name.clone(), addr, idle, cx));
+                        .child(self.connect_chip(
+                            format!("recent-go-{index}"),
+                            name.clone(),
+                            addr,
+                            idle,
+                            cx,
+                        ));
                     let (lead, summary) = self.row_extras(&addr);
                     list = list.child(host_row(
                         SharedString::from(format!("recent-{index}")),
@@ -1138,10 +1460,15 @@ impl Desk {
                     ));
                 }
                 if shown == 0 {
-                    empty = if self.book.recent.is_empty() {
-                        "Hosts you connect to show up here.".into()
-                    } else {
+                    empty = if self
+                        .book
+                        .recent
+                        .iter()
+                        .any(|entry| !self.here.owns_addr(&entry.addr))
+                    {
                         "No recent host matches the filter.".into()
+                    } else {
+                        "Hosts you connect to show up here.".into()
                     };
                 }
             }
@@ -1149,8 +1476,11 @@ impl Desk {
                 let details = self.open.devices;
                 let rows: Vec<_> = self.roster.ordered().into_iter().cloned().collect();
                 for row in rows {
+                    if self.here.owns_row(&row) {
+                        continue;
+                    }
                     let title = row.title();
-                    let summary = row_summary(row.caps.as_ref());
+                    let summary = row_summary(row.caps.as_ref(), row.release.as_ref());
                     let address = row.address_line();
                     if !matches_filter(&filter, &[&title, &address, &summary]) {
                         continue;
@@ -1158,15 +1488,27 @@ impl Desk {
                     shown += 1;
                     let mac = row.mac;
                     let key = format_mac(row.key).replace(':', "");
-                    let found = board.devices.iter().find(|device| device.key == row.key).cloned();
+                    let found = board
+                        .devices
+                        .iter()
+                        .find(|device| device.key == row.key)
+                        .cloned();
                     let picture = self.thumbnail_image(row.key, row.thumbnail.as_deref());
                     let caps_lines = row.caps.as_ref().map(caps_details).unwrap_or_default();
                     // A host heard only over UDP is dialed by IP: raw Ethernet is
                     // not working here, and every host shares one L2 identity.
-                    let udp_only = found.as_ref().is_some_and(|device| device.via_udp && !device.via_l2);
+                    let udp_only = found
+                        .as_ref()
+                        .is_some_and(|device| device.via_udp && !device.via_l2);
                     let target = match (udp_only, row.ipv4.first(), row.ipv6.first()) {
-                        (true, Some(ip), _) => HostAddr::Ip { ip: IpAddr::V4(*ip), port: row.port },
-                        (true, None, Some(ip)) => HostAddr::Ip { ip: IpAddr::V6(*ip), port: row.port },
+                        (true, Some(ip), _) => HostAddr::Ip {
+                            ip: IpAddr::V4(*ip),
+                            port: row.port,
+                        },
+                        (true, None, Some(ip)) => HostAddr::Ip {
+                            ip: IpAddr::V6(*ip),
+                            port: row.port,
+                        },
                         _ => HostAddr::Mac(mac),
                     };
                     let status = match (&found, row.online) {
@@ -1193,7 +1535,8 @@ impl Desk {
                             Some(device_details(device, &selection, &caps_lines).into_any_element())
                         }
                         (None, true) => Some(
-                            muted_line("Not in the latest discovery burst.".into()).into_any_element(),
+                            muted_line("Not in the latest discovery burst.".into())
+                                .into_any_element(),
                         ),
                         _ => None,
                     };
@@ -1224,7 +1567,7 @@ impl Desk {
                         ));
                     let row_el = host_row(
                         SharedString::from(format!("found-{key}")),
-                        Some(thumb_slot(picture)),
+                        Some(host_lead(picture, row.caps.as_ref(), row.release.as_ref())),
                         row_title(title.clone()),
                         address,
                         summary,
@@ -1251,10 +1594,23 @@ impl Desk {
                     );
                 }
                 if shown == 0 {
+                    let only_this_pc = !board.devices.is_empty()
+                        && board.devices.iter().all(|device| {
+                            self.here.owns(
+                                device.name.trim(),
+                                device.l2_mac,
+                                device.key,
+                                device.caps.as_ref().and_then(|caps| caps.nic_mac),
+                                &device.ipv4,
+                                &device.ipv6,
+                            )
+                        });
                     empty = if let Some(err) = board.error.clone() {
                         err
                     } else if !self.roster.is_empty() {
                         "No discovered host matches the filter.".into()
+                    } else if only_this_pc {
+                        "No other computers answered.".into()
                     } else if board.looking {
                         "Looking for hosts…".into()
                     } else {
@@ -1300,13 +1656,13 @@ impl Desk {
             .min_w_0()
             .child(tab_chip(
                 "tab-saved",
-                format!("Saved {}", self.book.saved.len()),
+                format!("Saved {}", self.saved_count()),
                 self.tab == HostTab::Saved,
                 cx.listener(|desk, _, _, cx| desk.set_tab(HostTab::Saved, cx)),
             ))
             .child(tab_chip(
                 "tab-recent",
-                format!("Recent {}", self.book.recent.len()),
+                format!("Recent {}", self.recent_count()),
                 self.tab == HostTab::Recent,
                 cx.listener(|desk, _, _, cx| desk.set_tab(HostTab::Recent, cx)),
             ))
@@ -1382,7 +1738,11 @@ impl Desk {
                             .when(on_found, |row| {
                                 row.child(small_chip(
                                     "found-details",
-                                    if details_on { "Hide details" } else { "Details" },
+                                    if details_on {
+                                        "Hide details"
+                                    } else {
+                                        "Details"
+                                    },
                                     None,
                                     true,
                                     cx.listener(|desk, _, _, cx| {
@@ -1762,11 +2122,9 @@ impl Desk {
             idle,
             cx.listener(move |desk, _, window, cx| {
                 cx.stop_propagation();
-                if desk.link.role() != Role::Idle {
-                    return;
-                }
                 desk.pick(&name, addr);
-                desk.on_connect(window, cx);
+                desk.open_typed_connection(cx);
+                let _ = window;
             }),
         )
         .into_any_element()
@@ -1805,12 +2163,29 @@ impl Desk {
         }
     }
 
+    fn saved_count(&self) -> usize {
+        self.book
+            .saved
+            .iter()
+            .filter(|entry| !self.here.owns_addr(&entry.addr))
+            .count()
+    }
+
+    fn recent_count(&self) -> usize {
+        self.book
+            .recent
+            .iter()
+            .filter(|entry| !self.here.owns_addr(&entry.addr))
+            .count()
+    }
+
     /// Fold a finished discovery burst into the roster, and move a connect that
-    /// came up into Recent.
+    /// came up into Recent. This computer's own answer is dropped.
     fn track_hosts(&mut self) {
         let board = self.scan.board();
         if board.burst != self.roster_burst {
             self.roster_burst = board.burst;
+            self.here = ThisMachine::detect();
             let sightings: Vec<Sighting> = board
                 .devices
                 .iter()
@@ -1819,13 +2194,16 @@ impl Desk {
                     mac: device.l2_mac,
                     caps: device.caps.clone(),
                     thumbnail: device.thumbnail.clone(),
+                    release: device.release.clone(),
                     name: device.name.trim().to_string(),
                     ipv4: device.ipv4.clone(),
                     ipv6: device.ipv6.clone(),
                     port: device.l3_port,
                 })
+                .filter(|seen| !self.here.owns_sighting(seen))
                 .collect();
             self.roster.update(&sightings, now_secs());
+            self.roster.forget_self(&self.here);
         }
         if self.pending_recent.is_some() {
             match self.link.role() {
@@ -1975,10 +2353,7 @@ impl Desk {
     }
 
     fn applied(&self, mac: [u8; 6]) -> Applied {
-        apply_override(
-            &self.preferences_now(),
-            self.connections.get(&mac_key(mac)),
-        )
+        apply_override(&self.preferences_now(), self.connections.get(&mac_key(mac)))
     }
 
     fn capture_fps(&self) -> u32 {
@@ -1999,11 +2374,7 @@ impl Desk {
 
     fn edit_connection(&mut self, mac: [u8; 6], edit: impl FnOnce(&mut ConnectionOverride)) {
         let key = mac_key(mac);
-        let mut over = self
-            .connections
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
+        let mut over = self.connections.get(&key).cloned().unwrap_or_default();
         edit(&mut over);
         self.connections.set(key, over);
         if let Err(err) = store_connections(&self.connections) {
@@ -2017,7 +2388,13 @@ impl Desk {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = self.fps;
-        let mut row = div().flex().flex_row().flex_wrap().gap_2().w_full().min_w_0();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .w_full()
+            .min_w_0();
         row = row.child(choice_chip(
             SharedString::from(format!("{id_prefix}-auto")),
             "Auto",
@@ -2084,9 +2461,9 @@ impl Desk {
                 applied.skip_without_hw,
             )
         });
-        let audio_line = device
-            .as_ref()
-            .map(|device| audio_match_line(&applied.audio, &self.local_audio, device.audio.as_deref()));
+        let audio_line = device.as_ref().map(|device| {
+            audio_match_line(&applied.audio, &self.local_audio, device.audio.as_deref())
+        });
         let picture = self.picture_pin_row(mac, stored.as_ref().and_then(|over| over.video), cx);
         let sound = self.audio_pin_row(mac, stored.as_ref().and_then(|over| over.audio), cx);
         let rate = self.connection_fps_row(mac, stored.as_ref().and_then(|over| over.fps), cx);
@@ -2178,7 +2555,13 @@ impl Desk {
         pin: Option<PicturePref>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut row = div().flex().flex_row().flex_wrap().gap_2().w_full().min_w_0();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .w_full()
+            .min_w_0();
         row = row.child(choice_chip(
             "conn-video-default",
             "Default",
@@ -2210,7 +2593,13 @@ impl Desk {
         pin: Option<AudioId>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut row = div().flex().flex_row().flex_wrap().gap_2().w_full().min_w_0();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .w_full()
+            .min_w_0();
         row = row.child(choice_chip(
             "conn-audio-default",
             "Default",
@@ -2242,7 +2631,13 @@ impl Desk {
         pin: Option<FrameRate>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut row = div().flex().flex_row().flex_wrap().gap_2().w_full().min_w_0();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .w_full()
+            .min_w_0();
         row = row.child(choice_chip(
             "conn-fps-default",
             "Default",
@@ -2350,15 +2745,23 @@ impl Desk {
             .into_iter()
             .find(|device| device.l2_mac == mac);
         if let Some(predicted) = self.predicted(mac) {
-            let note = if predicted.negotiates { "" } else { " (host does not negotiate)" };
+            let note = if predicted.negotiates {
+                ""
+            } else {
+                " (host does not negotiate)"
+            };
             return format!(
                 "{} · {}{note} · {}",
                 predicted.video.name(),
                 predicted.audio.name(),
-                etherquic_ui::fps_headline(applied.fps, None, matches!(
-                    predicted.video,
-                    PicturePref::Av1Hw | PicturePref::H265Hw | PicturePref::H264Hw
-                )),
+                etherquic_ui::fps_headline(
+                    applied.fps,
+                    None,
+                    matches!(
+                        predicted.video,
+                        PicturePref::Av1Hw | PicturePref::H265Hw | PicturePref::H264Hw
+                    )
+                ),
             );
         }
         match device {
@@ -2504,72 +2907,105 @@ impl Desk {
     /// Ethernet, IPv4, and IPv6 for the picked host. Picking one fills the field.
     fn transport_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let row = self.selected_row();
-        let mac = row.as_ref().map(|row| row.mac).or_else(|| self.peer.parse());
+        let mac = row
+            .as_ref()
+            .map(|row| row.mac)
+            .or_else(|| self.peer.parse());
         let (direct_v4, direct_v6, direct_port) = match self.direct {
-            Some(HostAddr::Ip { ip: IpAddr::V4(ip), port }) => (Some(ip), None, port),
-            Some(HostAddr::Ip { ip: IpAddr::V6(ip), port }) => (None, Some(ip), port),
+            Some(HostAddr::Ip {
+                ip: IpAddr::V4(ip),
+                port,
+            }) => (Some(ip), None, port),
+            Some(HostAddr::Ip {
+                ip: IpAddr::V6(ip),
+                port,
+            }) => (None, Some(ip), port),
             _ => (None, None, 0),
         };
-        let v4 = row.as_ref().and_then(|row| row.ipv4.first().copied()).or(direct_v4);
-        let v6 = row.as_ref().and_then(|row| row.ipv6.first().copied()).or(direct_v6);
-        let port = row.as_ref().map(|row| row.port).filter(|port| *port != 0).unwrap_or(direct_port);
+        let v4 = row
+            .as_ref()
+            .and_then(|row| row.ipv4.first().copied())
+            .or(direct_v4);
+        let v6 = row
+            .as_ref()
+            .and_then(|row| row.ipv6.first().copied())
+            .or(direct_v6);
+        let port = row
+            .as_ref()
+            .map(|row| row.port)
+            .filter(|port| *port != 0)
+            .unwrap_or(direct_port);
         let (all_v4, all_v6) = row
             .as_ref()
             .map(|row| (row.ipv4.clone(), row.ipv6.clone()))
             .unwrap_or_default();
         let active = match self.direct {
-            Some(HostAddr::Ip { ip: IpAddr::V4(_), .. }) => 1,
-            Some(HostAddr::Ip { ip: IpAddr::V6(_), .. }) => 2,
+            Some(HostAddr::Ip {
+                ip: IpAddr::V4(_), ..
+            }) => 1,
+            Some(HostAddr::Ip {
+                ip: IpAddr::V6(_), ..
+            }) => 2,
             _ => match active_layer(self.layer, &all_v4, &all_v6) {
                 Layer::L2 => 0,
                 Layer::V4(_) => 1,
                 Layer::V6(_) => 2,
             },
         };
-        let tab = |id: &'static str, (kind, address): (&'static str, String), on: bool, enabled: bool| {
-            div()
-                .id(id)
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .h(px(38.))
-                .px_2()
-                .justify_center()
-                .overflow_hidden()
-                .rounded_sm()
-                .border_1()
-                .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
-                .bg(rgb(if on { 0x243044 } else { BG }))
-                .text_xs()
-                .text_color(rgb(if on { TEXT } else { MUTED }))
-                .when(!enabled, |tab| tab.opacity(0.45))
-                .when(enabled, |tab| tab.cursor_pointer())
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(16.))
-                        .line_height(px(16.))
-                        .overflow_hidden()
-                        .when(on, |line| line.font_weight(FontWeight::BOLD))
-                        .child(kind),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(16.))
-                        .line_height(px(16.))
-                        .overflow_hidden()
-                        .whitespace_normal()
-                        .child(address),
-                )
-        };
+        let tab =
+            |id: &'static str, (kind, address): (&'static str, String), on: bool, enabled: bool| {
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(38.))
+                    .px_2()
+                    .justify_center()
+                    .overflow_hidden()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+                    .bg(rgb(if on { 0x243044 } else { BG }))
+                    .text_xs()
+                    .text_color(rgb(if on { TEXT } else { MUTED }))
+                    .when(!enabled, |tab| tab.opacity(0.45))
+                    .when(enabled, |tab| tab.cursor_pointer())
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(16.))
+                            .line_height(px(16.))
+                            .overflow_hidden()
+                            .when(on, |line| line.font_weight(FontWeight::BOLD))
+                            .child(kind),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(16.))
+                            .line_height(px(16.))
+                            .overflow_hidden()
+                            .whitespace_normal()
+                            .child(address),
+                    )
+            };
         let ether_label = (
             "Ethernet",
-            mac.map(format_mac).unwrap_or_else(|| "no MAC address".into()),
+            mac.map(format_mac)
+                .unwrap_or_else(|| "no MAC address".into()),
         );
-        let v4_label = ("IPv4", v4.map(|ip| ip.to_string()).unwrap_or_else(|| "not announced".into()));
-        let v6_label = ("IPv6", v6.map(|ip| ip.to_string()).unwrap_or_else(|| "not announced".into()));
+        let v4_label = (
+            "IPv4",
+            v4.map(|ip| ip.to_string())
+                .unwrap_or_else(|| "not announced".into()),
+        );
+        let v6_label = (
+            "IPv6",
+            v6.map(|ip| ip.to_string())
+                .unwrap_or_else(|| "not announced".into()),
+        );
         div()
             .flex()
             .flex_row()
@@ -2577,29 +3013,42 @@ impl Desk {
             .w_full()
             .min_w_0()
             .child(
-                tab("via-l2", ether_label, active == 0, mac.is_some()).when_some(mac, |tab, mac| {
+                tab("via-l2", ether_label, active == 0, mac.is_some()).when_some(
+                    mac,
+                    |tab, mac| {
+                        tab.on_click(cx.listener(move |desk, _, _, cx| {
+                            desk.direct = None;
+                            desk.layer = Layer::L2;
+                            desk.peer = HexMac::from_bytes(mac);
+                            cx.notify();
+                        }))
+                    },
+                ),
+            )
+            .child(
+                tab("via-v4", v4_label, active == 1, v4.is_some()).when_some(v4, |tab, ip| {
                     tab.on_click(cx.listener(move |desk, _, _, cx| {
-                        desk.direct = None;
-                        desk.layer = Layer::L2;
-                        desk.peer = HexMac::from_bytes(mac);
+                        desk.direct = Some(HostAddr::Ip {
+                            ip: IpAddr::V4(ip),
+                            port,
+                        });
+                        desk.layer = Layer::V4(ip);
                         cx.notify();
                     }))
                 }),
             )
-            .child(tab("via-v4", v4_label, active == 1, v4.is_some()).when_some(v4, |tab, ip| {
-                tab.on_click(cx.listener(move |desk, _, _, cx| {
-                    desk.direct = Some(HostAddr::Ip { ip: IpAddr::V4(ip), port });
-                    desk.layer = Layer::V4(ip);
-                    cx.notify();
-                }))
-            }))
-            .child(tab("via-v6", v6_label, active == 2, v6.is_some()).when_some(v6, |tab, ip| {
-                tab.on_click(cx.listener(move |desk, _, _, cx| {
-                    desk.direct = Some(HostAddr::Ip { ip: IpAddr::V6(ip), port });
-                    desk.layer = Layer::V6(ip);
-                    cx.notify();
-                }))
-            }))
+            .child(
+                tab("via-v6", v6_label, active == 2, v6.is_some()).when_some(v6, |tab, ip| {
+                    tab.on_click(cx.listener(move |desk, _, _, cx| {
+                        desk.direct = Some(HostAddr::Ip {
+                            ip: IpAddr::V6(ip),
+                            port,
+                        });
+                        desk.layer = Layer::V6(ip);
+                        cx.notify();
+                    }))
+                }),
+            )
     }
 
     /// The discovery record of the picked host, for its codecs.
@@ -2662,7 +3111,12 @@ impl Desk {
         if let Some(predicted) = mac.and_then(|mac| self.predicted(mac)) {
             let pinned_v = pins.as_ref().is_some_and(|over| over.video.is_some());
             let pinned_a = pins.as_ref().is_some_and(|over| over.audio.is_some());
-            return (Some(predicted.video), Some(predicted.audio), pinned_v, pinned_a);
+            return (
+                Some(predicted.video),
+                Some(predicted.audio),
+                pinned_v,
+                pinned_a,
+            );
         }
         let chosen_v = chosen_video(
             &video,
@@ -2713,10 +3167,20 @@ impl Desk {
         let name = self.target_label();
         let items: Vec<(String, Option<usize>)> = match which {
             Menu::Video => std::iter::once(("Auto".to_string(), None))
-                .chain(PicturePref::order().into_iter().enumerate().map(|(i, pref)| (pref.name().to_string(), Some(i))))
+                .chain(
+                    PicturePref::order()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, pref)| (pref.name().to_string(), Some(i))),
+                )
                 .collect(),
             Menu::Audio => std::iter::once(("Auto".to_string(), None))
-                .chain(AudioId::order().into_iter().enumerate().map(|(i, codec)| (codec.name().to_string(), Some(i))))
+                .chain(
+                    AudioId::order()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, codec)| (codec.name().to_string(), Some(i))),
+                )
                 .collect(),
         };
         let mut menu = div()
@@ -2737,8 +3201,12 @@ impl Desk {
         for (index, (text, pick)) in items.into_iter().enumerate() {
             let on = match (pick, which) {
                 (None, _) => !overridden && !pinned,
-                (Some(i), Menu::Video) => overridden && self.session_video == PicturePref::order().get(i).copied(),
-                (Some(i), Menu::Audio) => overridden && self.session_audio == AudioId::order().get(i).copied(),
+                (Some(i), Menu::Video) => {
+                    overridden && self.session_video == PicturePref::order().get(i).copied()
+                }
+                (Some(i), Menu::Audio) => {
+                    overridden && self.session_audio == AudioId::order().get(i).copied()
+                }
             };
             menu = menu.child(
                 div()
@@ -2749,7 +3217,9 @@ impl Desk {
                     .items_center()
                     .rounded_sm()
                     .cursor_pointer()
-                    .when(on, |item| item.bg(rgb(0x243044)).font_weight(FontWeight::BOLD))
+                    .when(on, |item| {
+                        item.bg(rgb(0x243044)).font_weight(FontWeight::BOLD)
+                    })
                     .hover(|item| item.bg(rgb(0x2a3242)))
                     .justify_between()
                     .child(text)
@@ -2768,8 +3238,12 @@ impl Desk {
                                     desk.edit_connection(mac, |over| over.audio = None);
                                 }
                             }
-                            (Menu::Video, Some(i)) => desk.session_video = PicturePref::order().get(i).copied(),
-                            (Menu::Audio, Some(i)) => desk.session_audio = AudioId::order().get(i).copied(),
+                            (Menu::Video, Some(i)) => {
+                                desk.session_video = PicturePref::order().get(i).copied()
+                            }
+                            (Menu::Audio, Some(i)) => {
+                                desk.session_audio = AudioId::order().get(i).copied()
+                            }
                         }
                         desk.menu = None;
                         cx.notify();
@@ -2824,30 +3298,28 @@ impl Desk {
                         }),
                 )
                 .child(div().text_color(rgb(MUTED)).child("|"))
-                .child(
-                    small_chip(
-                        SharedString::from(format!("{id}-save-global")),
-                        "Global",
-                        None,
-                        true,
-                        cx.listener(move |desk, _, _, cx| {
-                            match which {
-                                Menu::Video => {
-                                    if let Some(pick) = desk.session_video.take() {
-                                        move_to_front(&mut desk.video_pref, pick);
-                                    }
-                                }
-                                Menu::Audio => {
-                                    if let Some(pick) = desk.session_audio.take() {
-                                        move_to_front(&mut desk.audio_pref, pick);
-                                    }
+                .child(small_chip(
+                    SharedString::from(format!("{id}-save-global")),
+                    "Global",
+                    None,
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        match which {
+                            Menu::Video => {
+                                if let Some(pick) = desk.session_video.take() {
+                                    move_to_front(&mut desk.video_pref, pick);
                                 }
                             }
-                            desk.persist();
-                            cx.notify();
-                        }),
-                    ),
-                )
+                            Menu::Audio => {
+                                if let Some(pick) = desk.session_audio.take() {
+                                    move_to_front(&mut desk.audio_pref, pick);
+                                }
+                            }
+                        }
+                        desk.persist();
+                        cx.notify();
+                    }),
+                ))
         });
         div()
             .flex()
@@ -2857,7 +3329,13 @@ impl Desk {
             .w_full()
             .min_w_0()
             .h(px(30.))
-            .child(div().w(px(40.)).flex_none().text_color(rgb(MUTED)).child(label))
+            .child(
+                div()
+                    .w(px(40.))
+                    .flex_none()
+                    .text_color(rgb(MUTED))
+                    .child(label),
+            )
             .child(
                 div()
                     .relative()
@@ -2888,18 +3366,18 @@ impl Desk {
                             )
                             .child(chevron(open))
                             .on_click(cx.listener(move |desk, _, _, cx| {
-                                desk.menu = if desk.menu == Some(which) { None } else { Some(which) };
+                                desk.menu = if desk.menu == Some(which) {
+                                    None
+                                } else {
+                                    Some(which)
+                                };
                                 cx.notify();
                             })),
                     )
                     .when(open, |anchor| {
-                        anchor.child(
-                            div()
-                                .absolute()
-                                .top(px(30.))
-                                .left_0()
-                                .child(deferred(anchored().snap_to_window().child(menu)).with_priority(1)),
-                        )
+                        anchor.child(div().absolute().top(px(30.)).left_0().child(
+                            deferred(anchored().snap_to_window().child(menu)).with_priority(1),
+                        ))
                     }),
             )
             .when_some(save_for, |row, save| row.child(save))
@@ -2957,14 +3435,22 @@ impl Desk {
     }
 
     /// Reset, then "Reset? / Cancel" in the same fixed box, so nothing moves.
-    fn reset_control(&mut self, target: Option<Section>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn reset_control(
+        &mut self,
+        target: Option<Section>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let key = match target {
             Some(section) => section.title().to_ascii_lowercase().replace(' ', "-"),
             None => "all".into(),
         };
         let asking = self.confirm_reset == Some(target);
         let custom = self.defaults != Settings::default();
-        let label: &'static str = if target.is_none() { "Reset all" } else { "Reset" };
+        let label: &'static str = if target.is_none() {
+            "Reset all"
+        } else {
+            "Reset"
+        };
         let mut slot = div()
             .flex()
             .flex_row()
@@ -2976,11 +3462,16 @@ impl Desk {
         if asking {
             let factory_too = target.is_none() && custom;
             slot = slot
-                .child(div().text_xs().text_color(rgb(DANGER)).child(if factory_too {
-                    "Reset to:"
-                } else {
-                    "Reset to defaults?"
-                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(DANGER))
+                        .child(if factory_too {
+                            "Reset to:"
+                        } else {
+                            "Reset to defaults?"
+                        }),
+                )
                 .child(small_chip(
                     SharedString::from(format!("reset-yes-{key}")),
                     if factory_too { "My defaults" } else { "Reset" },
@@ -3038,7 +3529,9 @@ impl Desk {
         fields: &'static [Field],
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let changed = fields.iter().any(|field| !self.settings.same(&self.defaults, *field));
+        let changed = fields
+            .iter()
+            .any(|field| !self.settings.same(&self.defaults, *field));
         div()
             .flex()
             .flex_row()
@@ -3086,15 +3579,16 @@ impl Desk {
             let label = backend.label;
             row = row.child(
                 backend_chip(id, label, note, on, enabled).when(selectable, |chip| {
-                    chip.cursor_pointer().on_click(cx.listener(move |desk, _, _, cx| {
-                        let driver = match label {
-                            "Membrane" => NetworkDriver::Membrane,
-                            "Npcap" => NetworkDriver::Npcap,
-                            _ => NetworkDriver::Automatic,
-                        };
-                        desk.edit_settings(|settings| settings.network = driver);
-                        cx.notify();
-                    }))
+                    chip.cursor_pointer()
+                        .on_click(cx.listener(move |desk, _, _, cx| {
+                            let driver = match label {
+                                "Membrane" => NetworkDriver::Membrane,
+                                "Npcap" => NetworkDriver::Npcap,
+                                _ => NetworkDriver::Automatic,
+                            };
+                            desk.edit_settings(|settings| settings.network = driver);
+                            cx.notify();
+                        }))
                 }),
             );
         }
@@ -3104,7 +3598,11 @@ impl Desk {
     /// The media backend is the Opus tool order. The first installed one runs.
     fn media_backend_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut row = div().flex().flex_row().flex_wrap().gap_1().min_w_0();
-        for (index, tool) in etherquic::default_backend_order().iter().copied().enumerate() {
+        for (index, tool) in etherquic::default_backend_order()
+            .iter()
+            .copied()
+            .enumerate()
+        {
             let present = self.backends.has(tool);
             let on = present && tool == self.backend;
             let note = (!present).then_some("not installed");
@@ -3117,12 +3615,13 @@ impl Desk {
                     present,
                 )
                 .when(present, |chip| {
-                    chip.cursor_pointer().on_click(cx.listener(move |desk, _, _, cx| {
-                        move_to_front(&mut desk.backend_pref, tool);
-                        desk.apply_backend_order();
-                        desk.persist();
-                        cx.notify();
-                    }))
+                    chip.cursor_pointer()
+                        .on_click(cx.listener(move |desk, _, _, cx| {
+                            move_to_front(&mut desk.backend_pref, tool);
+                            desk.apply_backend_order();
+                            desk.persist();
+                            cx.notify();
+                        }))
                 }),
             );
         }
@@ -3142,8 +3641,10 @@ impl Desk {
         let render = self.backend_row(Part::Render, cx);
         let scale = self.settings.scale;
         let size_match = self.settings.size_match;
+        let look = self.settings.look;
         let default_scale = self.defaults.scale;
         let default_size = self.defaults.size_match;
+        let default_look = self.defaults.look;
         let mut scales = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
         for mode in ScaleMode::ALL {
             scales = scales.child(with_default(
@@ -3175,12 +3676,31 @@ impl Desk {
                 }),
             );
             sizes = sizes.child(with_default(
-                div().when(!choice.available(), |chip| chip.opacity(0.45)).child(chip),
+                div()
+                    .when(!choice.available(), |chip| chip.opacity(0.45))
+                    .child(chip),
                 default_size == choice,
+            ));
+        }
+        let mut looks = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for choice in Look::ALL {
+            looks = looks.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("look-{}", choice.token())),
+                    choice.label(),
+                    look == choice,
+                    140.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.look = choice);
+                        cx.notify();
+                    }),
+                ),
+                default_look == choice,
             ));
         }
         let scale_head = self.field_head("Scale to fit", &[Field::Scale], cx);
         let size_head = self.field_head("Resolution matching", &[Field::SizeMatch], cx);
+        let look_head = self.field_head("Picture look", &[Field::Look], cx);
         let appearance_body = div()
             .flex()
             .flex_col()
@@ -3191,8 +3711,13 @@ impl Desk {
             .child(scales)
             .child(size_head)
             .child(sizes)
+            .child(look_head)
+            .child(looks)
             .child(muted_line(
-                "Applies to an open view at once. Host matches window is not available: hosts do not change their resolution yet.".into(),
+                "Scale and resolution matching apply to an open view at once. Host matches window is not available: hosts do not change their resolution yet.".into(),
+            ))
+            .child(muted_line(
+                "Picture look is painted by the host before it sends the frame, and it applies to an open view at once. Poster flattens each colour so the stream is simpler. Game Boy, PICO-8, CGA, 1-bit, Newsprint, Endesga, and Sweetie use those palettes, in solid blocks.".into(),
             ));
         let appearance = self.section(Section::Appearance, Some(render), appearance_body, cx);
 
@@ -3211,7 +3736,8 @@ impl Desk {
             .child(muted_line(format!(
                 "This PC captures its primary monitor at {capture} fps. Auto uses the display rate when the picture this PC sends has a hardware encoder. Without one, or when the display rate cannot be read, Auto is {SOFTWARE_FPS} fps."
             )));
-        let capture_section = self.section(Section::Capture, Some(capture_backends), capture_body, cx);
+        let capture_section =
+            self.section(Section::Capture, Some(capture_backends), capture_body, cx);
 
         // Sound
         let media = self.media_backend_row(cx);
@@ -3239,8 +3765,16 @@ impl Desk {
         let share_pick = self.settings.share_device.clone();
         let share_default = self.defaults.share_device.clone();
         let out_default = self.defaults.output_device.clone();
-        let share_head = self.field_head("This computer: input (shared when hosting)", &[Field::ShareDevice], cx);
-        let out_head = self.field_head("This computer: output (remote sound plays here)", &[Field::OutputDevice], cx);
+        let share_head = self.field_head(
+            "This computer: input (shared when hosting)",
+            &[Field::ShareDevice],
+            cx,
+        );
+        let out_head = self.field_head(
+            "This computer: output (remote sound plays here)",
+            &[Field::OutputDevice],
+            cx,
+        );
         let mut shared = div().flex().flex_col().gap_1().w_full().min_w_0();
         shared = shared.child(device_chip(
             "share-auto".into(),
@@ -3335,8 +3869,14 @@ impl Desk {
         } else {
             "Pick a discovered host to see its devices"
         };
-        let remote_in = remote_list(remote_caps.as_ref().map(|caps| &caps.audio_inputs), none_heard);
-        let remote_out = remote_list(remote_caps.as_ref().map(|caps| &caps.audio_outputs), none_heard);
+        let remote_in = remote_list(
+            remote_caps.as_ref().map(|caps| &caps.audio_inputs),
+            none_heard,
+        );
+        let remote_out = remote_list(
+            remote_caps.as_ref().map(|caps| &caps.audio_outputs),
+            none_heard,
+        );
         let sound_body = div()
             .flex()
             .flex_col()
@@ -3392,7 +3932,11 @@ impl Desk {
 
         // Codecs
         let local = local_video_line(&self.local_video);
-        let audio_local = if self.local_audio.opus { "PCM, Opus" } else { "PCM" };
+        let audio_local = if self.local_audio.opus {
+            "PCM, Opus"
+        } else {
+            "PCM"
+        };
         let mut video = div().flex().flex_col().gap_2().w_full().min_w_0();
         for (index, codec) in self.video_pref.iter().copied().enumerate() {
             let off = self.video_off.contains(&codec);
@@ -3427,7 +3971,9 @@ impl Desk {
                             SharedString::from(format!("vid-{index}-on")),
                             if off { "Off" } else { "On" },
                             cx.listener(move |desk, _, _, cx| {
-                                if let Some(at) = desk.video_off.iter().position(|row| *row == codec) {
+                                if let Some(at) =
+                                    desk.video_off.iter().position(|row| *row == codec)
+                                {
                                     desk.video_off.remove(at);
                                 } else {
                                     desk.video_off.push(codec);
@@ -3495,8 +4041,19 @@ impl Desk {
         let keyboard = self.settings.send_keyboard;
         let mouse = self.settings.send_mouse;
         let pads = self.settings.send_pads;
+        let clipboard_as_keystrokes = self.settings.clipboard_as_keystrokes;
+        let cursor_mode = self.settings.cursor;
         let trace_input = self.trace_input;
-        let send_head = self.field_head("Send", &[Field::SendKeyboard, Field::SendMouse, Field::SendPads], cx);
+        let send_head = self.field_head(
+            "Send",
+            &[
+                Field::SendKeyboard,
+                Field::SendMouse,
+                Field::SendPads,
+                Field::ClipboardAsKeystrokes,
+            ],
+            cx,
+        );
         let slots_head = self.field_head("Controller to player slot", &[Field::PadSlots], cx);
         let default_pins = self.defaults.clone();
         let mut slots = div().flex().flex_col().gap_1().w_full().min_w_0();
@@ -3607,8 +4164,61 @@ impl Desk {
                         cx.notify();
                     }))),
             )
+            .child(self.field_head("Mouse cursor", &[Field::Cursor], cx))
+            .child({
+                let mut cursors = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+                for mode in CursorMode::ALL {
+                    cursors = cursors.child(choice_chip(
+                        SharedString::from(format!("cursor-{}", mode.token())),
+                        mode.label(),
+                        cursor_mode == mode,
+                        200.,
+                        cx.listener(move |desk, _, _, cx| {
+                            desk.edit_settings(|settings| settings.cursor = mode);
+                            cx.notify();
+                        }),
+                    ));
+                }
+                cursors
+            })
+            .child(muted_line(
+                "Native keeps this computer's cursor and changes its shape when the remote desktop would: a hand on a link, arrows on a window edge. Copy uses the remote cursor's picture for that. Remote hides this cursor and draws the remote one, including where it sits. The choice applies to an open view at once.".into(),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(toggle_chip(
+                        "clipboard-as-keystrokes",
+                        "Send clipboard as keystrokes",
+                        clipboard_as_keystrokes,
+                        Some(self.defaults.clipboard_as_keystrokes),
+                        cx.listener(|desk, _, _, cx| {
+                            desk.edit_settings(|settings| {
+                                settings.clipboard_as_keystrokes = !settings.clipboard_as_keystrokes;
+                            });
+                            cx.notify();
+                        }),
+                    ))
+                    .child(small_chip(
+                        "paste-clipboard",
+                        "Paste clipboard",
+                        Some(PLAYER_BLUE),
+                        true,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.paste_local_clipboard(cx);
+                            cx.notify();
+                        }),
+                    )),
+            )
             .child(muted_line(
                 "Send toggles apply to an open view at once. Trace input asks the remote to confirm each key and click; turn it on, then connect.".into(),
+            ))
+            .child(muted_line(
+                "Paste clipboard, and Ctrl+V in the picture, send this computer's clipboard text into the open view. Send clipboard as keystrokes types that text. The switch is saved.".into(),
             ))
             .child(slots_head)
             .child(slots)
@@ -3668,7 +4278,9 @@ impl Desk {
                     .cursor_pointer()
                     .child(flag_en())
                     .child("English")
-                    .when(self.defaults.language == "en", |chip| chip.child(faint_default()))
+                    .when(self.defaults.language == "en", |chip| {
+                        chip.child(faint_default())
+                    })
                     .on_click(cx.listener(|desk, _, _, cx| {
                         desk.edit_settings(|settings| settings.language = "en".into());
                         cx.notify();
@@ -3678,12 +4290,19 @@ impl Desk {
         let language = self.section(Section::Language, None, language_body, cx);
 
         // This computer's own picks, from its discovery record.
-        let computer = self.peer.parse().map(|mac| self.connection_controls(mac, cx));
+        let computer = self
+            .peer
+            .parse()
+            .map(|mac| self.connection_controls(mac, cx));
         let monitors = remote_caps.as_ref().map(|caps| {
             let mut row = div().flex().flex_row().flex_wrap().gap_1().min_w_0();
             for (index, m) in caps.monitors.iter().enumerate() {
                 let label = format!("{}: {}×{}", index + 1, m.width, m.height);
-                let label = if m.primary { format!("{label} · primary") } else { label };
+                let label = if m.primary {
+                    format!("{label} · primary")
+                } else {
+                    label
+                };
                 row = row.child(backend_chip(
                     SharedString::from(format!("remote-mon-{index}")),
                     label,
@@ -3765,7 +4384,8 @@ impl Desk {
 
 impl Render for Desk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.link.reap();
+        self.reap_links();
+        install_tray(window, cx);
         self.sync_taskbar(window, cx);
         self.track_hosts();
         self.settle_scrollbars(window);
@@ -3781,7 +4401,8 @@ impl Render for Desk {
             self.settings.scale.label(),
             self.summary_codecs(),
             match self.peer.parse() {
-                Some(mac) if self.applied(mac).custom => format!("{} has its own picks", self.target_label()),
+                Some(mac) if self.applied(mac).custom =>
+                    format!("{} has its own picks", self.target_label()),
                 _ => "your defaults".into(),
             }
         );
@@ -3804,6 +4425,9 @@ impl Render for Desk {
             // The page scrollbar sits in this right margin, so it never covers content.
             .pr(px(16. + BAR_W))
             .gap_3()
+            .when(self.tabs.len() > 0, |col| {
+                col.child(self.connection_bar(cx))
+            })
             .child(
                 div()
                     .flex()
@@ -4289,7 +4913,13 @@ fn save_chip(
     saved: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    small_chip(id, if saved { "Saved" } else { "Save" }, None, !saved, on_click)
+    small_chip(
+        id,
+        if saved { "Saved" } else { "Save" },
+        None,
+        !saved,
+        on_click,
+    )
 }
 
 fn tab_chip(
@@ -4340,7 +4970,7 @@ fn host_row(
     const PAD: f32 = 12.;
     const GAP: f32 = 12.;
     const STATUS_W: f32 = 132.;
-    let left = if lead.is_some() { THUMB_W + GAP } else { 0. };
+    let left = if lead.is_some() { LEAD_W + GAP } else { 0. };
     let right = STATUS_W + GAP + ACTIONS_W + GAP;
     let line = |text: String, small: bool, color: u32| {
         div()
@@ -4435,19 +5065,56 @@ fn host_row(
 }
 
 /// Monitors and inputs in a few words. An older host sends no details.
-fn row_summary(caps: Option<&etherquic::discover::Capabilities>) -> String {
-    match caps.map(|caps| (caps, caps_summary(caps))) {
-        Some((caps, summary)) if caps.monitors.len() > 1 => {
-            let sizes: Vec<String> = caps
-                .monitors
-                .iter()
-                .map(|m| format!("{}×{}", m.width, m.height))
-                .collect();
-            format!("{summary} · {}", sizes.join(" + "))
+fn row_summary(
+    caps: Option<&etherquic::discover::Capabilities>,
+    release: Option<&etherquic::discover::Release>,
+) -> String {
+    let hardware = match caps {
+        Some(caps) => {
+            let summary = caps_summary(caps);
+            if caps.monitors.len() > 1 {
+                let sizes: Vec<String> = caps
+                    .monitors
+                    .iter()
+                    .map(|m| format!("{}×{}", m.width, m.height))
+                    .collect();
+                if summary.is_empty() {
+                    sizes.join(" + ")
+                } else {
+                    format!("{summary} · {}", sizes.join(" + "))
+                }
+            } else if !summary.is_empty() {
+                summary
+            } else if caps.monitors.is_empty() {
+                "No monitors reported".into()
+            } else {
+                String::new()
+            }
         }
-        Some((_, summary)) if !summary.is_empty() => summary,
-        Some(_) => "No monitors reported".into(),
-        None => "No details from this host (older version)".into(),
+        None => String::new(),
+    };
+    let mut parts = Vec::new();
+    if let Some(rel) = release {
+        if !rel.version.trim().is_empty() {
+            parts.push(format!("version {}", rel.version.trim()));
+        }
+        let os = rel.os_label();
+        if !os.is_empty() {
+            parts.push(os);
+        }
+    } else if let Some(caps) = caps {
+        let label = caps.os_label.trim();
+        if !label.is_empty() {
+            parts.push(label.to_string());
+        }
+    }
+    if !hardware.is_empty() {
+        parts.push(hardware);
+    }
+    if parts.is_empty() {
+        "No details from this host (older version)".into()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -4548,16 +5215,10 @@ fn identity_row(label: &'static str, value: String) -> impl IntoElement {
         .child(div().flex_1().min_w_0().whitespace_normal().child(value))
 }
 
-fn phone_share(qr: &Option<QrGrid>) -> impl IntoElement {
-    let mut column = div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap_2()
-        .w_full()
-        .min_w_0();
+fn phone_share(qr: &Option<QrGrid>, ours: &etherquic::discover::Release) -> impl IntoElement {
+    let mut code = div().flex().flex_col().items_center().gap_2().flex_none();
     if let Some(grid) = qr {
-        column = column.child(
+        code = code.child(
             div()
                 .flex_none()
                 .p_2()
@@ -4566,15 +5227,79 @@ fn phone_share(qr: &Option<QrGrid>) -> impl IntoElement {
                 .child(qr_picture(grid)),
         );
     }
-    column.child(
+    code = code.child(
         div()
-            .w_full()
+            .w(px(240.))
             .min_w_0()
             .text_center()
             .text_color(rgb(MUTED))
             .whitespace_normal()
             .child("Scan to join this PC."),
-    )
+    );
+    let face = etherquic::discover::OsFace::from_os(ours.os, &ours.os_name, &ours.os_version);
+    let os = ours.os_label();
+    let version = format!("version {}", ours.version.trim());
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_4()
+        .w_full()
+        .min_w_0()
+        .child(code)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_2()
+                .min_w_0()
+                .child(os_badge(face, &ours.os_version))
+                .child(
+                    div()
+                        .text_color(rgb(TEXT))
+                        .whitespace_normal()
+                        .child(if os.is_empty() {
+                            "This PC".to_string()
+                        } else {
+                            os
+                        }),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(MUTED))
+                        .whitespace_normal()
+                        .child(version),
+                ),
+        )
+}
+
+fn host_lead(
+    picture: Option<Arc<RenderImage>>,
+    caps: Option<&etherquic::discover::Capabilities>,
+    release: Option<&etherquic::discover::Release>,
+) -> AnyElement {
+    let (face, subscript) = if let Some(rel) = release {
+        (
+            etherquic::discover::OsFace::from_os(rel.os, &rel.os_name, &rel.os_version),
+            rel.os_version.clone(),
+        )
+    } else if let Some(caps) = caps {
+        etherquic::discover::face_from_label(caps.os, &caps.os_label)
+    } else {
+        (etherquic::discover::OsFace::Other, String::new())
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .flex_none()
+        .w(px(LEAD_W))
+        .h(px(THUMB_H.max(BADGE_W)))
+        .child(os_badge(face, &subscript))
+        .child(thumb_slot(picture))
+        .into_any_element()
 }
 
 /// Black modules on white. Each module is a whole number of device pixels so a
@@ -4871,8 +5596,20 @@ fn slider_track(knob_at: gpui::Pixels) -> impl IntoElement {
 /// Addresses, codecs, and latency of one discovered host, under its row.
 fn device_details(device: &Found, selection: &str, caps: &[String]) -> impl IntoElement {
     let mut col = div().flex().flex_col().gap_1().w_full().min_w_0();
+    if let Some(rel) = &device.release {
+        let line = rel.list_line();
+        if !line.is_empty() {
+            col = col.child(muted_line(line));
+        }
+    }
     for line in caps {
-        col = col.child(div().w_full().min_w_0().whitespace_normal().child(line.clone()));
+        col = col.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .child(line.clone()),
+        );
     }
     if device.key != device.l2_mac {
         col = col.child(muted_line(format!("Adapter {}", format_mac(device.key))));
@@ -5193,7 +5930,11 @@ fn info_chip(label: String, first: bool) -> impl IntoElement {
                 .line_height(px(16.))
                 .overflow_hidden()
                 .whitespace_normal()
-                .child(if first { format!("{label} (default)") } else { label }),
+                .child(if first {
+                    format!("{label} (default)")
+                } else {
+                    label
+                }),
         )
 }
 
@@ -5297,7 +6038,11 @@ fn toggle_chip(
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .opacity(0.6)
-                    .child(if default_on { "default on" } else { "default off" }),
+                    .child(if default_on {
+                        "default on"
+                    } else {
+                        "default off"
+                    }),
             )
         })
         .on_click(on_click)
@@ -5307,12 +6052,11 @@ fn toggle_chip(
 fn flag_en() -> impl IntoElement {
     let mut stripes = div().flex().flex_col().w(px(24.)).h(px(14.));
     for index in 0..7 {
-        stripes = stripes.child(
-            div()
-                .w_full()
-                .h(px(2.))
-                .bg(rgb(if index % 2 == 0 { 0xb22234 } else { 0xffffff })),
-        );
+        stripes = stripes.child(div().w_full().h(px(2.)).bg(rgb(if index % 2 == 0 {
+            0xb22234
+        } else {
+            0xffffff
+        })));
     }
     div()
         .relative()

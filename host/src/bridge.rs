@@ -23,6 +23,7 @@ struct Outbound {
     video: FrameSlot,
     audio: mpsc::Sender<AudioChunk>,
     acks: mpsc::Sender<Vec<u8>>,
+    cursor: tokio::sync::watch::Sender<Option<Vec<u8>>>,
 }
 
 pub use crate::extras::Picture;
@@ -98,8 +99,14 @@ impl Desk {
         video: FrameSlot,
         audio: mpsc::Sender<AudioChunk>,
         acks: mpsc::Sender<Vec<u8>>,
+        cursor: tokio::sync::watch::Sender<Option<Vec<u8>>>,
     ) {
-        *lock(&self.outbound) = Some(Outbound { video, audio, acks });
+        *lock(&self.outbound) = Some(Outbound {
+            video,
+            audio,
+            acks,
+            cursor,
+        });
     }
 
     pub fn detach(&self) {
@@ -110,7 +117,8 @@ impl Desk {
         let video = FrameSlot::new();
         let (audio_tx, audio_rx) = mpsc::channel(8);
         let (ack_tx, ack_rx) = mpsc::channel(64);
-        self.attach(video.clone(), audio_tx, ack_tx);
+        let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
+        self.attach(video.clone(), audio_tx, ack_tx, cursor_tx);
         // The helper wakes the display and moves onto the input desktop. A
         // screen saver, lock screen, or powered-down output would otherwise
         // hand this player a stale black picture and swallow its input.
@@ -118,8 +126,16 @@ impl Desk {
         let _guard = Detach(self);
         let log = self.log.clone();
         let media_log: etherquic_media::Log = Arc::new(move |line: &str| log.line(line));
-        let result =
-            crate::media::serve(conn, video.clone(), audio_rx, self.input(), ack_rx, media_log).await;
+        let result = crate::media::serve(
+            conn,
+            video.clone(),
+            audio_rx,
+            self.input(),
+            ack_rx,
+            media_log,
+            cursor_rx,
+        )
+        .await;
         video.close();
         result
     }
@@ -260,7 +276,11 @@ fn reader_loop(
                     kept_at = Some(Instant::now());
                 }
                 if let Some(slot) = video_sender(&outbound) {
-                    slot.put(etherquic_media::Frame { width: rgb.width, height: rgb.height, rgb: rgb.rgb });
+                    slot.put(etherquic_media::Frame {
+                        width: rgb.width,
+                        height: rgb.height,
+                        rgb: rgb.rgb,
+                    });
                 }
             }
             Ok(Some(Message::Jpeg(jpeg))) => {
@@ -270,13 +290,19 @@ fn reader_loop(
                     *lock(&picture) = Some(jpeg.clone());
                     kept_at = Some(Instant::now());
                 }
-                if let (Some(slot), Ok(frame)) = (video_sender(&outbound), etherquic_media::jpeg::decode(&jpeg)) {
+                if let (Some(slot), Ok(frame)) = (
+                    video_sender(&outbound),
+                    etherquic_media::jpeg::decode(&jpeg),
+                ) {
                     slot.put(frame);
                 }
             }
             Ok(Some(Message::Pcm(bytes))) => match AudioChunk::decode(&bytes) {
                 Ok(chunk) => {
-                    if !saw_audio && chunk.sample_rate > 0 && chunk.channels > 0 && !chunk.pcm.is_empty()
+                    if !saw_audio
+                        && chunk.sample_rate > 0
+                        && chunk.channels > 0
+                        && !chunk.pcm.is_empty()
                     {
                         log.line(&format!(
                             "audio {} Hz {} ch pcm {} samples",
@@ -304,6 +330,11 @@ fn reader_loop(
             Ok(Some(Message::Ack(bytes))) => {
                 if let Some(tx) = ack_sender(&outbound) {
                     let _ = tx.try_send(bytes);
+                }
+            }
+            Ok(Some(Message::Cursor(bytes))) => {
+                if let Some(tx) = cursor_sender(&outbound) {
+                    let _ = tx.send(Some(bytes));
                 }
             }
             Ok(Some(Message::Eqin(_) | Message::Wake | Message::Release)) => {}
@@ -345,7 +376,9 @@ fn input_loop(
         let active = session.load(Ordering::SeqCst);
         let current = generation.load(Ordering::SeqCst);
         if let Some(message) = session_message(active, told, current) {
-            let pipe = lock(&pipe_slot).as_ref().and_then(|pipe| pipe.duplicate().ok());
+            let pipe = lock(&pipe_slot)
+                .as_ref()
+                .and_then(|pipe| pipe.duplicate().ok());
             if let Some(pipe) = pipe {
                 if pipe.write_message(&message, &stop).is_ok() {
                     told = Some((current, active));
@@ -363,7 +396,9 @@ fn input_loop(
         if events.is_empty() {
             continue;
         }
-        let pipe = lock(&pipe_slot).as_ref().and_then(|pipe| pipe.duplicate().ok());
+        let pipe = lock(&pipe_slot)
+            .as_ref()
+            .and_then(|pipe| pipe.duplicate().ok());
         let Some(pipe) = pipe else {
             continue;
         };
@@ -386,6 +421,12 @@ fn ack_sender(outbound: &Mutex<Option<Outbound>>) -> Option<mpsc::Sender<Vec<u8>
     lock(outbound).as_ref().map(|out| out.acks.clone())
 }
 
+fn cursor_sender(
+    outbound: &Mutex<Option<Outbound>>,
+) -> Option<tokio::sync::watch::Sender<Option<Vec<u8>>>> {
+    lock(outbound).as_ref().map(|out| out.cursor.clone())
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -400,13 +441,19 @@ mod tests {
         assert_eq!(session_message(false, None, 1), None);
         assert_eq!(session_message(true, None, 1), Some(Message::Wake));
         assert_eq!(session_message(true, Some((1, true)), 1), None);
-        assert_eq!(session_message(false, Some((1, true)), 1), Some(Message::Release));
+        assert_eq!(
+            session_message(false, Some((1, true)), 1),
+            Some(Message::Release)
+        );
         assert_eq!(session_message(false, Some((1, false)), 1), None);
     }
 
     #[test]
     fn a_restarted_helper_is_woken_again_mid_session() {
-        assert_eq!(session_message(true, Some((1, true)), 2), Some(Message::Wake));
+        assert_eq!(
+            session_message(true, Some((1, true)), 2),
+            Some(Message::Wake)
+        );
         assert_eq!(session_message(false, Some((1, true)), 2), None);
     }
 }

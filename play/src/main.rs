@@ -62,6 +62,7 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     udp: connect.udp,
                     view: etherquic_play::live(connect.view),
                     codecs: connect.codecs,
+                    picture: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 },
                 stop,
                 etherquic_play::stderr_status(),

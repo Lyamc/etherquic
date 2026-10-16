@@ -18,6 +18,8 @@
 
 use std::fmt::Write as _;
 
+use crate::look::Look;
+
 /// ALPN of a session that negotiates codecs.
 pub const ALPN_NEGOTIATE: &[u8] = b"etherquic/2";
 /// Negotiation record version written by this build.
@@ -32,6 +34,9 @@ pub const AUDIO2_MAGIC: &[u8; 4] = b"EAU2";
 pub const RECORD_CONFIG: u8 = b'C';
 /// First byte of an `EVI2`/`EAU2` record: coded media.
 pub const RECORD_DATA: u8 = b'D';
+/// First byte of an `EVI2` record: the host cursor. A player that does not
+/// know it skips the record. It is not sent on the legacy `EVID` stream.
+pub const RECORD_CURSOR: u8 = b'P';
 
 /// One row of a picture preference list. The suffix is the sender's encoder:
 /// `-hw` is an encode ASIC (NVENC, VideoToolbox, AMF, Quick Sync), `-sw` the CPU.
@@ -111,9 +116,15 @@ impl Video {
         }
     }
 
-    /// An encode ASIC on the sender.
+    /// Hardware encode on the sender.
+    ///
+    /// GPU PyroWave counts: a Direct3D 11 device or a non-CPU Vulkan device.
+    /// CPU PyroWave does not. MJPEG and H.264 (SW) do not.
     pub fn hardware(self) -> bool {
-        matches!(self, Video::Av1Hw | Video::H265Hw | Video::H264Hw)
+        matches!(
+            self,
+            Video::Av1Hw | Video::H265Hw | Video::H264Hw | Video::Pyrowave
+        )
     }
 }
 
@@ -225,7 +236,10 @@ impl HostCaps {
 
     /// Read [`HostCaps::to_text`]. `None` when it names no video encoder.
     pub fn from_text(text: &str) -> Option<HostCaps> {
-        let mut caps = HostCaps { video: Vec::new(), audio: Vec::new() };
+        let mut caps = HostCaps {
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
         for line in text.lines() {
             let mut words = line.split_whitespace();
             let Some(key) = words.next() else { continue };
@@ -264,7 +278,10 @@ impl HostCaps {
                     .collect();
             }
             "host-audio" => {
-                self.audio = words.iter().filter_map(|word| Audio::from_token(word)).collect();
+                self.audio = words
+                    .iter()
+                    .filter_map(|word| Audio::from_token(word))
+                    .collect();
             }
             _ => {}
         }
@@ -287,6 +304,9 @@ pub struct Offer {
     /// from before the split does not, and its plain `pyrowave` also takes a
     /// CPU PyroWave encoder, as it did then.
     pub knows_pyrowave_cpu: bool,
+    /// Picture look the host paints before it encodes. An offer without the
+    /// line is [`Look::Off`].
+    pub look: Look,
 }
 
 impl Offer {
@@ -305,7 +325,16 @@ impl Offer {
         if self.knows_pyrowave_cpu {
             let _ = writeln!(out, "knows pyrowave-cpu");
         }
+        let _ = writeln!(out, "look {}", self.look.token());
         out.into_bytes()
+    }
+
+    /// Codec lists, limits, and failures match. The picture look may differ,
+    /// so the host can keep the encoder it already opened.
+    pub fn same_codecs(&self, other: &Offer) -> bool {
+        let mut other = other.clone();
+        other.look = self.look;
+        *self == other
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Offer, String> {
@@ -318,19 +347,29 @@ impl Offer {
             bitrate_kbps: 0,
             failed: Vec::new(),
             knows_pyrowave_cpu: false,
+            look: Look::Off,
         };
         for (key, words) in &lines.rows {
             match key.as_str() {
                 "video" => offer.video = dedup(words.iter().filter_map(|w| Video::from_token(w))),
                 "audio" => offer.audio = dedup(words.iter().filter_map(|w| Audio::from_token(w))),
                 "max" => {
-                    offer.max = words.first().and_then(|w| Limit::parse(w)).unwrap_or_default()
+                    offer.max = words
+                        .first()
+                        .and_then(|w| Limit::parse(w))
+                        .unwrap_or_default()
                 }
                 "bitrate" => {
                     offer.bitrate_kbps = words.first().and_then(|w| w.parse().ok()).unwrap_or(0)
                 }
                 "failed" => offer.failed = dedup(words.iter().filter_map(|w| Video::from_token(w))),
                 "knows" => offer.knows_pyrowave_cpu |= words.contains(&"pyrowave-cpu"),
+                "look" => {
+                    offer.look = words
+                        .first()
+                        .and_then(|word| Look::from_token(word))
+                        .unwrap_or(Look::Off);
+                }
                 _ => {}
             }
         }
@@ -526,7 +565,8 @@ pub struct OfferInput<'a> {
 /// what this player decodes. MJPEG and PCM always end the lists so an offer
 /// can never come up empty.
 pub fn build_offer(input: &OfferInput<'_>) -> Offer {
-    let decodes = |row: &Video| row.codec() == VideoCodec::Mjpeg || input.decodes.contains(&row.codec());
+    let decodes =
+        |row: &Video| row.codec() == VideoCodec::Mjpeg || input.decodes.contains(&row.codec());
     let mut video: Vec<Video> = Vec::new();
     for row in input.video_pin.iter().chain(input.video_order.iter()) {
         if decodes(row) && !video.contains(row) {
@@ -554,6 +594,7 @@ pub fn build_offer(input: &OfferInput<'_>) -> Offer {
         bitrate_kbps: input.bitrate_kbps,
         failed: Vec::new(),
         knows_pyrowave_cpu: true,
+        look: Look::Off,
     }
 }
 
@@ -587,7 +628,10 @@ pub fn choose_video(
     let mut skipped = Vec::new();
     for row in &offer.video {
         if excluded.contains(row) || offer.failed.contains(row) {
-            skipped.push(Skip { row: *row, reason: "failed earlier in this session" });
+            skipped.push(Skip {
+                row: *row,
+                reason: "failed earlier in this session",
+            });
             continue;
         }
         let cap = host.encodes(*row).or_else(|| {
@@ -600,18 +644,34 @@ pub fn choose_video(
             }
         });
         let Some(cap) = cap else {
-            skipped.push(Skip { row: *row, reason: "the host has no such encoder" });
+            skipped.push(Skip {
+                row: *row,
+                reason: "the host has no such encoder",
+            });
             continue;
         };
         if let Some((w, h)) = frame {
             if !cap.limit.fits(w, h) {
-                skipped.push(Skip { row: *row, reason: "the picture is larger than the encoder takes" });
+                skipped.push(Skip {
+                    row: *row,
+                    reason: "the picture is larger than the encoder takes",
+                });
                 continue;
             }
         }
-        return Choice { row: *row, encoder: cap.encoder.clone(), skipped, fallback: false };
+        return Choice {
+            row: *row,
+            encoder: cap.encoder.clone(),
+            skipped,
+            fallback: false,
+        };
     }
-    Choice { row: Video::Mjpeg, encoder: "jpeg".into(), skipped, fallback: true }
+    Choice {
+        row: Video::Mjpeg,
+        encoder: "jpeg".into(),
+        skipped,
+        fallback: true,
+    }
 }
 
 /// First offered audio codec the host encodes.
@@ -619,7 +679,10 @@ pub fn choose_audio(offer: &Offer, host: &HostCaps, excluded: &[Audio]) -> Choic
     let mut skipped = Vec::new();
     for row in &offer.audio {
         if excluded.contains(row) {
-            skipped.push(Skip { row: *row, reason: "failed earlier in this session" });
+            skipped.push(Skip {
+                row: *row,
+                reason: "failed earlier in this session",
+            });
             continue;
         }
         if *row == Audio::Pcm || host.audio.contains(row) {
@@ -628,11 +691,24 @@ pub fn choose_audio(offer: &Offer, host: &HostCaps, excluded: &[Audio]) -> Choic
                 Audio::Aac => "aac",
                 Audio::Pcm => "pcm",
             };
-            return Choice { row: *row, encoder: encoder.into(), skipped, fallback: false };
+            return Choice {
+                row: *row,
+                encoder: encoder.into(),
+                skipped,
+                fallback: false,
+            };
         }
-        skipped.push(Skip { row: *row, reason: "the host has no such encoder" });
+        skipped.push(Skip {
+            row: *row,
+            reason: "the host has no such encoder",
+        });
     }
-    Choice { row: Audio::Pcm, encoder: "pcm".into(), skipped, fallback: true }
+    Choice {
+        row: Audio::Pcm,
+        encoder: "pcm".into(),
+        skipped,
+        fallback: true,
+    }
 }
 
 /// What a session that did not negotiate carries.
@@ -646,7 +722,10 @@ pub fn session_pair(negotiates: bool, offer: &Offer, host: &HostCaps) -> (Video,
     if !negotiates {
         return legacy_pair();
     }
-    (choose_video(offer, host, &[], None).row, choose_audio(offer, host, &[]).row)
+    (
+        choose_video(offer, host, &[], None).row,
+        choose_audio(offer, host, &[]).row,
+    )
 }
 
 /// What a player expects before connecting: the same rule the host applies,
@@ -673,7 +752,11 @@ mod tests {
     }
 
     fn cap(video: Video, encoder: &str) -> EncodeCap {
-        EncodeCap { video, encoder: encoder.into(), limit: Limit::NONE }
+        EncodeCap {
+            video,
+            encoder: encoder.into(),
+            limit: Limit::NONE,
+        }
     }
 
     fn host(video: &[Video], audio: &[Audio]) -> HostCaps {
@@ -692,7 +775,13 @@ mod tests {
     }
 
     fn all_decodes() -> Vec<VideoCodec> {
-        vec![VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264, VideoCodec::Pyrowave, VideoCodec::Mjpeg]
+        vec![
+            VideoCodec::Av1,
+            VideoCodec::H265,
+            VideoCodec::H264,
+            VideoCodec::Pyrowave,
+            VideoCodec::Mjpeg,
+        ]
     }
 
     fn offer(order: &[Video], decodes: &[VideoCodec]) -> Offer {
@@ -742,7 +831,10 @@ mod tests {
             decodes: &all_decodes(),
             ..OfferInput::default()
         });
-        assert_eq!(choose_video(&pinned, &host, &[], None).row, Video::PyrowaveCpu);
+        assert_eq!(
+            choose_video(&pinned, &host, &[], None).row,
+            Video::PyrowaveCpu
+        );
         // Asking for GPU PyroWave does not get the CPU one.
         let gpu = offer(&[Video::Pyrowave, Video::Mjpeg], &all_decodes());
         assert_eq!(choose_video(&gpu, &host, &[], None).row, Video::Mjpeg);
@@ -750,12 +842,38 @@ mod tests {
 
     #[test]
     fn an_old_player_still_gets_pyrowave_from_a_cpu_host() {
-        let old = Offer::decode(b"eqneg 1\nvideo pyrowave mjpeg\naudio opus pcm\nmax 0x0@0\nbitrate 0\n").unwrap();
+        let old =
+            Offer::decode(b"eqneg 1\nvideo pyrowave mjpeg\naudio opus pcm\nmax 0x0@0\nbitrate 0\n")
+                .unwrap();
         assert!(!old.knows_pyrowave_cpu);
         let host = host(&[Video::PyrowaveCpu], &[]);
         let pick = choose_video(&old, &host, &[], None);
         assert_eq!(pick.row, Video::Pyrowave);
-        assert_eq!(StreamConfig::video(pick.row, &pick.encoder, 64, 64, 30).encode()[1..].starts_with(b"eqneg 1\nvideo pyrowave\n"), true);
+        assert_eq!(old.look, Look::Off);
+        assert_eq!(
+            StreamConfig::video(pick.row, &pick.encoder, 64, 64, 30).encode()[1..]
+                .starts_with(b"eqneg 1\nvideo pyrowave\n"),
+            true
+        );
+    }
+
+    #[test]
+    fn look_round_trips_and_a_missing_line_stays_off() {
+        let mut offer = offer(&[Video::Mjpeg], &[VideoCodec::Mjpeg]);
+        assert_eq!(offer.look, Look::Off);
+        offer.look = Look::Pico8;
+        let text = String::from_utf8(offer.encode()).unwrap();
+        assert!(text.contains("look pico8\n"), "{text}");
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert_eq!(back.look, Look::Pico8);
+        assert!(back.same_codecs(&offer));
+        let mut other = offer.clone();
+        other.look = Look::GameBoy;
+        assert!(offer.same_codecs(&other));
+        other.bitrate_kbps = offer.bitrate_kbps + 1;
+        assert!(!offer.same_codecs(&other));
+        let unknown = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\nlook crt\n").unwrap();
+        assert_eq!(unknown.look, Look::Off);
     }
 
     #[test]
@@ -765,8 +883,14 @@ mod tests {
         assert!(back.knows_pyrowave_cpu);
         assert_eq!(back.video, offer.video);
         // An old host's plain pyrowave is treated as GPU.
-        let old_host = HostCaps::from_text("host-video mjpeg=jpeg:0x0@0 pyrowave=pyrowave:7680x4320@0\nhost-audio pcm\n").unwrap();
-        assert_eq!(choose_video(&offer, &old_host, &[], None).row, Video::Pyrowave);
+        let old_host = HostCaps::from_text(
+            "host-video mjpeg=jpeg:0x0@0 pyrowave=pyrowave:7680x4320@0\nhost-audio pcm\n",
+        )
+        .unwrap();
+        assert_eq!(
+            choose_video(&offer, &old_host, &[], None).row,
+            Video::Pyrowave
+        );
     }
 
     #[test]
@@ -780,7 +904,10 @@ mod tests {
     #[test]
     fn offer_drops_what_the_player_cannot_decode() {
         let offer = offer(&Video::ALL, &[VideoCodec::H264]);
-        assert_eq!(offer.video, vec![Video::H264Hw, Video::Mjpeg, Video::H264Sw]);
+        assert_eq!(
+            offer.video,
+            vec![Video::H264Hw, Video::Mjpeg, Video::H264Sw]
+        );
         let host = host(&[Video::Pyrowave], &[]);
         assert_eq!(choose_video(&offer, &host, &[], None).row, Video::Mjpeg);
     }
@@ -835,7 +962,12 @@ mod tests {
         assert_eq!(choose_video(&offer, &host, &[], None).row, Video::H264Hw);
         let next = choose_video(&offer, &host, &[Video::H264Hw], None);
         assert_eq!(next.row, Video::Pyrowave);
-        let last = choose_video(&offer, &host, &[Video::H264Hw, Video::Pyrowave, Video::Mjpeg], None);
+        let last = choose_video(
+            &offer,
+            &host,
+            &[Video::H264Hw, Video::Pyrowave, Video::Mjpeg],
+            None,
+        );
         assert_eq!(last.row, Video::H264Sw);
     }
 
@@ -866,19 +998,35 @@ mod tests {
         let mut host = host(&[Video::H264Sw], &[]);
         host.video.iter_mut().for_each(|cap| {
             if cap.video == Video::H264Sw {
-                cap.limit = Limit { width: 1920, height: 1080, fps: 60 };
+                cap.limit = Limit {
+                    width: 1920,
+                    height: 1080,
+                    fps: 60,
+                };
             }
         });
-        assert_eq!(choose_video(&offer, &host, &[], Some((1280, 720))).row, Video::H264Sw);
-        assert_eq!(choose_video(&offer, &host, &[], Some((3840, 2160))).row, Video::Mjpeg);
+        assert_eq!(
+            choose_video(&offer, &host, &[], Some((1280, 720))).row,
+            Video::H264Sw
+        );
+        assert_eq!(
+            choose_video(&offer, &host, &[], Some((3840, 2160))).row,
+            Video::Mjpeg
+        );
     }
 
     #[test]
     fn old_peer_gets_mjpeg_and_pcm() {
         let offer = offer(&Video::ALL, &all_decodes());
         let host = host(&[Video::Pyrowave, Video::H264Sw], &[Audio::Opus]);
-        assert_eq!(session_pair(false, &offer, &host), (Video::Mjpeg, Audio::Pcm));
-        assert_eq!(session_pair(true, &offer, &host), (Video::Pyrowave, Audio::Opus));
+        assert_eq!(
+            session_pair(false, &offer, &host),
+            (Video::Mjpeg, Audio::Pcm)
+        );
+        assert_eq!(
+            session_pair(true, &offer, &host),
+            (Video::Pyrowave, Audio::Opus)
+        );
         assert_eq!(predict(&offer, None), (Video::Mjpeg, Audio::Pcm));
     }
 
@@ -892,14 +1040,21 @@ mod tests {
         let host = host(&[], &[Audio::Opus]);
         assert_eq!(choose_audio(&offer_no_opus, &host, &[]).row, Audio::Pcm);
         let offer = offer(&Video::ALL, &all_decodes());
-        assert_eq!(choose_audio(&offer, &HostCaps::baseline(), &[]).row, Audio::Pcm);
+        assert_eq!(
+            choose_audio(&offer, &HostCaps::baseline(), &[]).row,
+            Audio::Pcm
+        );
         assert_eq!(choose_audio(&offer, &host, &[]).row, Audio::Opus);
     }
 
     #[test]
     fn offer_round_trips_and_ignores_unknown_lines() {
         let mut offer = offer(&Video::ALL, &all_decodes());
-        offer.max = Limit { width: 2560, height: 1440, fps: 120 };
+        offer.max = Limit {
+            width: 2560,
+            height: 1440,
+            fps: 120,
+        };
         offer.bitrate_kbps = 20_000;
         let back = Offer::decode(&offer.encode()).unwrap();
         assert_eq!(back, offer);
@@ -915,7 +1070,11 @@ mod tests {
         config.bitrate_kbps = 8000;
         config.reason = "pyrowave encoder failed".into();
         config.host = host(&[Video::Pyrowave, Video::H264Sw], &[Audio::Opus]);
-        config.host.video[1].limit = Limit { width: 4096, height: 2304, fps: 60 };
+        config.host.video[1].limit = Limit {
+            width: 4096,
+            height: 2304,
+            fps: 60,
+        };
         let bytes = config.encode();
         assert_eq!(bytes[0], RECORD_CONFIG);
         assert_eq!(StreamConfig::decode(&bytes).unwrap(), config);

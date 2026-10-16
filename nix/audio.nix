@@ -25,9 +25,9 @@ rustPlatform.buildRustPackage {
       && !(lib.hasInfix "/.git/" p);
   };
 
-  cargoLock.lockFile = ../audio/Cargo.lock;
-  cargoRoot = "audio";
-  buildAndTestSubdir = "audio";
+  cargoLock.lockFile = ../Cargo.lock;
+  cargoBuildFlags = [ "-p" "etherquic-audio" ];
+  cargoTestFlags = [ "-p" "etherquic-audio" ];
 
   nativeBuildInputs = [
     pkg-config

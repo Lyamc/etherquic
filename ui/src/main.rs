@@ -1,10 +1,17 @@
 //! `etherquic` window. `host` and `connect` are the two commands.
 
+#![windows_subsystem = "windows"]
+
+mod badge;
+mod console;
+mod place;
 mod scan;
 mod taskbar;
+mod tray;
 mod view;
 
 fn main() {
+    console::attach();
     if let Err(error) = etherquic::capture_from_env() {
         eprintln!("etherquic: capture: {error}");
     }

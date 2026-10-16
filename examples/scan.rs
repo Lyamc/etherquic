@@ -35,18 +35,32 @@ fn main() {
             host.l2_service,
             etherquic::discover::l2_backend_label(host.l2_backend)
         );
+        if let Some(video) = &host.video {
+            for row in video {
+                println!(
+                    "  video id {} hw-encode {} hw-decode {} gpu {}",
+                    row.id, row.hardware_encode, row.hardware_decode, row.gpu
+                );
+            }
+        }
+        if let Some(rel) = &host.release {
+            println!("  {}", rel.list_line());
+        }
         match &host.caps {
-            Some(caps) => println!(
-                "  caps: {} host {} monitors {:?} inputs {:#x} vpad {}",
-                caps.os_label,
-                caps.hostname,
-                caps.monitors
-                    .iter()
-                    .map(|m| format!("{}x{}", m.width, m.height))
-                    .collect::<Vec<_>>(),
-                caps.inputs,
-                caps.virtual_pad
-            ),
+            Some(caps) => {
+                println!(
+                    "  caps: {} host {} monitors {:?} inputs {:#x} vpad {}",
+                    caps.os_label,
+                    caps.hostname,
+                    caps.monitors
+                        .iter()
+                        .map(|m| format!("{}x{}", m.width, m.height))
+                        .collect::<Vec<_>>(),
+                    caps.inputs,
+                    caps.virtual_pad
+                );
+                println!("  codecs: {}", caps.codecs);
+            }
             None => println!("  caps: none"),
         }
         match &host.thumbnail {

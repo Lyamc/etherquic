@@ -34,15 +34,19 @@ pub const PYROWAVE_FILES: [&str; 3] = [
     "libpyrowave-shared-1.dll",
     "LICENSE-pyrowave.txt",
 ];
+/// Copied only when present. Built from the `vendor/pyrowave-dx11` submodule.
+/// The host loads `pyrowave_d3d11.dll` beside `etherquic-host.exe`.
+pub const PYROWAVE_D3D11_FILES: [&str; 2] = ["pyrowave_d3d11.dll", "LICENSE-pyrowave-d3d11.txt"];
 /// Copied only when present. libopus (BSD) gives Opus audio. The MinGW C++
 /// runtime (GCC runtime exception) and mcfgthread are what the MinGW-built
 /// PyroWave library loads. The host probes each codec and announces only what works.
-pub const CODEC_FILES: [&str; 7] = [
+pub const CODEC_FILES: [&str; 8] = [
     "libopus-0.dll",
     "LICENSE-opus.txt",
     "libgcc_s_seh-1.dll",
     "libstdc++-6.dll",
     "libmcfgthread-2.dll",
+    "libwinpthread-1.dll",
     "LICENSE-gcc-runtime.txt",
     "LICENSE-mcfgthread.txt",
 ];
@@ -273,7 +277,12 @@ pub fn install_plan(
             to: paths.install_dir.join(name),
         });
     }
-    for name in PYROWAVE_FILES.iter().chain(CODEC_FILES.iter()).chain(THUMBNAIL_FILES.iter()) {
+    for name in PYROWAVE_FILES
+        .iter()
+        .chain(PYROWAVE_D3D11_FILES.iter())
+        .chain(CODEC_FILES.iter())
+        .chain(THUMBNAIL_FILES.iter())
+    {
         let from = paths.payload_dir.join(name);
         if from.is_file() {
             steps.push(Step::CopyFile {
@@ -899,16 +908,16 @@ service=5000
         std::fs::write(payload.join("libopus-0.dll"), b"dll").unwrap();
         let staged = Paths {
             install_dir: install,
-            payload_dir: payload,
+            payload_dir: payload.clone(),
             program_data: data,
         };
         let steps = install_plan(&staged, &cli(), None, MACHINE).unwrap();
         let names: Vec<String> = steps
             .iter()
             .filter_map(|step| match step {
-                Step::CopyFile { to, .. } => {
-                    to.file_name().map(|name| name.to_string_lossy().into_owned())
-                }
+                Step::CopyFile { to, .. } => to
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
                 _ => None,
             })
             .collect();
@@ -917,6 +926,23 @@ service=5000
         assert!(!names.iter().any(|name| name == "libpyrowave-shared-1.dll"));
         assert!(names.iter().any(|name| name == "libopus-0.dll"));
         assert!(!names.iter().any(|name| name == "libstdc++-6.dll"));
+        assert!(!names.iter().any(|name| name == "pyrowave_d3d11.dll"));
+        std::fs::write(payload.join("pyrowave_d3d11.dll"), b"dll").unwrap();
+        std::fs::write(payload.join("LICENSE-pyrowave-d3d11.txt"), b"mit").unwrap();
+        let with_d3d11 = install_plan(&staged, &cli(), None, MACHINE).unwrap();
+        let d3d11_names: Vec<String> = with_d3d11
+            .iter()
+            .filter_map(|step| match step {
+                Step::CopyFile { to, .. } => to
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(d3d11_names.iter().any(|name| name == "pyrowave_d3d11.dll"));
+        assert!(d3d11_names
+            .iter()
+            .any(|name| name == "LICENSE-pyrowave-d3d11.txt"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -936,7 +962,9 @@ service=5000
                 .collect::<Vec<_>>()
         };
         let without = install_plan(&p, &cli(), None, MACHINE).unwrap();
-        assert!(!targets(&without).iter().any(|t| t.ends_with("vulkan_lvp.dll")));
+        assert!(!targets(&without)
+            .iter()
+            .any(|t| t.ends_with("vulkan_lvp.dll")));
         for name in VULKAN_CPU_FILES {
             std::fs::write(payload.join(VULKAN_CPU_DIR).join(name), b"x").unwrap();
         }
@@ -968,7 +996,9 @@ service=5000
             steps
                 .iter()
                 .filter_map(|s| match s {
-                    Step::CopyFile { to, .. } => to.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    Step::CopyFile { to, .. } => {
+                        to.file_name().map(|n| n.to_string_lossy().into_owned())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()

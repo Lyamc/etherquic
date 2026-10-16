@@ -5,7 +5,7 @@
 //! that worker's Tokio runtime.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 #[cfg(not(feature = "ui"))]
@@ -47,6 +47,7 @@ pub struct Link {
     peers: Arc<AtomicUsize>,
     status: Arc<Mutex<String>>,
     thread: Option<JoinHandle<()>>,
+    picture: Arc<AtomicU64>,
 }
 
 impl Link {
@@ -60,7 +61,13 @@ impl Link {
                 "Idle. Host this PC, or connect as the player.".into(),
             )),
             thread: None,
+            picture: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Picture seat this player session is showing. `0` when it has none.
+    pub fn picture_id(&self) -> u64 {
+        self.picture.load(Ordering::SeqCst)
     }
 
     pub fn role(&self) -> Role {
@@ -157,7 +164,8 @@ impl Link {
             (None, format!("Opening the view to {addr}…"))
         } else {
             let label = nic.clone().unwrap_or_else(|| "default adapter".into());
-            let net = L2Net::open(nic.as_deref(), MTU, ETHERTYPE_QUIC).map_err(|e| e.to_string())?;
+            let net =
+                L2Net::open(nic.as_deref(), MTU, ETHERTYPE_QUIC).map_err(|e| e.to_string())?;
             let driver = etherquic::discover::l2_backend_label(host_l2);
             let driver = if driver.is_empty() {
                 String::new()
@@ -173,12 +181,25 @@ impl Link {
             )
         };
         self.arm(Role::Client, opening);
+        self.picture = Arc::new(AtomicU64::new(0));
         let stop = Arc::clone(&self.stop_flag);
         let status = Arc::clone(&self.status);
+        let picture = Arc::clone(&self.picture);
         match std::thread::Builder::new()
             .name("etherquic-connect".into())
-            .spawn(move || client_thread(net, nic, peer, udp, trace_input, codecs, stop, status))
-        {
+            .spawn(move || {
+                client_thread(
+                    net,
+                    nic,
+                    peer,
+                    udp,
+                    trace_input,
+                    codecs,
+                    stop,
+                    status,
+                    picture,
+                )
+            }) {
             Ok(handle) => {
                 self.thread = Some(handle);
                 Ok(())
@@ -189,6 +210,26 @@ impl Link {
                 Err(e.to_string())
             }
         }
+    }
+
+    /// Ask the worker to leave and return without joining it.
+    ///
+    /// A tab click uses this. That worker sits in `hold_picture` for its own
+    /// seat. The picture window is a different thread. Joining either one
+    /// here would freeze the click until the other desktop closed.
+    pub fn release(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        self.up.store(false, Ordering::SeqCst);
+        self.peers.store(0, Ordering::SeqCst);
+        self.role = Role::Idle;
+        self.write_status("Idle. Host this PC, or connect as the player.");
+    }
+
+    /// True while the worker thread has not exited.
+    pub fn running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
     }
 
     pub fn stop(&mut self) {
@@ -474,10 +515,16 @@ fn remember_session(peer: [u8; 6], udp: Option<SocketAddr>, text: &str) {
 /// The codecs of the last session with this host in this run, if any.
 pub fn last_session(peer: [u8; 6], ip: Option<std::net::IpAddr>) -> Option<String> {
     let list = SESSIONS.lock().unwrap_or_else(|poison| poison.into_inner());
-    let keys = [ip.map(|ip| ip.to_string()), (peer != [0; 6]).then(|| crate::format_mac(peer))];
-    keys.iter()
-        .flatten()
-        .find_map(|key| list.iter().rev().find(|(k, _)| k == key).map(|(_, p)| p.clone()))
+    let keys = [
+        ip.map(|ip| ip.to_string()),
+        (peer != [0; 6]).then(|| crate::format_mac(peer)),
+    ];
+    keys.iter().flatten().find_map(|key| {
+        list.iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, p)| p.clone())
+    })
 }
 
 /// What an open view reads every frame. Settings change it while the view runs.
@@ -516,6 +563,7 @@ fn client_thread(
     codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
+    picture: Arc<AtomicU64>,
 ) {
     #[cfg(feature = "ui")]
     {
@@ -523,17 +571,18 @@ fn client_thread(
         {
             // The picture window needs the main thread, which GPUI holds.
             drop(net);
+            drop(picture);
             child_view(nic, peer, udp, trace_input, codecs, stop, status);
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = nic;
-            open_view(net, peer, udp, trace_input, codecs, stop, status);
+            open_view(net, peer, udp, trace_input, codecs, stop, status, picture);
         }
     }
     #[cfg(not(feature = "ui"))]
     {
-        let _ = (trace_input, nic, codecs);
+        let _ = (trace_input, nic, codecs, picture);
         client_quic(net, peer, udp, stop, status);
     }
 }
@@ -599,6 +648,7 @@ fn open_view(
     codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
+    picture: Arc<AtomicU64>,
 ) {
     let slot = Arc::clone(&status);
     let last = Arc::new(Mutex::new(String::new()));
@@ -619,6 +669,7 @@ fn open_view(
         udp,
         view: live_view(),
         codecs,
+        picture,
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         etherquic_play::connect_view(net, session, Arc::clone(&stop), report)
@@ -820,5 +871,117 @@ mod tests {
         assert!(!link.shows_taskbar());
         assert_eq!(link.peers(), 0);
         assert!(link.status().contains("Idle"));
+    }
+
+    /// Two player sessions, the same acquire and release the window uses.
+    /// Closing one must return while the other is still inside `hold_picture`
+    /// and the picture-window thread is still drawing it.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn closing_one_session_does_not_join_the_other_picture() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        fn seat(stop: &Arc<AtomicBool>) -> etherquic_play::PictureSeat {
+            etherquic_play::PictureSeat {
+                id: 0,
+                frames: Arc::new(Mutex::new(None)),
+                input: Arc::new(etherquic_play::Gate::new()),
+                stop: Arc::clone(stop),
+                trace: false,
+                view: etherquic_play::live(etherquic_play::ViewOptions::default()),
+                stamps: Arc::new(Mutex::new(HashMap::new())),
+                title: Arc::new(Mutex::new(String::new())),
+                cursor: etherquic::cursor::share(),
+            }
+        }
+
+        fn watching(stop: Arc<AtomicBool>, picture_id: u64) -> Link {
+            let flag = Arc::clone(&stop);
+            let picture = Arc::new(AtomicU64::new(picture_id));
+            let thread = std::thread::Builder::new()
+                .name("etherquic-connect".into())
+                .spawn(move || {
+                    etherquic_play::hold_picture(picture_id, &flag);
+                })
+                .expect("session thread");
+            Link {
+                role: Role::Client,
+                stop_flag: stop,
+                up: Arc::new(AtomicBool::new(true)),
+                peers: Arc::new(AtomicUsize::new(1)),
+                status: Arc::new(Mutex::new("Viewing".into())),
+                thread: Some(thread),
+                picture,
+            }
+        }
+
+        let stop_a = Arc::new(AtomicBool::new(false));
+        let stop_b = Arc::new(AtomicBool::new(false));
+        let first = etherquic_play::open_picture("one", seat(&stop_a));
+        let second = etherquic_play::open_picture("two", seat(&stop_b));
+        assert!(etherquic_play::switch_picture(first));
+        assert_eq!(etherquic_play::shown_picture(), Some(first));
+        assert!(etherquic_play::switch_picture(second));
+        assert_eq!(etherquic_play::shown_picture(), Some(second));
+
+        let window_stop = Arc::clone(&stop_b);
+        let window = std::thread::spawn(move || {
+            while etherquic_play::shown_picture() == Some(second) {
+                if window_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let mut gone = watching(Arc::clone(&stop_a), first);
+        let mut stay = watching(Arc::clone(&stop_b), second);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(gone.running());
+        assert!(stay.running());
+        assert!(!window.is_finished());
+
+        let started = Instant::now();
+        gone.release();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "release joined a waiter"
+        );
+        assert!(
+            etherquic_play::switch_picture(stay.picture_id()),
+            "the session on screen could not be shown"
+        );
+        assert_eq!(etherquic_play::shown_picture(), Some(second));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            !window.is_finished(),
+            "closing the other picture joined the window"
+        );
+        assert!(stay.running(), "the session on screen was stopped");
+        assert!(
+            !etherquic_play::shown_picture().is_some_and(|id| id == first),
+            "the closed picture is still the one on screen"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gone.running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !gone.running(),
+            "released session did not leave hold_picture"
+        );
+        gone.reap();
+
+        stay.release();
+        let _ = window.join();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while stay.running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stay.reap();
+        let _ = etherquic_play::close_picture(first);
+        let _ = etherquic_play::close_picture(second);
     }
 }

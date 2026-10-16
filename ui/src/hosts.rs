@@ -4,11 +4,13 @@
 //! Saved and Recent live in `hosts.txt` next to `preferences.txt`. Each line is
 //! `kind<TAB>unix-seconds<TAB>address<TAB>name`, where kind is `saved` or `recent`.
 //! A line this build cannot read is skipped, not fatal.
+//! This computer is not a host the user can join: the installed service and
+//! the in-window share both answer discovery on the same machine.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use crate::session::format_mac;
+use crate::session::{format_mac, HOST_MAC};
 use etherquic::discover::Capabilities;
 
 /// Recent keeps at most this many hosts, newest first.
@@ -21,7 +23,10 @@ pub const NAME_MAX: usize = 64;
 pub enum HostAddr {
     Mac([u8; 6]),
     /// `port` `0` means the play service port.
-    Ip { ip: IpAddr, port: u16 },
+    Ip {
+        ip: IpAddr,
+        port: u16,
+    },
 }
 
 impl HostAddr {
@@ -46,7 +51,10 @@ impl HostAddr {
         if let Ok(ip) = text.parse::<IpAddr>() {
             return Ok(Self::Ip { ip, port: 0 });
         }
-        if let Some(inner) = text.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        if let Some(inner) = text
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
             if let Ok(ip) = inner.parse::<Ipv6Addr>() {
                 return Ok(Self::Ip {
                     ip: IpAddr::V6(ip),
@@ -77,8 +85,12 @@ impl HostAddr {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Mac(_) => "Ethernet",
-            Self::Ip { ip: IpAddr::V4(_), .. } => "IPv4",
-            Self::Ip { ip: IpAddr::V6(_), .. } => "IPv6",
+            Self::Ip {
+                ip: IpAddr::V4(_), ..
+            } => "IPv4",
+            Self::Ip {
+                ip: IpAddr::V6(_), ..
+            } => "IPv6",
         }
     }
 
@@ -167,7 +179,14 @@ impl HostBook {
     pub fn record_recent(&mut self, name: &str, addr: HostAddr, now: u64) {
         let name = clean_name(name, &addr);
         self.recent.retain(|entry| !entry.addr.same_host(&addr));
-        self.recent.insert(0, HostEntry { name, addr, at: now });
+        self.recent.insert(
+            0,
+            HostEntry {
+                name,
+                addr,
+                at: now,
+            },
+        );
         self.recent.truncate(RECENT_CAP);
     }
 
@@ -181,7 +200,9 @@ impl HostBook {
     }
 
     pub fn saved_index(&self, addr: &HostAddr) -> Option<usize> {
-        self.saved.iter().position(|entry| entry.addr.same_host(addr))
+        self.saved
+            .iter()
+            .position(|entry| entry.addr.same_host(addr))
     }
 
     /// Adds to Saved and returns its index. An address that is already saved
@@ -191,7 +212,11 @@ impl HostBook {
             return index;
         }
         let name = clean_name(name, &addr);
-        self.saved.push(HostEntry { name, addr, at: now });
+        self.saved.push(HostEntry {
+            name,
+            addr,
+            at: now,
+        });
         self.saved.len() - 1
     }
 
@@ -321,6 +346,8 @@ pub struct Sighting {
     pub mac: [u8; 6],
     pub caps: Option<Capabilities>,
     pub thumbnail: Option<Vec<u8>>,
+    /// Etherquic version and operating system from the last offer that had one.
+    pub release: Option<etherquic::discover::Release>,
     pub name: String,
     pub ipv4: Vec<Ipv4Addr>,
     pub ipv6: Vec<Ipv6Addr>,
@@ -334,6 +361,7 @@ pub struct RosterRow {
     pub caps: Option<Capabilities>,
     /// The latest picture the host sent; kept when a burst brings none.
     pub thumbnail: Option<Vec<u8>>,
+    pub release: Option<etherquic::discover::Release>,
     pub name: String,
     pub ipv4: Vec<Ipv4Addr>,
     pub ipv6: Vec<Ipv6Addr>,
@@ -399,6 +427,9 @@ impl Roster {
                     if seen.thumbnail.is_some() {
                         row.thumbnail = seen.thumbnail.clone();
                     }
+                    if seen.release.is_some() {
+                        row.release = seen.release.clone();
+                    }
                     row.name = seen.name.clone();
                     row.ipv4 = seen.ipv4.clone();
                     row.ipv6 = seen.ipv6.clone();
@@ -411,6 +442,7 @@ impl Roster {
                     mac: seen.mac,
                     caps: seen.caps.clone(),
                     thumbnail: seen.thumbnail.clone(),
+                    release: seen.release.clone(),
                     name: seen.name.clone(),
                     ipv4: seen.ipv4.clone(),
                     ipv6: seen.ipv6.clone(),
@@ -468,6 +500,144 @@ impl Roster {
             None => Presence::Unseen,
         }
     }
+
+    /// Drop rows that are this computer. A burst that no longer includes them
+    /// would otherwise keep them listed as offline.
+    pub fn forget_self(&mut self, here: &ThisMachine) {
+        self.rows.retain(|row| !here.owns_row(row));
+    }
+}
+
+/// This computer, so its own discovery answer is not a row.
+///
+/// The installed service announces `host.conf`'s MAC. The in-window share
+/// announces the shared placeholder MAC under this computer's name, and both
+/// list addresses that belong to an adapter here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThisMachine {
+    macs: Vec<[u8; 6]>,
+    ipv4: Vec<Ipv4Addr>,
+    ipv6: Vec<Ipv6Addr>,
+    name: String,
+}
+
+impl ThisMachine {
+    pub fn detect() -> Self {
+        let (ipv4, ipv6) = etherquic::pcap_link::local_ips();
+        let mut macs = Vec::new();
+        if let Some(mac) = installed_host_mac() {
+            macs.push(mac);
+        }
+        Self {
+            macs,
+            ipv4,
+            ipv6,
+            name: crate::share::machine_name(),
+        }
+    }
+
+    pub fn owns_addr(&self, addr: &HostAddr) -> bool {
+        match *addr {
+            HostAddr::Mac(mac) => self.owns_mac(mac),
+            HostAddr::Ip { ip, .. } => self.owns_ip(ip),
+        }
+    }
+
+    pub fn owns_sighting(&self, seen: &Sighting) -> bool {
+        self.owns(
+            &seen.name,
+            seen.mac,
+            seen.key,
+            seen.caps.as_ref().and_then(|caps| caps.nic_mac),
+            &seen.ipv4,
+            &seen.ipv6,
+        )
+    }
+
+    pub fn owns_row(&self, row: &RosterRow) -> bool {
+        self.owns(
+            &row.name,
+            row.mac,
+            row.key,
+            row.caps.as_ref().and_then(|caps| caps.nic_mac),
+            &row.ipv4,
+            &row.ipv6,
+        )
+    }
+
+    /// `true` when this announcement is the machine the window is running on.
+    pub fn owns(
+        &self,
+        name: &str,
+        mac: [u8; 6],
+        key: [u8; 6],
+        nic_mac: Option<[u8; 6]>,
+        ipv4: &[Ipv4Addr],
+        ipv6: &[Ipv6Addr],
+    ) -> bool {
+        if self.owns_mac(mac) || self.owns_mac(key) || nic_mac.is_some_and(|mac| self.owns_mac(mac))
+        {
+            return true;
+        }
+        if ipv4.iter().any(|ip| self.ipv4.contains(ip))
+            || ipv6.iter().any(|ip| self.ipv6.contains(ip))
+        {
+            return true;
+        }
+        // The in-window host publishes one shared MAC. Keep another computer
+        // that does the same under its own name, or that lists an address
+        // this machine does not have.
+        let placeholder = mac == HOST_MAC || key == HOST_MAC;
+        if !placeholder || self.name.is_empty() || !name.trim().eq_ignore_ascii_case(&self.name) {
+            return false;
+        }
+        ipv4.iter().all(|ip| self.ipv4.contains(ip)) && ipv6.iter().all(|ip| self.ipv6.contains(ip))
+    }
+
+    fn owns_mac(&self, mac: [u8; 6]) -> bool {
+        self.macs.contains(&mac)
+    }
+
+    fn owns_ip(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => self.ipv4.contains(&ip),
+            IpAddr::V6(ip) => self.ipv6.contains(&ip),
+        }
+    }
+}
+
+/// `mac=` from `host.conf`. `auto` and a missing key are not an identity.
+pub fn mac_from_host_conf(text: &str) -> Option<[u8; 6]> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("mac") {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+            return None;
+        }
+        return parse_mac(value);
+    }
+    None
+}
+
+fn installed_host_mac() -> Option<[u8; 6]> {
+    let path = if let Some(config) = std::env::var_os("ETHERQUIC_CONFIG") {
+        PathBuf::from(config)
+    } else {
+        let base = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        base.join("etherquic").join("host.conf")
+    };
+    mac_from_host_conf(&std::fs::read_to_string(path).ok()?)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -524,6 +694,7 @@ mod tests {
             mac,
             caps: None,
             thumbnail: None,
+            release: None,
             name: name.into(),
             ipv4: ip.map(|ip| vec![ip.parse().unwrap()]).unwrap_or_default(),
             ipv6: Vec::new(),
@@ -563,7 +734,12 @@ mod tests {
         assert!(HostAddr::parse("").is_err());
         assert!(HostAddr::parse("aa:bb:cc").is_err());
         assert!(HostAddr::parse("my-pc").is_err());
-        for text in ["aa:bb:cc:dd:ee:ff", "10.0.0.2:9000", "[2604::5]:4433", "10.0.0.2"] {
+        for text in [
+            "aa:bb:cc:dd:ee:ff",
+            "10.0.0.2:9000",
+            "[2604::5]:4433",
+            "10.0.0.2",
+        ] {
             let addr = HostAddr::parse(text).unwrap();
             assert_eq!(HostAddr::parse(&addr.display()), Ok(addr));
         }
@@ -583,7 +759,11 @@ mod tests {
     fn recent_is_newest_first_deduplicated_and_capped() {
         let mut book = HostBook::default();
         for n in 0..15u8 {
-            book.record_recent(&format!("pc{n}"), HostAddr::Mac([2, 0, 0, 0, 0, n]), n as u64);
+            book.record_recent(
+                &format!("pc{n}"),
+                HostAddr::Mac([2, 0, 0, 0, 0, n]),
+                n as u64,
+            );
         }
         assert_eq!(book.recent.len(), RECENT_CAP);
         assert_eq!(book.recent[0].name, "pc14");
@@ -672,7 +852,11 @@ mod tests {
         assert_eq!(book.saved[0].name, "Good");
         assert_eq!(book.saved[1].name, "10.0.0.1");
         assert_eq!(book.saved[1].at, 0);
-        let names: Vec<_> = book.recent.iter().map(|entry| entry.name.as_str()).collect();
+        let names: Vec<_> = book
+            .recent
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
         assert_eq!(names, ["newer", "older"]);
     }
 
@@ -680,16 +864,28 @@ mod tests {
     fn roster_keeps_missing_hosts_and_orders_stably() {
         let mut roster = Roster::default();
         roster.update(
-            &[seen(B, "beta", None), seen(A, "alpha", None), seen(C, "gamma", None)],
+            &[
+                seen(B, "beta", None),
+                seen(A, "alpha", None),
+                seen(C, "gamma", None),
+            ],
             100,
         );
         let titles = |roster: &Roster| -> Vec<String> {
-            roster.ordered().into_iter().map(|row| row.title()).collect()
+            roster
+                .ordered()
+                .into_iter()
+                .map(|row| row.title())
+                .collect()
         };
         assert_eq!(titles(&roster), ["alpha", "beta", "gamma"]);
         // A different answer order does not move anything.
         roster.update(
-            &[seen(C, "gamma", None), seen(A, "alpha", None), seen(B, "beta", None)],
+            &[
+                seen(C, "gamma", None),
+                seen(A, "alpha", None),
+                seen(B, "beta", None),
+            ],
             110,
         );
         assert_eq!(titles(&roster), ["alpha", "beta", "gamma"]);
@@ -764,5 +960,71 @@ mod tests {
         assert_eq!(hyte.thumbnail.as_deref(), Some(&[1u8, 2, 3][..]));
         assert!(hyte.online);
         assert!(!roster.find(&HostAddr::Mac(b.key)).unwrap().online);
+    }
+
+    fn here(mac: [u8; 6], ip: &str, name: &str) -> ThisMachine {
+        ThisMachine {
+            macs: vec![mac],
+            ipv4: vec![ip.parse().unwrap()],
+            ipv6: Vec::new(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn host_conf_mac_is_the_installed_identity() {
+        assert_eq!(
+            mac_from_host_conf("nic=\nmac=c2:d1:e0:fc:a0:9f\nunattended=yes\n"),
+            Some([0xc2, 0xd1, 0xe0, 0xfc, 0xa0, 0x9f])
+        );
+        assert_eq!(mac_from_host_conf("mac=auto\n"), None);
+        assert_eq!(mac_from_host_conf("# mac=02:00:00:00:00:01\n"), None);
+        assert_eq!(mac_from_host_conf("service=4433\n"), None);
+    }
+
+    #[test]
+    fn this_computer_is_not_a_host_to_join() {
+        let me = here([0xc2, 0xd1, 0xe0, 0xfc, 0xa0, 0x9f], "192.168.0.10", "HYTE");
+        let service = seen(me.macs[0], "HYTE", Some("192.168.0.10"));
+        let other = seen(
+            [0xf2, 0x94, 0xbf, 0x4c, 0xa7, 0x1b],
+            "AN515",
+            Some("192.168.0.58"),
+        );
+        assert!(me.owns_sighting(&service));
+        assert!(me.owns_addr(&HostAddr::Mac(me.macs[0])));
+        assert!(me.owns_addr(&HostAddr::parse("192.168.0.10:4434").unwrap()));
+        assert!(!me.owns_sighting(&other));
+        assert!(!me.owns_addr(&HostAddr::Mac(other.mac)));
+
+        // Same display name, different machine: it stays.
+        let same_name = seen([0x02, 0, 0, 0, 0, 0x22], "hyte", Some("10.1.1.9"));
+        assert!(!me.owns_sighting(&same_name));
+
+        // The adapter key is the installed MAC even when the announced identity differs.
+        let mut keyed = seen([0x02, 0, 0, 0, 0, 0x01], "HYTE", None);
+        keyed.key = me.macs[0];
+        keyed.ipv4.clear();
+        assert!(me.owns_sighting(&keyed));
+
+        // In-window share: shared placeholder MAC and this computer's name.
+        // No addresses, so it still matches when the adapter list is empty.
+        let mut share = seen(crate::session::HOST_MAC, "HYTE", None);
+        share.key = crate::session::HOST_MAC;
+        assert!(me.owns_sighting(&share));
+        // The same placeholder under another name, or this name at another address, stays.
+        let mut remote_share = seen(crate::session::HOST_MAC, "AN515", Some("192.168.0.58"));
+        remote_share.key = [0x04, 0x11, 0x22, 0x33, 0x44, 0x55];
+        assert!(!me.owns_sighting(&remote_share));
+        let mut same_name_elsewhere = seen(crate::session::HOST_MAC, "HYTE", Some("10.9.9.9"));
+        same_name_elsewhere.key = crate::session::HOST_MAC;
+        assert!(!me.owns_sighting(&same_name_elsewhere));
+
+        let mut roster = Roster::default();
+        roster.update(&[service, other.clone()], 10);
+        roster.forget_self(&me);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster.ordered()[0].name, "AN515");
+        assert_eq!(roster.online_count(), 1);
     }
 }

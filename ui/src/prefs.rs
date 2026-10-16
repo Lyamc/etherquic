@@ -69,7 +69,7 @@ pub fn swap_later<T>(items: &mut [T], index: usize) {
 pub fn video_hint(pref: PicturePref) -> &'static str {
     match pref {
         PicturePref::Pyrowave => {
-            "GPU compute (Vulkan, or Metal on a Mac) on both ends, needs libpyrowave-shared, spends bandwidth"
+            "Hardware encode on a GPU (Vulkan, Direct3D 11, or Metal). The player decodes with Vulkan or Metal"
         }
         PicturePref::PyrowaveCpu => {
             "PyroWave on a CPU Vulkan driver (no GPU). Uses many cores and about 40 Mbit/s"
@@ -194,8 +194,16 @@ pub fn backend_line(probe: BackendProbe, selected: MediaBackend) -> String {
         (probe.ffmpeg, "ffmpeg"),
         (probe.gstreamer, "GStreamer"),
     ];
-    let found: Vec<&str> = tools.iter().filter(|tool| tool.0).map(|tool| tool.1).collect();
-    let missing: Vec<&str> = tools.iter().filter(|tool| !tool.0).map(|tool| tool.1).collect();
+    let found: Vec<&str> = tools
+        .iter()
+        .filter(|tool| tool.0)
+        .map(|tool| tool.1)
+        .collect();
+    let missing: Vec<&str> = tools
+        .iter()
+        .filter(|tool| !tool.0)
+        .map(|tool| tool.1)
+        .collect();
     let found = if found.is_empty() {
         "Detected: none.".to_string()
     } else {
@@ -258,6 +266,7 @@ fn support_words(end: &EndSupport) -> &'static str {
         end.cpu_can_sustain,
     ) {
         (true, true, _, _) => "encode+decode",
+        (true, false, true, _) => "HW encode",
         (true, false, _, _) => "encode, no decode",
         (false, true, _, _) => "decode, no encode",
         (false, false, true, _) => "GPU",
@@ -472,11 +481,14 @@ fn clamp_fps(fps: u32) -> u32 {
     fps.clamp(1, 240)
 }
 
-/// Hardware-encode rows. Pyrowave, MJPEG, and H.264 (SW) are not this.
+/// Hardware-encode rows. GPU PyroWave counts. CPU PyroWave, MJPEG, and
+/// H.264 (SW) do not.
 pub fn sender_hardware_encode(pref: Option<PicturePref>) -> bool {
     matches!(
         pref,
-        Some(PicturePref::Av1Hw | PicturePref::H265Hw | PicturePref::H264Hw)
+        Some(
+            PicturePref::Av1Hw | PicturePref::H265Hw | PicturePref::H264Hw | PicturePref::Pyrowave
+        )
     )
 }
 
@@ -562,7 +574,11 @@ pub fn top_selection(
 pub fn listed_top(video: &[PicturePref], audio: &[AudioId], fps: FrameRate) -> String {
     format!(
         "{} · {} · {}",
-        video.first().copied().map(PicturePref::name).unwrap_or("none"),
+        video
+            .first()
+            .copied()
+            .map(PicturePref::name)
+            .unwrap_or("none"),
         audio.first().copied().map(AudioId::name).unwrap_or("none"),
         fps_headline(fps, None, sender_hardware_encode(video.first().copied())),
     )
@@ -716,7 +732,10 @@ fn join_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> String {
 }
 
 fn parse_list<T: Copy>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
-    value.split(',').filter_map(|token| parse(token.trim())).collect()
+    value
+        .split(',')
+        .filter_map(|token| parse(token.trim()))
+        .collect()
 }
 
 fn fill<T: Copy + PartialEq>(saved: Vec<T>, full: &[T]) -> Vec<T> {
@@ -735,7 +754,11 @@ fn fill<T: Copy + PartialEq>(saved: Vec<T>, full: &[T]) -> Vec<T> {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn parse_yes(value: &str) -> bool {
@@ -1053,8 +1076,13 @@ mod tests {
             Some("PyroWave 1280x720 (pyrowave) · Opus 128 kbit/s")
         );
         let legacy = "Viewing peer · MJPEG · PCM (the host does not negotiate codecs).";
-        assert_eq!(negotiated_from_status(legacy).as_deref(), Some("MJPEG · PCM"));
-        assert!(negotiated_from_status("Viewing peer · video starting · audio starting.").is_none());
+        assert_eq!(
+            negotiated_from_status(legacy).as_deref(),
+            Some("MJPEG · PCM")
+        );
+        assert!(
+            negotiated_from_status("Viewing peer · video starting · audio starting.").is_none()
+        );
         assert!(negotiated_from_status("Dialing …").is_none());
     }
 
@@ -1082,7 +1110,10 @@ mod tests {
         assert_eq!(back.video_off, vec![PicturePref::PyrowaveCpu]);
         let applied = apply_override(&back, None);
         assert!(!applied.video.contains(&PicturePref::PyrowaveCpu));
-        let pinned = ConnectionOverride { video: Some(PicturePref::PyrowaveCpu), ..ConnectionOverride::default() };
+        let pinned = ConnectionOverride {
+            video: Some(PicturePref::PyrowaveCpu),
+            ..ConnectionOverride::default()
+        };
         let applied = apply_override(&back, Some(&pinned));
         assert_eq!(applied.video.first(), Some(&PicturePref::PyrowaveCpu));
     }
@@ -1196,8 +1227,14 @@ mod tests {
             ffmpeg: true,
             gstreamer: false,
         }];
-        assert_eq!(remote_backend_line(Some(&audio)), "Remote audio tools: ffmpeg");
-        assert_eq!(remote_backend_line(None), "Remote audio tools: not announced");
+        assert_eq!(
+            remote_backend_line(Some(&audio)),
+            "Remote audio tools: ffmpeg"
+        );
+        assert_eq!(
+            remote_backend_line(None),
+            "Remote audio tools: not announced"
+        );
     }
 
     #[test]
@@ -1256,8 +1293,34 @@ mod tests {
         );
         assert!(sender_hardware_encode(Some(PicturePref::H264Hw)));
         assert!(!sender_hardware_encode(Some(PicturePref::Mjpeg)));
-        assert!(!sender_hardware_encode(Some(PicturePref::Pyrowave)));
+        assert!(sender_hardware_encode(Some(PicturePref::Pyrowave)));
+        assert!(!sender_hardware_encode(Some(PicturePref::PyrowaveCpu)));
         assert!(!sender_hardware_encode(Some(PicturePref::H264Sw)));
+    }
+
+    #[test]
+    fn pyrowave_hardware_is_chosen_by_default() {
+        let remote = [AnnouncedCodec {
+            id: VIDEO_PYROWAVE,
+            hardware_encode: true,
+            hardware_decode: false,
+            cpu: false,
+            gpu: true,
+            libopus: false,
+            ffmpeg: false,
+            gstreamer: false,
+        }];
+        let local = MachineCodecs::from_rows(vec![(
+            CodecId::Pyrowave,
+            EndSupport {
+                gpu_compute: true,
+                ..EndSupport::default()
+            },
+        )]);
+        let chosen = chosen_video(&default_video(), &local, Some(&remote), true);
+        assert_eq!(chosen, Some(PicturePref::Pyrowave));
+        let line = remote_hardware_line(Some(&remote));
+        assert!(line.contains("Pyrowave HW encode"), "{line}");
     }
 
     #[test]
