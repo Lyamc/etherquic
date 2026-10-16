@@ -309,9 +309,14 @@ pub async fn play_session(
     let (done_tx, mut done_rx) = mpsc::channel(2);
     let mut got_video = false;
     let mut got_audio = false;
-    let mut got_file = !negotiates;
-    let mut got_clip = !negotiates;
-    let mut got_chat = !negotiates;
+    // File, clipboard, and chat are optional host streams. A desktop host
+    // (the Windows service included) sends only picture and audio. Waiting
+    // for the other three leaves this task blocked in accept_uni, so the
+    // EINP stream never opens and the remote keyboard and mouse stay dead
+    // while the picture is already on screen.
+    let mut got_file = false;
+    let mut got_clip = false;
+    let mut got_chat = false;
     let mut early_ack = None;
     let (pcm_tx, mut pcm_rx) = mpsc::channel::<etherquic_media::Pcm>(8);
     tokio::spawn(async move {
@@ -326,7 +331,7 @@ pub async fn play_session(
             }
         }
     });
-    while !got_video || !got_audio || !got_file || !got_clip || !got_chat {
+    while !got_video || !got_audio {
         let mut recv = conn
             .accept_uni()
             .await
@@ -447,11 +452,32 @@ pub async fn play_session(
             }
         }
     });
-    if let Some(acks) = acks {
-        let ack_conn = conn.clone();
+    // Side streams and input confirmations can arrive after the picture.
+    // Reading them here, not in the loop above, is what lets EINP open when
+    // the host has no file, clipboard, or chat stream.
+    {
+        let more = conn.clone();
+        let files_in = pipes.files_in.clone();
+        let clipboard_in = pipes.clipboard_in.clone();
+        let chat_in = pipes.chat_in.clone();
+        let roster = pipes.roster.clone();
         tokio::spawn(async move {
-            if let Err(error) = read_acks(ack_conn, early_ack, acks).await {
-                eprintln!("etherquic-play: input trace: {error}");
+            if let Err(error) = accept_late(
+                more,
+                negotiates,
+                got_file,
+                got_clip,
+                got_chat,
+                early_ack,
+                acks,
+                files_in,
+                clipboard_in,
+                chat_in,
+                roster,
+            )
+            .await
+            {
+                eprintln!("etherquic-play: side stream: {error}");
             }
         });
     }
@@ -498,25 +524,78 @@ async fn finish(send: &mut SendStream) -> Result<(), Error> {
     Ok(())
 }
 
-async fn read_acks(
+/// File, clipboard, chat, and input confirmations that were not on the
+/// first two host streams. Returns when every stream this session still
+/// expects has been accepted, or the connection closes.
+async fn accept_late(
     conn: Connection,
-    early: Option<RecvStream>,
+    negotiates: bool,
+    have_file: bool,
+    have_clip: bool,
+    have_chat: bool,
+    mut ack_recv: Option<RecvStream>,
+    acks: Option<mpsc::Sender<InputAck>>,
+    files_in: mpsc::Sender<crate::transfer::NamedFile>,
+    clipboard_in: mpsc::Sender<String>,
+    chat_in: mpsc::Sender<crate::chat::Routed>,
+    roster: Vec<crate::chat::Participant>,
+) -> Result<(), Error> {
+    let mut need_file = negotiates && !have_file;
+    let mut need_clip = negotiates && !have_clip;
+    let mut need_chat = negotiates && !have_chat;
+    let mut acks = acks;
+    while need_file || need_clip || need_chat || (acks.is_some() && ack_recv.is_none()) {
+        let mut recv = match conn.accept_uni().await {
+            Ok(recv) => recv,
+            // The desktop host often never opens these streams. The
+            // connection ending is that case, not a failed session.
+            Err(_) => break,
+        };
+        let magic = match wire::read_magic(&mut recv).await {
+            Ok(magic) => magic,
+            Err(_) => break,
+        };
+        if &magic == FILE_MAGIC && need_file {
+            need_file = false;
+            let files_in = files_in.clone();
+            tokio::spawn(async move {
+                if let Err(error) = read_files(recv, files_in).await {
+                    eprintln!("etherquic-play: file: {error}");
+                }
+            });
+        } else if &magic == CLIP_MAGIC && need_clip {
+            need_clip = false;
+            let clipboard_in = clipboard_in.clone();
+            tokio::spawn(async move {
+                if let Err(error) = read_clipboard(recv, clipboard_in).await {
+                    eprintln!("etherquic-play: clipboard: {error}");
+                }
+            });
+        } else if &magic == CHAT_MAGIC && need_chat {
+            need_chat = false;
+            let chat_in = chat_in.clone();
+            let roster = roster.clone();
+            tokio::spawn(async move {
+                if let Err(error) = read_chat(recv, roster, chat_in).await {
+                    eprintln!("etherquic-play: chat: {error}");
+                }
+            });
+        } else if &magic == ACK_MAGIC && ack_recv.is_none() {
+            ack_recv = Some(recv);
+        } else {
+            eprintln!("etherquic-play: ignored stream {}", magic_name(&magic));
+        }
+    }
+    if let (Some(acks), Some(recv)) = (acks.take(), ack_recv) {
+        read_ack_records(recv, acks).await?;
+    }
+    Ok(())
+}
+
+async fn read_ack_records(
+    mut recv: RecvStream,
     acks: mpsc::Sender<InputAck>,
 ) -> Result<(), Error> {
-    let mut recv = if let Some(recv) = early {
-        recv
-    } else {
-        loop {
-            let mut incoming = conn
-                .accept_uni()
-                .await
-                .map_err(|error| Error::Wire(error.to_string()))?;
-            let magic = wire::read_magic(&mut incoming).await?;
-            if &magic == ACK_MAGIC {
-                break incoming;
-            }
-        }
-    };
     while let Some(payload) = wire::read_record(&mut recv, ACK_MAGIC).await? {
         let ack = InputAck::decode(&payload)?;
         if acks.send(ack).await.is_err() {

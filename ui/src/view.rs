@@ -44,6 +44,7 @@ use crate::badge::os_badge;
 use crate::scan::Scan;
 use gpui::{
     anchored, canvas, deferred, div, fill, img, point, prelude::*, px, rgb, size, AnyElement, App,
+    AppContext,
     Application, Bounds, ClickEvent, Context, Div, FocusHandle, FontWeight, ImageSource,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, TitlebarOptions, Window,
@@ -231,9 +232,7 @@ pub fn run() {
         })
         .detach();
 
-        let screen = cx
-            .primary_display()
-            .map(|display| crate::place::from_bounds(display.bounds()));
+        let screen = screen_of(cx);
         let fit = crate::place::fit(screen);
         let open = fit.opening;
         let outer = fit.outer;
@@ -269,6 +268,24 @@ pub fn run() {
     });
 }
 
+/// The display the window should fill. Wayland's primary output is the one
+/// at the origin; if that is still unknown, the largest output is used.
+fn screen_of(cx: &App) -> Option<crate::place::RectF> {
+    let mut best = cx.primary_display();
+    if best.is_none() {
+        let mut area = 0.0_f32;
+        for display in cx.displays() {
+            let bounds = display.bounds();
+            let next = f32::from(bounds.size.width) * f32::from(bounds.size.height);
+            if next > area {
+                area = next;
+                best = Some(display);
+            }
+        }
+    }
+    best.map(|display| crate::place::from_bounds(display.bounds()))
+}
+
 struct Desk {
     link: Link,
     /// Every connection the window is keeping. `link` is the current one.
@@ -292,6 +309,10 @@ struct Desk {
     share_nic: Option<String>,
     share_at: Instant,
     share_ready: bool,
+    /// The opening size has been checked against a real display. Wayland
+    /// reports outputs only after a roundtrip, so the first poll grows a
+    /// window that still has the fallback size.
+    display_fit: bool,
     share_text: String,
     share: Share,
     qr: Option<QrGrid>,
@@ -409,6 +430,7 @@ impl Desk {
             share_nic: None,
             share_at: Instant::now(),
             share_ready: false,
+            display_fit: false,
             share_text: String::new(),
             share: Share::blank(),
             qr: None,
@@ -565,6 +587,7 @@ impl Desk {
                 .update(cx, |desk, cx| {
                     desk.reap_links();
                     desk.refresh_share();
+                    desk.fit_display(cx);
                     cx.notify();
                 })
                 .is_err()
@@ -962,6 +985,93 @@ impl Desk {
             }))
     }
 
+    /// Grow a window that opened before the compositor named a display.
+    fn fit_display(&mut self, cx: &mut Context<Self>) {
+        if self.display_fit {
+            return;
+        }
+        let Some(screen) = screen_of(cx) else {
+            return;
+        };
+        if screen.w < 200. || screen.h < 200. {
+            return;
+        }
+        let Some(handle) = cx.active_window() else {
+            return;
+        };
+        let open = crate::place::fit(Some(screen)).opening;
+        if cx
+            .update_window(handle, |_desk, window, _cx| {
+                let current = window.bounds().size;
+                let dw = (f32::from(current.width) - open.w).abs();
+                let dh = (f32::from(current.height) - open.h).abs();
+                if dw > 24. || dh > 24. {
+                    window.resize(size(px(open.w), px(open.h)));
+                }
+            })
+            .is_ok()
+        {
+            self.display_fit = true;
+        }
+    }
+
+    /// Addresses `interface_info` found for this computer.
+    fn this_pc_addresses(&self) -> String {
+        let v4 = if self.share.ipv4.is_empty() {
+            "not found".to_string()
+        } else {
+            self.share
+                .ipv4
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let v6 = if self.share.ipv6.is_empty() {
+            "not found".to_string()
+        } else {
+            self.share
+                .ipv6
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!("IPv4 {v4} · IPv6 {v6}")
+    }
+
+    /// Codec probe for this computer, including whether PyroWave loaded.
+    fn this_pc_codecs(&self) -> String {
+        let audio = if self.local_audio.opus {
+            "PCM, Opus"
+        } else {
+            "PCM"
+        };
+        let library = if self.pyrowave_library {
+            "found"
+        } else {
+            "not found"
+        };
+        let mut line = format!(
+            "This computer: {}. Audio: {audio}. Pyrowave library: {library}.",
+            local_video_line(&self.local_video)
+        );
+        if let Some(probe) = etherquic_play::etherquic_media::caps::ready() {
+            let notes: Vec<&str> = probe
+                .notes
+                .iter()
+                .filter(|note| note.contains("pyrowave"))
+                .map(String::as_str)
+                .collect();
+            if !notes.is_empty() {
+                line.push(' ');
+                line.push_str(&notes.join("; "));
+                line.push('.');
+            }
+        }
+        line
+    }
+
     fn host_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let hosting = self.link.role() == Role::Host;
         let enabled = true;
@@ -987,6 +1097,8 @@ impl Desk {
             .rounded_md()
             .child(card_title("Host", HOST_GREEN))
             .child(muted_line("Share this desktop and its audio.".into()))
+            .child(muted_line(self.this_pc_addresses()))
+            .child(muted_line(self.this_pc_codecs()))
             .child(action_button(
                 "host-btn",
                 label,
@@ -3931,12 +4043,7 @@ impl Desk {
         let sound = self.section(Section::Sound, Some(media), sound_body, cx);
 
         // Codecs
-        let local = local_video_line(&self.local_video);
-        let audio_local = if self.local_audio.opus {
-            "PCM, Opus"
-        } else {
-            "PCM"
-        };
+        let codec_line = self.this_pc_codecs();
         let mut video = div().flex().flex_col().gap_2().w_full().min_w_0();
         for (index, codec) in self.video_pref.iter().copied().enumerate() {
             let off = self.video_off.contains(&codec);
@@ -4014,7 +4121,7 @@ impl Desk {
             .child(muted_line(
                 "The default order for every computer. The first row both sides can run is the match. A computer can have its own pick: use Save for in the Connect card.".into(),
             ))
-            .child(muted_line(format!("This computer: {local}. Audio: {audio_local}.")))
+            .child(muted_line(codec_line))
             .child(two_columns(column("Video", video), column("Audio", audio)))
             .child(toggle_row(
                 "skip-without-hw",

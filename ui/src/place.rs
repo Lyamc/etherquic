@@ -9,7 +9,10 @@
 //!
 //! When the work area cannot be read, both sides are at most 75% of the
 //! display the window opens on. That box is top-aligned, so an unknown
-//! taskbar still has the remaining quarter.
+//! taskbar still has the remaining quarter. Linux passes the display
+//! itself as the work area: Wayland does not report a taskbar rectangle,
+//! and a quarter of the screen left empty is room the window should use.
+//! The compositor clamps a client that would cover a panel.
 
 use gpui::Bounds;
 
@@ -24,11 +27,13 @@ const PREFER_MIN_H: f32 = 560.;
 const EDGE: f32 = 1.;
 /// Title bar that sits above the rect GPUI is given. Windows includes the
 /// caption in the frame instead. On macOS the content rect is shorter than
-/// the window frame by about this much.
+/// the window frame by about this much. On Linux a server-side caption is
+/// outside the client, so the client has to be shorter by about this much
+/// or the frame runs off the bottom of the work area.
 #[cfg(all(not(windows), target_os = "macos"))]
 const TITLE_ABOVE: f32 = 28.;
 #[cfg(all(not(windows), not(target_os = "macos")))]
-const TITLE_ABOVE: f32 = 0.;
+const TITLE_ABOVE: f32 = 32.;
 
 /// A rectangle in one pixel space. Origin is the top left.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -168,7 +173,7 @@ pub fn fit(screen: Option<RectF>) -> Fit {
     {
         fit_windows(screen)
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), target_os = "macos"))]
     {
         let screen = screen.unwrap_or(RectF {
             x: 0.,
@@ -181,6 +186,74 @@ pub fn fit(screen: Option<RectF>) -> Fit {
             outer: None,
         }
     }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        fit_in(screen, linux_work_area())
+    }
+}
+
+/// `work` is the usable rectangle (panels excluded), in the same space as
+/// `screen`. Without one, the display is used and the caption is still
+/// reserved so the frame does not hang off the bottom.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub fn fit_in(screen: Option<RectF>, work: Option<RectF>) -> Fit {
+    let screen = screen.unwrap_or(RectF {
+        x: 0.,
+        y: 0.,
+        w: 1280.,
+        h: 720.,
+    });
+    let work = work.filter(|area| area.w > 200. && area.h > 200.);
+    Fit {
+        opening: opening(screen, work.or(Some(screen)), (0., 0.), TITLE_ABOVE),
+        outer: None,
+    }
+}
+
+/// KDE's panel-excluded rectangle for the active output, when Plasma answers.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn linux_work_area() -> Option<RectF> {
+    let name = std::process::Command::new("qdbus")
+        .args(["org.kde.KWin", "/KWin", "activeOutputName"])
+        .output()
+        .ok()?;
+    if !name.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(name.stdout).ok()?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let rect = std::process::Command::new("qdbus")
+        .args([
+            "--literal",
+            "org.kde.plasmashell",
+            "/StrutManager",
+            "availableScreenRect",
+            name,
+        ])
+        .output()
+        .ok()?;
+    if !rect.status.success() {
+        return None;
+    }
+    parse_kde_rect(&String::from_utf8_lossy(&rect.stdout))
+}
+
+/// `[Argument: (iiii) x, y, w, h]` from `qdbus --literal`.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub fn parse_kde_rect(text: &str) -> Option<RectF> {
+    let rest = text.split("(iiii)").nth(1)?;
+    let nums: Vec<f32> = rest
+        .split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().ok())
+        .collect::<Option<_>>()?;
+    let [x, y, w, h, ..] = nums[..] else {
+        return None;
+    };
+    (w > 1. && h > 1.).then_some(RectF { x, y, w, h })
 }
 
 pub fn from_bounds(bounds: Bounds<gpui::Pixels>) -> RectF {
@@ -560,5 +633,57 @@ mod tests {
         let snap = fit.outer.expect("snap");
         assert!(snap.w <= live.work.w && snap.h <= live.work.h);
         assert!(snap.x >= live.work.x && snap.y >= live.work.y);
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_fills_the_display_instead_of_leaving_a_quarter() {
+        let display = RectF {
+            x: 0.,
+            y: 0.,
+            w: 1920.,
+            h: 1080.,
+        };
+        let open = fit_in(Some(display), None).opening;
+        assert!(open.h > display.h * 0.9, "height {}", open.h);
+        assert!(open.h < display.h, "caption reserved, height {}", open.h);
+        assert!(open.w > display.w * 0.95, "width {}", open.w);
+        assert!(open.y + open.h <= display.h + 0.5);
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn a_panel_and_caption_stay_inside_the_work_area() {
+        let screen = RectF {
+            x: 0.,
+            y: 0.,
+            w: 1920.,
+            h: 1080.,
+        };
+        let work = RectF {
+            x: 0.,
+            y: 0.,
+            w: 1920.,
+            h: 1018.,
+        };
+        let open = fit_in(Some(screen), Some(work)).opening;
+        assert!(open.y + open.h <= work.y + work.h + 0.5);
+        assert!(open.h > 900., "{}", open.h);
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn kde_rect_parses_the_literal_qdbus_line() {
+        let area = parse_kde_rect("[Argument: (iiii) 0, 0, 1920, 1018]\n").unwrap();
+        assert_eq!(
+            area,
+            RectF {
+                x: 0.,
+                y: 0.,
+                w: 1920.,
+                h: 1018.,
+            }
+        );
+        assert!(parse_kde_rect("no rect").is_none());
     }
 }
