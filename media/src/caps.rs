@@ -45,6 +45,12 @@ fn run_probe() -> Probe {
         let record = enc.encode(&test_frame(256, 144))?;
         Ok((record, enc.vulkan_device()))
     });
+    // Hardware Vulkan wins. D3D11 is only for a failed encode or a CPU device.
+    // An unknown device type is counted as a GPU, same as the row above.
+    let try_d3d11 = match &encoded {
+        Err(_) => true,
+        Ok((_, device)) => device.as_ref().is_some_and(|d| d.cpu),
+    };
     match encoded {
         Ok((record, device)) => {
             let cpu = device.as_ref().is_some_and(|d| d.cpu);
@@ -74,6 +80,34 @@ fn run_probe() -> Probe {
             }
         }
     }
+    // Same bitstream, Direct3D 11 feature level 11_0. Kept behind the Vulkan
+    // attempt so a real GPU is not probed twice. A failed D3D11 encode leaves
+    // the CPU Vulkan row in place when that one succeeded.
+    #[cfg(windows)]
+    if try_d3d11 && !crate::pyrowave_d3d11::disabled() {
+        let d3d11 = crate::pyrowave_d3d11::Encoder::new(256, 144, 32 * 1024).and_then(|mut enc| {
+            let record = enc.encode(&test_frame(256, 144))?;
+            let adapter = enc.adapter().to_string();
+            crate::pyrowave_d3d11::record_acceptable(256, 144, &record)?;
+            Ok(adapter)
+        });
+        match d3d11 {
+            Ok(adapter) => {
+                probe.notes.push(format!("pyrowave d3d11: {adapter}"));
+                probe.caps.video.push(EncodeCap {
+                    video: Video::Pyrowave,
+                    encoder: "pyrowave-d3d11".into(),
+                    limit: Limit { width: 7680, height: 4320, fps: 0 },
+                });
+                if !probe.decodes.contains(&VideoCodec::Pyrowave) && pyrowave::Decoder::new(256, 144).is_ok() {
+                    probe.decodes.push(VideoCodec::Pyrowave);
+                }
+            }
+            Err(error) => probe.notes.push(format!("pyrowave d3d11: {error}")),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = try_d3d11;
     match ffmpeg::binary() {
         Some(path) => {
             for spec in ffmpeg::working_encoders() {

@@ -2,6 +2,8 @@
 
 use crate::negotiate::{Video, VideoCodec};
 use crate::{ffmpeg, jpeg, pyrowave, Frame, Sink};
+#[cfg(windows)]
+use crate::pyrowave_d3d11;
 
 /// Encoder settings the host chose.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +21,8 @@ pub struct EncodeSetup {
 pub enum VideoEncoder {
     Mjpeg { sink: Sink<Vec<u8>> },
     Pyrowave { inner: pyrowave::Encoder, sink: Sink<Vec<u8>> },
+    #[cfg(windows)]
+    PyrowaveD3d11 { inner: pyrowave_d3d11::Encoder, sink: Sink<Vec<u8>> },
     Ffmpeg(ffmpeg::Encoder),
 }
 
@@ -34,8 +38,19 @@ impl VideoEncoder {
                 } else {
                     pyrowave::default_frame_bytes(setup.width, setup.height)
                 };
-                let inner = pyrowave::Encoder::new(setup.width, setup.height, frame_bytes)?;
                 let kbps = (frame_bytes.max(16 * 1024) * 8 * setup.fps.max(1) as usize / 1000) as u32;
+                if setup.encoder == "pyrowave-d3d11" {
+                    #[cfg(windows)]
+                    {
+                        let inner = pyrowave_d3d11::Encoder::new(setup.width, setup.height, frame_bytes)?;
+                        return Ok((VideoEncoder::PyrowaveD3d11 { inner, sink }, kbps));
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        return Err("pyrowave-d3d11 is only built for Windows".into());
+                    }
+                }
+                let inner = pyrowave::Encoder::new(setup.width, setup.height, frame_bytes)?;
                 Ok((VideoEncoder::Pyrowave { inner, sink }, kbps))
             }
             video => {
@@ -60,6 +75,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Mjpeg { sink } => Ok(sink(jpeg::encode(frame, jpeg::QUALITY)?)),
             VideoEncoder::Pyrowave { inner, sink } => Ok(sink(inner.encode(frame)?)),
+            #[cfg(windows)]
+            VideoEncoder::PyrowaveD3d11 { inner, sink } => Ok(sink(inner.encode(frame)?)),
             VideoEncoder::Ffmpeg(inner) => inner.push(frame).map(|_| true),
         }
     }

@@ -1,14 +1,15 @@
 //! Encoders and decoders for a negotiated etherquic session.
 //!
 //! Every codec here is real end to end: PyroWave through `libpyrowave-shared`
-//! (CPU buffers in and out, Vulkan compute inside), Opus through libopus,
+//! (CPU buffers in and out, Vulkan compute inside) or, on Windows without a
+//! hardware Vulkan device, `pyrowave_d3d11.dll`, Opus through libopus,
 //! H.264, H.265 and AV1 through an `ffmpeg` child process, and MJPEG and PCM
 //! in Rust. [`caps`] runs a test encode or decode before a codec is offered,
 //! so nothing is advertised that cannot run on this computer.
 //!
-//! FFI to the two C libraries is the only `unsafe` in etherquic; it sits in
-//! [`pyrowave`] and [`opus`], loaded at run time so a missing library only
-//! removes that codec.
+//! FFI to the C libraries is the only `unsafe` in etherquic; it sits in
+//! [`pyrowave`], [`pyrowave_d3d11`] and [`opus`], loaded at run time so a
+//! missing library only removes that codec.
 
 pub mod audio;
 pub mod caps;
@@ -18,6 +19,8 @@ pub mod jpeg;
 pub mod opus;
 pub mod player;
 pub mod pyrowave;
+#[cfg(windows)]
+pub mod pyrowave_d3d11;
 pub mod video;
 pub mod wire;
 pub mod yuv;

@@ -8,6 +8,7 @@ QUIC over Ethernet. Quinn sees datagrams, an opaque peer, and a max payload. It 
 | --- | --- |
 | QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule, `rustls-pure`, pin `a201190` |
 | TLS | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule, pin `9cba6e9` (AES-128-GCM for QUIC) |
+| PyroWave on Direct3D 11 | [Lyamc/pyrowave-dx11](https://github.com/Lyamc/pyrowave-dx11) submodule `vendor/pyrowave-dx11`, tag `v0.1.0`. Windows loads `pyrowave_d3d11.dll` when Vulkan is missing or only a CPU device answered |
 | L2, first choice | NDIS filter `membrane_ndis`, device `\\.\MembraneNdis`. [Install](docs/windows-membrane-ndis.md) |
 | L2, fallback | libpcap / Npcap (`src/pcap_link.rs`) when that device is not open |
 | Tests | in-memory `Fabric` |
@@ -16,7 +17,7 @@ EtherType `0x88B6`. A frame carries destination service, source service, and pay
 
 ## Clone
 
-The QUIC and TLS trees are submodules. Relative URLs (`../quinn.git`, `../rustls-rustcrypto.git`) follow the clone's protocol. Initialize them before `nix-build`.
+The QUIC, TLS, and Direct3D 11 PyroWave trees are submodules. Relative URLs (`../quinn.git`, `../rustls-rustcrypto.git`, `../pyrowave-dx11.git`) follow the clone's protocol. Initialize them before `nix-build`.
 
 ```bash
 git clone --recurse-submodules git@github.com:Lyamc/etherquic.git

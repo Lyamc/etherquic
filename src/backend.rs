@@ -125,9 +125,125 @@ fn split_list(path: &str, sep: char) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Vulkan compute is not enough. The shared library has to be installed too.
+/// Vulkan compute plus the shared library, or a D3D11 encoder on Windows.
+///
+/// `d3d11` is true when `pyrowave_d3d11.dll` is installed and this process
+/// can create a hardware feature-level 11_0 device. The unit test passes the
+/// flag itself so a DLL beside the test binary cannot change the result.
+pub fn pyrowave_ready_with(vulkan: bool, library: bool, d3d11: bool) -> bool {
+    (vulkan && library) || d3d11
+}
+
+/// Vulkan compute is not enough. The shared library has to be installed too,
+/// unless the Windows D3D11 encoder is present on a feature-level 11_0 GPU.
 pub fn pyrowave_ready(vulkan: bool, library: bool) -> bool {
-    vulkan && library
+    pyrowave_ready_with(vulkan, library, d3d11_encoder_present())
+}
+
+/// `pyrowave_d3d11.dll` next to this program, in the install directory, or
+/// named by `ETHERQUIC_PYROWAVE_D3D11`, and a hardware FL 11_0 device.
+fn d3d11_encoder_present() -> bool {
+    #[cfg(not(windows))]
+    {
+        false
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static READY: OnceLock<bool> = OnceLock::new();
+        *READY.get_or_init(|| pyrowave_d3d11_dll_present() && hardware_feature_level_11())
+    }
+}
+
+#[cfg(windows)]
+fn pyrowave_d3d11_dll_present() -> bool {
+    if let Some(value) = std::env::var_os("ETHERQUIC_PYROWAVE_D3D11") {
+        if value == "off" {
+            return false;
+        }
+        if Path::new(&value).is_file() {
+            return true;
+        }
+    }
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs.push(PathBuf::from(r"C:\Program Files\etherquic"));
+    file_named_in(&["pyrowave_d3d11.dll"], &dirs)
+}
+
+/// `D3D11CreateDevice` with a null adapter and `D3D_DRIVER_TYPE_HARDWARE`.
+/// Feature level 11_0 is `0xb000`. SDK version 7 is `D3D11_SDK_VERSION`.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn hardware_feature_level_11() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
+        fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
+        fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+    }
+    type CreateDevice = unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        *mut core::ffi::c_void,
+        u32,
+        *const u32,
+        u32,
+        u32,
+        *mut *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut core::ffi::c_void,
+    ) -> i32;
+    const DRIVER_HARDWARE: u32 = 1;
+    const FEATURE_LEVEL_11_0: u32 = 0xb000;
+    const SDK_VERSION: u32 = 7;
+    unsafe {
+        let module = LoadLibraryA(b"d3d11.dll\0".as_ptr());
+        if module.is_null() {
+            return false;
+        }
+        let symbol = GetProcAddress(module, b"D3D11CreateDevice\0".as_ptr());
+        if symbol.is_null() {
+            FreeLibrary(module);
+            return false;
+        }
+        let create: CreateDevice = std::mem::transmute(symbol);
+        let mut device: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut context: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut level = 0u32;
+        let feature = FEATURE_LEVEL_11_0;
+        let hr = create(
+            std::ptr::null_mut(),
+            DRIVER_HARDWARE,
+            std::ptr::null_mut(),
+            0,
+            &feature,
+            1,
+            SDK_VERSION,
+            &mut device,
+            &mut level,
+            &mut context,
+        );
+        // IUnknown::Release is vtable slot 2.
+        if !context.is_null() {
+            let vt = *(context as *const *const usize);
+            let release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 =
+                std::mem::transmute(*vt.add(2));
+            release(context);
+        }
+        if !device.is_null() {
+            let vt = *(device as *const *const usize);
+            let release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 =
+                std::mem::transmute(*vt.add(2));
+            release(device);
+        }
+        FreeLibrary(module);
+        hr >= 0 && level >= FEATURE_LEVEL_11_0
+    }
 }
 
 /// `libpyrowave-shared` beside this program, on the library path, or in the install directory.
@@ -748,9 +864,11 @@ mod tests {
 
     #[test]
     fn pyrowave_needs_the_library_and_vulkan() {
-        assert!(!pyrowave_ready(true, false));
-        assert!(!pyrowave_ready(false, true));
-        assert!(pyrowave_ready(true, true));
+        assert!(!pyrowave_ready_with(true, false, false));
+        assert!(!pyrowave_ready_with(false, true, false));
+        assert!(pyrowave_ready_with(true, true, false));
+        assert!(pyrowave_ready_with(false, false, true));
+        assert!(!pyrowave_ready_with(false, false, false));
     }
 
     #[test]
