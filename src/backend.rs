@@ -265,8 +265,27 @@ fn hardware_feature_level_11() -> bool {
     }
 }
 
+/// Directories that can hold `libpyrowave-shared` besides the program directory.
+///
+/// NixOS installs the library next to `etherquic` on `PATH`
+/// (`/run/current-system/sw/bin`), not under `lib/`.
+pub fn pyrowave_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    dirs.push(PathBuf::from("/run/current-system/sw/bin"));
+    dirs
+}
+
 /// `libpyrowave-shared` beside this program, on the library path, or in the install directory.
 pub fn pyrowave_library_present() -> bool {
+    if let Some(path) = std::env::var_os("ETHERQUIC_PYROWAVE") {
+        if Path::new(&path).is_file() {
+            return true;
+        }
+    }
     let mut dirs = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
@@ -304,6 +323,7 @@ pub fn pyrowave_library_present() -> bool {
         dirs.push(PathBuf::from("/run/current-system/sw/lib"));
         dirs.push(PathBuf::from("/usr/lib"));
         dirs.push(PathBuf::from("/usr/lib64"));
+        dirs.extend(pyrowave_search_dirs());
         file_named_in(
             &[
                 "libpyrowave-shared.so",

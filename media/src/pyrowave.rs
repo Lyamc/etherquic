@@ -151,6 +151,8 @@ pub fn library_candidates() -> Vec<PathBuf> {
             dirs.extend(std::env::split_paths(&paths));
         }
     }
+    // NixOS puts the library on PATH, beside the installed program.
+    dirs.extend(etherquic::backend::pyrowave_search_dirs());
     for dir in &dirs {
         for name in names {
             let path = dir.join(name);
@@ -186,6 +188,89 @@ fn prepare_vulkan() {
             }
         }
     }
+    // Linux Granite dlopens `libvulkan.so.1` by name. On NixOS that loader is
+    // not in the default search path; the package wrapper is what usually
+    // adds it. Point Granite at the file before the first device is created.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("GRANITE_VULKAN_LIBRARY").is_none() {
+        if let Some(loader) = linux_vulkan_loader() {
+            std::env::set_var("GRANITE_VULKAN_LIBRARY", loader);
+        }
+    }
+}
+
+/// `libvulkan.so.1` from the library path, or from the installed `etherquic`
+/// wrapper, which records the Nix store path of the loader.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_vulkan_loader() -> Option<PathBuf> {
+    let names = ["libvulkan.so.1", "libvulkan.so"];
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    for dir in [
+        "/run/opengl-driver/lib",
+        "/run/current-system/sw/lib",
+        "/usr/lib",
+        "/usr/lib64",
+    ] {
+        dirs.push(PathBuf::from(dir));
+    }
+    for dir in dirs {
+        for name in names {
+            let path = dir.join(name);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let Ok(text) = std::fs::read_to_string(dir.join("etherquic")) else {
+                continue;
+            };
+            if let Some(loader) = vulkan_loader_in_script(&text) {
+                return Some(loader);
+            }
+        }
+    }
+    // A desktop session can have a short PATH. The NixOS program link is fixed.
+    if let Ok(text) = std::fs::read_to_string("/run/current-system/sw/bin/etherquic") {
+        if let Some(loader) = vulkan_loader_in_script(&text) {
+            return Some(loader);
+        }
+    }
+    None
+}
+
+fn path_token_end(ch: char) -> bool {
+    matches!(
+        ch,
+        '\'' | '"' | ' ' | '\n' | '\t' | '=' | ':' | '$' | '{' | '}'
+    )
+}
+
+/// The Vulkan loader named by an etherquic wrapper script, when that file exists.
+fn vulkan_loader_in_script(text: &str) -> Option<PathBuf> {
+    let mut rest = text;
+    while let Some(rel) = rest.find("vulkan-loader-") {
+        let head = &rest[..rel];
+        let begin = head
+            .rfind(path_token_end)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let after = &rest[rel..];
+        let end = after.find(path_token_end).unwrap_or(after.len());
+        let token = &rest[begin..rel + end];
+        if let Some(lib_at) = token.find("/lib") {
+            let so = PathBuf::from(&token[..lib_at + 4]).join("libvulkan.so.1");
+            if so.is_file() {
+                return Some(so);
+            }
+        }
+        rest = &rest[rel + "vulkan-loader-".len()..];
+    }
+    None
 }
 
 /// Subdirectory of the install directory with the CPU Vulkan fallback.
@@ -608,6 +693,19 @@ mod device_tests {
         let gpu = device_from_properties(&props(2, "NVIDIA GeForce RTX 4090")).unwrap();
         assert!(!gpu.cpu);
         assert_eq!(gpu.name, "NVIDIA GeForce RTX 4090");
+        let dir = std::env::temp_dir().join(format!("eq-vk-{}", std::process::id()));
+        let root = dir.join("vulkan-loader-test");
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let so = lib.join("libvulkan.so.1");
+        std::fs::write(&so, b"").unwrap();
+        let script = format!("LD_LIBRARY_PATH='{}'", lib.display());
+        assert_eq!(vulkan_loader_in_script(&script).as_ref(), Some(&so));
+        // An earlier `/lib` on the same line must not hide the loader path.
+        let joined = format!("LD_LIBRARY_PATH=/run/opengl-driver/lib:{}", lib.display());
+        assert_eq!(vulkan_loader_in_script(&joined).as_ref(), Some(&so));
+        assert!(vulkan_loader_in_script("no loader here").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
         // KosmicKrisp on Metal is an integrated GPU.
         assert!(!device_from_properties(&props(1, "Apple M2 Pro (KosmicKrisp)")).unwrap().cpu);
     }

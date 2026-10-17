@@ -32,8 +32,8 @@ pub mod tls;
 pub mod udp_endpoint;
 
 /// Release label announced in discovery and shown in the window.
-/// Cargo's `version` field holds three numbers, so `0.1.5.1` lives here.
-pub const RELEASE: &str = "0.1.5.3";
+/// This is the Cargo package version (`major.minor.patch`).
+pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 /// 6-byte Ethernet MAC address.
 pub type Mac = [u8; 6];

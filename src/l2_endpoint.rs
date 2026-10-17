@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
@@ -39,7 +40,7 @@ impl L2Net {
     pub fn open(nic: Option<&str>, mtu: usize, ethertype: u16) -> Result<Arc<Self>, EndpointError> {
         let fabric = Fabric::with_ether_type(mtu, ethertype);
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut io = open_packet_io(nic, ethertype)?;
+        let io = open_packet_io(nic, ethertype)?;
         let l2_backend = io.l2_backend();
         let hw_mac = io.hw_mac();
         let adapter = io.adapter();
@@ -56,45 +57,25 @@ impl L2Net {
         );
 
         let fabric_rx = fabric.clone();
-        thread::Builder::new()
-            .name("etherquic-l2-io".into())
-            .spawn(move || loop {
-                // Wait on the send queue first. A pcap read can block until a
-                // frame arrives, so a read-first loop never transmits.
-                // 1ms instead of 5ms: that wait was added to every round trip.
-                match rx.recv_timeout(Duration::from_millis(1)) {
-                    Ok(frame) => {
-                        if let Err(e) = io.send(&frame) {
-                            eprintln!("L2 send error: {e}");
-                        }
-                        while let Ok(more) = rx.try_recv() {
-                            if let Err(e) = io.send(&more) {
-                                eprintln!("L2 send error: {e}");
-                            }
-                        }
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        // Membrane's read waits inside the driver until a frame arrives.
+        // pcap returns at once. A read on the send thread leaves the first
+        // picture queued until the peer sends again.
+        #[cfg(windows)]
+        if io.blocks_in_recv() {
+            match open_dedicated_reader() {
+                Ok(reader) => spawn_split_io(rx, io, reader, fabric_rx, ethertype)?,
+                Err(error) => {
+                    eprintln!(
+                        "L2 recv could not open a second Membrane handle ({error}); sends wait for reads"
+                    );
+                    spawn_coupled_io(rx, io, fabric_rx, ethertype)?;
                 }
-                let batch = match io.recv_batch(64) {
-                    Ok(batch) => batch,
-                    Err(e) => {
-                        eprintln!("L2 recv error: {e}");
-                        thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
-                };
-                for raw in batch {
-                    if let Ok(frame) = Frame::decode_filtered(&raw, ethertype) {
-                        // Announcements share this EtherType. They are not QUIC datagrams.
-                        if crate::discover::is_discovery(&frame) {
-                            continue;
-                        }
-                        fabric_rx.inject(frame);
-                    }
-                }
-            })
-            .map_err(|e| EndpointError::Other(e.to_string()))?;
+            }
+        } else {
+            spawn_coupled_io(rx, io, fabric_rx, ethertype)?;
+        }
+        #[cfg(not(windows))]
+        spawn_coupled_io(rx, io, fabric_rx, ethertype)?;
 
         Ok(Arc::new(Self {
             fabric,
@@ -152,6 +133,206 @@ impl L2Net {
     /// The pcap device name this net opened. `None` for Membrane.
     pub fn adapter(&self) -> Option<&str> {
         self.adapter.as_deref()
+    }
+}
+
+/// Writes queued frames on this thread. A blocked recv must be a different thread.
+///
+/// Linux pcap does not call this. The unit test does, and Windows Membrane does.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn drive_send(rx: Receiver<Vec<u8>>, mut send: impl FnMut(&[u8])) {
+    while let Ok(frame) = rx.recv() {
+        send(&frame);
+        while let Ok(more) = rx.try_recv() {
+            send(&more);
+        }
+    }
+}
+
+fn deliver_raw(fabric: &Fabric, ethertype: u16, raw: &[u8]) {
+    if let Ok(frame) = Frame::decode_filtered(raw, ethertype) {
+        // Announcements share this EtherType. They are not QUIC datagrams.
+        if !crate::discover::is_discovery(&frame) {
+            fabric.inject(frame);
+        }
+    }
+}
+
+fn spawn_coupled_io(
+    rx: Receiver<Vec<u8>>,
+    mut io: PacketIo,
+    fabric: Arc<Fabric>,
+    ethertype: u16,
+) -> Result<(), EndpointError> {
+    thread::Builder::new()
+        .name("etherquic-l2-io".into())
+        .spawn(move || {
+            loop {
+                // Wait on the send queue first. A read that blocks until a
+                // frame arrives must not run on this thread: the queued
+                // picture would sit until the peer sends again.
+                // 1ms instead of 5ms: that wait was added to every round trip.
+                match rx.recv_timeout(Duration::from_millis(1)) {
+                    Ok(frame) => {
+                        if let Err(e) = io.send(&frame) {
+                            eprintln!("L2 send error: {e}");
+                        }
+                        while let Ok(more) = rx.try_recv() {
+                            if let Err(e) = io.send(&more) {
+                                eprintln!("L2 send error: {e}");
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                let batch = match io.recv_batch(64) {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        eprintln!("L2 recv error: {e}");
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                };
+                for raw in batch {
+                    deliver_raw(&fabric, ethertype, &raw);
+                }
+            }
+        })
+        .map_err(|e| EndpointError::Other(e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_dedicated_reader() -> Result<crate::ndis_link::NdisLink, String> {
+    match crate::ndis_link::NdisLink::try_open().map_err(|e| e.to_string())? {
+        Some(link) => Ok(link),
+        None => Err("Membrane device is not open".into()),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_split_io(
+    rx: Receiver<Vec<u8>>,
+    mut io: PacketIo,
+    reader: crate::ndis_link::NdisLink,
+    fabric: Arc<Fabric>,
+    ethertype: u16,
+) -> Result<(), EndpointError> {
+    let stop = Arc::new(RecvStop::default());
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let stop_recv = Arc::clone(&stop);
+    thread::Builder::new()
+        .name("etherquic-l2-recv".into())
+        .spawn(move || {
+            recv_on_its_own(&reader, &stop_recv, &fabric, ethertype);
+            let _ = done_tx.send(());
+        })
+        .map_err(|e| EndpointError::Other(e.to_string()))?;
+    let stop_send = Arc::clone(&stop);
+    thread::Builder::new()
+        .name("etherquic-l2-io".into())
+        .spawn(move || {
+            drive_send(rx, move |frame| {
+                if let Err(e) = io.send(frame) {
+                    eprintln!("L2 send error: {e}");
+                }
+            });
+            stop_send.cancel_until(&done_rx, Duration::from_millis(500));
+        })
+        .map_err(|e| EndpointError::Other(e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn recv_on_its_own(
+    reader: &crate::ndis_link::NdisLink,
+    stop: &RecvStop,
+    fabric: &Fabric,
+    ethertype: u16,
+) {
+    stop.arm(reader.raw_handle());
+    let mut buf = vec![0u8; 2048];
+    while !stop.stopped() {
+        let mut got = 0usize;
+        for _ in 0..64 {
+            if stop.stopped() {
+                return;
+            }
+            match reader.recv(&mut buf) {
+                Ok(Some(n)) => {
+                    let n = n.min(buf.len());
+                    got += 1;
+                    deliver_raw(fabric, ethertype, &buf[..n]);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    if stop.stopped() {
+                        return;
+                    }
+                    eprintln!("L2 recv error: {error}");
+                    thread::sleep(Duration::from_millis(50));
+                    break;
+                }
+            }
+        }
+        // An immediate empty read must not spin. A read that waits in the
+        // driver returns only when a frame arrives, and never reaches here.
+        if got == 0 && !stop.stopped() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(windows)]
+struct RecvStop {
+    stop: std::sync::atomic::AtomicBool,
+    handle: std::sync::atomic::AtomicPtr<core::ffi::c_void>,
+}
+
+#[cfg(windows)]
+impl Default for RecvStop {
+    fn default() -> Self {
+        Self {
+            stop: std::sync::atomic::AtomicBool::new(false),
+            handle: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl RecvStop {
+    fn arm(&self, handle: windows_sys::Win32::Foundation::HANDLE) {
+        self.handle
+            .store(handle, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wake a read that is waiting in the driver, then wait until it leaves.
+    fn cancel_until(&self, done: &Receiver<()>, budget: Duration) {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Instant;
+
+        self.stop.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + budget;
+        loop {
+            let handle = self.handle.load(Ordering::SeqCst);
+            if !handle.is_null() {
+                crate::ndis_link::NdisLink::cancel_io(handle);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            match done.recv_timeout(left.min(Duration::from_millis(10))) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 }
 
@@ -379,6 +560,16 @@ impl PacketIo {
         }
     }
 
+    /// True when [`Self::recv_one`] can wait until a frame arrives.
+    #[cfg(windows)]
+    fn blocks_in_recv(&self) -> bool {
+        match self {
+            PacketIo::Pcap(_) => false,
+            #[cfg(windows)]
+            PacketIo::Ndis(_) => true,
+        }
+    }
+
     fn send(&mut self, frame: &[u8]) -> Result<(), String> {
         match self {
             PacketIo::Pcap(link) => link.send(frame).map_err(|e| e.to_string()),
@@ -456,4 +647,65 @@ fn open_packet_io(nic: Option<&str>, ethertype: u16) -> Result<PacketIo, Endpoin
     }
     let link = pcap_link::open(nic, ethertype).map_err(|e| EndpointError::Other(e.to_string()))?;
     Ok(PacketIo::Pcap(link))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::drive_send;
+
+    /// Membrane's read waits in the driver. The send side of that split is
+    /// [`drive_send`]: a frame queued while recv has not returned is still written.
+    #[test]
+    fn a_queued_send_is_written_while_recv_blocks() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_thread = Arc::clone(&sent);
+
+        let recv = thread::Builder::new()
+            .name("blocked-recv".into())
+            .spawn(move || {
+                entered_tx.send(()).expect("entered");
+                let _ = release_rx.recv();
+            })
+            .expect("recv thread");
+
+        let send = thread::Builder::new()
+            .name("etherquic-l2-io".into())
+            .spawn(move || {
+                drive_send(rx, move |frame| {
+                    sent_thread
+                        .lock()
+                        .expect("sent")
+                        .push(frame.to_vec());
+                });
+            })
+            .expect("send thread");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recv entered");
+        tx.send(b"picture".to_vec()).expect("queue");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let wrote = loop {
+            let ready = !sent.lock().expect("sent").is_empty();
+            if ready || Instant::now() >= deadline {
+                break ready;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(wrote, "send stayed behind the blocked recv");
+        assert_eq!(sent.lock().expect("sent").as_slice(), &[b"picture".to_vec()]);
+
+        drop(tx);
+        let _ = release_tx.send(());
+        recv.join().expect("recv joined");
+        send.join().expect("send joined");
+    }
 }

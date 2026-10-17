@@ -9,8 +9,9 @@
   runs msi-setup.ps1, which may install Membrane and then etherquic-setup.exe.
   That copies the host to Program Files\etherquic and creates etherquic-service.
   INSTALLSERVICE=0 installs the app only and removes a host service left by an
-  older install. host.conf is kept. MSI compares only the first three version
-  fields, so AllowSameVersionUpgrades lets 0.1.5.1 replace 0.1.5.
+  older install. host.conf is kept. ProductVersion is the Cargo package
+  version, major.minor.patch. AllowSameVersionUpgrades replaces an install
+  of that same version.
 
   Properties (msiexec ... NAME=value):
     INSTALLSERVICE=1|0   1 installs the host service (default). 0 is the app only.
@@ -27,7 +28,7 @@
            UpgradeCode="5B0E7F3C-2A41-4C8E-9D6B-71E4A3C90F12"
            Scope="perMachine"
            Compressed="yes">
-    <!-- Fourth field is ignored by Windows Installer, so 0.1.5.1 must replace 0.1.5. -->
+    <!-- Windows Installer keeps three fields. A fourth field is ignored. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />

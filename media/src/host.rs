@@ -246,28 +246,23 @@ pub async fn run(
         loop {
             tokio::select! {
                 biased;
+                // An encoded picture goes out before a cursor sample. The watch
+                // keeps only the latest cursor, so the pointer still follows
+                // this frame instead of sitting in front of it.
+                out = out_rx.recv() => {
+                    let Some(out) = out else { break };
+                    write_out(&mut video_send, v2, out).await?;
+                    if cursor_open {
+                        cursor_open = write_pending_cursor(&mut cursor, &mut video_send, v2).await?;
+                    }
+                }
                 changed = cursor.changed(), if cursor_open => {
                     match changed {
                         Ok(()) => {
-                            let bytes = cursor.borrow_and_update().clone();
-                            if v2 {
-                                if let Some(bytes) = bytes {
-                                    wire::write_typed(&mut video_send, VIDEO2_MAGIC, RECORD_CURSOR, &bytes).await?;
-                                }
-                            }
+                            cursor_open = send_cursor(&mut cursor, &mut video_send, v2).await?;
                         }
                         Err(_) => cursor_open = false,
                     }
-                }
-                out = out_rx.recv() => {
-                    let Some(out) = out else { break };
-                    let result = match out {
-                        VideoOut::Config(bytes) if v2 => wire::write_record(&mut video_send, VIDEO2_MAGIC, &bytes).await,
-                        VideoOut::Config(_) => Ok(()),
-                        VideoOut::Data(bytes) if v2 => wire::write_typed(&mut video_send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await,
-                        VideoOut::Data(bytes) => wire::write_record(&mut video_send, LEGACY_VIDEO_MAGIC, &bytes).await,
-                    };
-                    result?;
                 }
             }
         }
@@ -283,6 +278,44 @@ pub async fn run(
         task.abort();
     }
     video_result.and(audio_result)
+}
+
+async fn write_out(send: &mut SendStream, v2: bool, out: VideoOut) -> Result<(), String> {
+    match out {
+        VideoOut::Config(bytes) if v2 => wire::write_record(send, VIDEO2_MAGIC, &bytes).await,
+        VideoOut::Config(_) => Ok(()),
+        VideoOut::Data(bytes) if v2 => {
+            wire::write_typed(send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await
+        }
+        VideoOut::Data(bytes) => wire::write_record(send, LEGACY_VIDEO_MAGIC, &bytes).await,
+    }
+}
+
+/// `false` when the cursor watch has closed.
+async fn write_pending_cursor(
+    cursor: &mut watch::Receiver<Option<Vec<u8>>>,
+    send: &mut SendStream,
+    v2: bool,
+) -> Result<bool, String> {
+    match cursor.has_changed() {
+        Ok(false) => Ok(true),
+        Err(_) => Ok(false),
+        Ok(true) => send_cursor(cursor, send, v2).await,
+    }
+}
+
+async fn send_cursor(
+    cursor: &mut watch::Receiver<Option<Vec<u8>>>,
+    send: &mut SendStream,
+    v2: bool,
+) -> Result<bool, String> {
+    let bytes = cursor.borrow_and_update().clone();
+    if v2 {
+        if let Some(bytes) = bytes {
+            wire::write_typed(send, VIDEO2_MAGIC, RECORD_CURSOR, &bytes).await?;
+        }
+    }
+    Ok(true)
 }
 
 async fn finish(send: &mut SendStream) -> Result<(), String> {

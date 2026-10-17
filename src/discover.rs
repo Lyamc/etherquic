@@ -409,7 +409,7 @@ const MAX_OS_VER: usize = 16;
 /// This build and the operating system, carried in [`TLV_RELEASE`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
-    /// [`crate::RELEASE`], such as `0.1.5.1`.
+    /// [`crate::RELEASE`], the Cargo package version, such as `0.1.6`.
     pub version: String,
     pub os: u8,
     /// `Windows`, `macOS`, `Android`, or a Linux distribution name.

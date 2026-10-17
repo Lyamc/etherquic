@@ -1,18 +1,32 @@
 # Build dist\etherquic-<version>-windows-x64.msi (WiX 5: dotnet tool install --global wix --version 5.0.2).
-#   powershell -File packaging\windows\build-msi.ps1 [-Version 0.1.0] [-Cjxl DIR] [-Codecs DIR] [-VulkanCpu DIR] [-Npcap DIR]
+#   powershell -File packaging\windows\build-msi.ps1 [-Version 0.1.6] [-Cjxl DIR] [-Codecs DIR] [-VulkanCpu DIR] [-Npcap DIR]
+# -Version defaults to the root Cargo package version.
 # Codec libraries are built from git submodules by build-codecs.ps1 and always staged.
 # -Codecs, -Cjxl, and -VulkanCpu add to that set; they do not replace it.
 # -VulkanCpu is staged as vulkan-cpu\ so PyroWave works on PCs without a GPU Vulkan driver.
 # Builds etherquic-host and the app (both link Npcap's wpcap.lib), etherquic-setup and the etherquic app,
 # stages them with the Membrane driver package and the codecs, and runs wix build.
 param(
-    [string]$Version = "0.1.0",
+    [string]$Version = "",
     [string]$Cjxl = "",
     [string]$Codecs = "",
     [string]$VulkanCpu = "",
     [string]$Npcap = "C:\Build\networking\borderless\third_party\npcap\lib"
 )
 $ErrorActionPreference = "Stop"
+if (-not $Version) {
+    $manifest = Join-Path $PSScriptRoot "..\..\Cargo.toml"
+    $inPackage = $false
+    foreach ($line in Get-Content $manifest) {
+        if ($line -match '^\[package\]') { $inPackage = $true; continue }
+        if ($inPackage -and $line -match '^\[') { break }
+        if ($inPackage -and $line -match '^version = "([^"]+)"') {
+            $Version = $Matches[1]
+            break
+        }
+    }
+    if (-not $Version) { throw "package version missing from $manifest" }
+}
 
 # ui/build.rs writes PNG images inside the .ico. Windows Installer stores that
 # file in the Icon table and wants a classic BMP icon, so convert before wix.

@@ -17,8 +17,17 @@ here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 pyrowave=${1:-}
 out=${2:-$root/dist/macos}
-# VERSION=0.1.1 overrides the ui crate version, like build-msi.ps1 -Version.
-version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/ui/Cargo.toml" | head -1)}
+# VERSION=0.1.6 overrides the root package version, like build-msi.ps1 -Version.
+version=${VERSION:-$(awk '
+  /^\[package\]/ { inpkg = 1; next }
+  inpkg && /^\[/ { exit }
+  inpkg && /^version = "/ {
+    sub(/^version = "/, "")
+    sub(/".*/, "")
+    print
+    exit
+  }
+' "$root/Cargo.toml")}
 target=${CARGO_TARGET_DIR:-$root/target}
 brew=${HOMEBREW_PREFIX:-/opt/homebrew}
 

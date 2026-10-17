@@ -28,7 +28,7 @@ extern "system" {
         template: HANDLE,
     ) -> HANDLE;
 }
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::IO::{CancelIoEx, DeviceIoControl};
 
 const FILE_DEVICE_L2_CAP: u32 = 0x0000_8888;
 const METHOD_BUFFERED: u32 = 0;
@@ -82,6 +82,18 @@ impl NdisLink {
         Ok(Some(Self { handle }))
     }
 
+    pub(crate) fn raw_handle(&self) -> HANDLE {
+        self.handle
+    }
+
+    /// Unblock a read that is waiting on this handle, including one issued by
+    /// another thread. A null overlapped pointer cancels every pending call.
+    pub(crate) fn cancel_io(handle: HANDLE) {
+        unsafe {
+            CancelIoEx(handle, std::ptr::null());
+        }
+    }
+
     pub fn send(&self, frame: &[u8]) -> io::Result<()> {
         let mut returned = 0u32;
         let ok = unsafe {
@@ -119,7 +131,9 @@ impl NdisLink {
         };
         if ok == 0 {
             let err = io::Error::last_os_error();
-            // 259 = no data yet. The driver queues reads; treat empty as timeout.
+            // 259 = ERROR_NO_MORE_ITEMS, an empty queue. The same call can
+            // also wait inside the driver until a frame arrives. The send
+            // thread must not be the one inside this call.
             if err.raw_os_error() == Some(259) {
                 return Ok(None);
             }
