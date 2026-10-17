@@ -8,7 +8,7 @@ QUIC over Ethernet. Quinn sees datagrams, an opaque peer, and a max payload. It 
 | --- | --- |
 | QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule, `rustls-pure`, pin `a201190` |
 | TLS | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule, pin `9cba6e9` (AES-128-GCM for QUIC) |
-| PyroWave on Direct3D 11 | [Lyamc/pyrowave-dx11](https://github.com/Lyamc/pyrowave-dx11) submodule `vendor/pyrowave-dx11`, tag `v0.1.0`. Windows loads `pyrowave_d3d11.dll` when Vulkan is missing or only a CPU device answered |
+| PyroWave on Direct3D 11 | [Lyamc/pyrowave-dx11](https://github.com/Lyamc/pyrowave-dx11) submodule `vendor/pyrowave-dx11`, tag `v0.1.1`. Windows loads `pyrowave_d3d11.dll` when Vulkan is missing or only a CPU device answered |
 | Windows codecs | Submodules built into the MSI by `packaging/windows/build-codecs.ps1`: [xiph/opus](https://github.com/xiph/opus) `v1.6.1`, [Themaister/pyrowave](https://github.com/Themaister/pyrowave) `a0d2e71` with [Granite](https://github.com/Themaister/Granite) `fb178c8`, and [libjxl](https://github.com/libjxl/libjxl) `v0.12.0` (`cjxl`). Lavapipe is the pinned [mesa-dist-win](https://github.com/pal1000/mesa-dist-win) `26.2.4` release; the `vulkan-1.dll` shim is compiled from this tree |
 | L2, first choice | NDIS filter `membrane_ndis`, device `\\.\MembraneNdis`. [Install](docs/windows-membrane-ndis.md) |
 | L2, fallback | libpcap / Npcap (`src/pcap_link.rs`) when that device is not open |
