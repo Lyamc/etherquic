@@ -87,11 +87,23 @@ pub enum DialTarget {
 }
 
 /// Keep `choice` when that address is still on the host. Otherwise use L2.
+/// On Android L2 is never available, so a leftover L2 choice becomes the
+/// first announced IPv4 or IPv6 address.
 pub fn active_layer(choice: Layer, v4: &[Ipv4Addr], v6: &[Ipv6Addr]) -> Layer {
     match choice {
         Layer::V4(ip) if v4.contains(&ip) => choice,
         Layer::V6(ip) if v6.contains(&ip) => choice,
-        _ => Layer::L2,
+        _ => {
+            if cfg!(target_os = "android") {
+                if let Some(&ip) = v4.first() {
+                    return Layer::V4(ip);
+                }
+                if let Some(&ip) = v6.first() {
+                    return Layer::V6(ip);
+                }
+            }
+            Layer::L2
+        }
     }
 }
 

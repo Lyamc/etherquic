@@ -398,6 +398,13 @@ fn capture_primary() -> Option<(Vec<u8>, u32, u32)> {
 
 /// Names of the controllers plugged into this computer, as the player sends
 /// them. A slot pin in Settings matches one of these names.
+#[cfg(not(feature = "desktop"))]
+pub fn local_pads() -> Vec<String> {
+    Vec::new()
+}
+
+/// Names of the controllers plugged into this computer, as the player sends
+/// them. A slot pin in Settings matches one of these names.
 #[cfg(feature = "desktop")]
 pub fn local_pads() -> Vec<String> {
     let Ok(mut gilrs) = gilrs::Gilrs::new() else {

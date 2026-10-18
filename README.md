@@ -11,7 +11,7 @@ QUIC over Ethernet. Quinn sees datagrams, an opaque peer, and a max payload. It 
 | PyroWave on Direct3D 11 | [Lyamc/pyrowave-dx11](https://github.com/Lyamc/pyrowave-dx11) submodule `vendor/pyrowave-dx11`, tag `v0.1.1`. Windows loads `pyrowave_d3d11.dll` when Vulkan is missing or only a CPU device answered |
 | Windows codecs | Submodules built into the MSI by `packaging/windows/build-codecs.ps1`: [xiph/opus](https://github.com/xiph/opus) `v1.6.1`, [Themaister/pyrowave](https://github.com/Themaister/pyrowave) `a0d2e71` with [Granite](https://github.com/Themaister/Granite) `fb178c8`, and [libjxl](https://github.com/libjxl/libjxl) `v0.12.0` (`cjxl`). Lavapipe is the pinned [mesa-dist-win](https://github.com/pal1000/mesa-dist-win) `26.2.4` release; the `vulkan-1.dll` shim is compiled from this tree |
 | L2, first choice | NDIS filter `membrane_ndis`, device `\\.\MembraneNdis`. [Install](docs/windows-membrane-ndis.md) |
-| L2, fallback | libpcap / Npcap (`src/pcap_link.rs`) when that device is not open |
+| L2, fallback | Npcap or libpcap (`src/pcap_link.rs`) when that device is not open. macOS uses BPF receive and AF_NDRV send (`src/macos_link.rs`) |
 | Tests | in-memory `Fabric` |
 
 EtherType `0x88B6`. A frame carries destination service, source service, and payload length, so Ethernet padding does not swallow a short QUIC ACK. Rust 1.85. The crypto path has no `ring`, `aws-lc`, or `cc`. This crate is `#![forbid(unsafe_code)]`.
@@ -40,7 +40,7 @@ On Windows the receiver tries NDIS, then Npcap:
 etherquic-video-recv --local-mac PEER_MAC --out received.mp4
 ```
 
-Linux send needs `CAP_NET_RAW` and `CAP_NET_ADMIN`. On Windows, point `RUSTFLAGS` at the Npcap import library:
+Linux send needs `CAP_NET_RAW` and `CAP_NET_ADMIN`. macOS send needs a `/dev/bpf*` device (usually root). The macOS host LaunchDaemon (`dev.etherquic.host`) runs as root so BPF opens; `packaging/macos/make-pkg.sh` can install it, and the app prompts if it is missing. On Windows, point `RUSTFLAGS` at the Npcap import library:
 
 ```powershell
 $env:RUSTFLAGS = '-L native=PATH\TO\npcap\lib'
@@ -72,6 +72,10 @@ cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- connect --nic 
 
 `etherquic` is the window: `host` and `connect`. The `ui` feature is the GPUI front end. Host and Connect call the play library inside `etherquic.exe`: the picture, the audio, and keyboard, mouse, and gamepad.
 
+## Android
+
+The Play APK (`dev.etherquic.play`) is a UDP player. Scan the host-card QR, or paste that text. Ethernet is not used. The native crate is [`android`](android/README.md) (`etherquic-android`), built with `--no-default-features` on `etherquic-play`. `INTERNET` and `ACCESS_NETWORK_STATE` are in the manifest. A phone `.so` needs the NDK and `aarch64-linux-android`.
+
 ## Capture
 
 Preferences has Capture. It writes `ether.pcap` and `app.pcap` under `$XDG_STATE_HOME/etherquic/capture/`, or `%LOCALAPPDATA%\etherquic\capture\` on Windows. `ETHERQUIC_CAPTURE=DIR` starts that for the window and for `etherquic-play`. Decode both with `wireshark/etherquic.lua`. Capture is off until it is turned on, and the switch is not saved.
@@ -81,6 +85,7 @@ Preferences has Capture. It writes `ether.pcap` and `app.pcap` under `$XDG_STATE
 | Crate | What it does |
 | --- | --- |
 | [`ui`](ui/README.md) | Window. Taskbar button only while hosting. Host and Connect call the play library in this process. |
+| [`android`](android/README.md) | UDP player the Play APK loads. Parses the host-card QR and dials the UDP port. |
 | [`play`](play/README.md) | Desktop session: picture, audio, and input on one connection. |
 | [`input`](input/README.md) | Lab tool. Keyboard, mouse, and gamepad file. Service 4435, priority 20. |
 | [`audio`](audio/README.md) | Lab tool. Opus as LOC objects. Service 4434, priority 10. |

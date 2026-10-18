@@ -4,179 +4,21 @@
 //! and service to dial, the port, and the adapter addresses. The QR grid is
 //! that text. A quiet zone is included so the dark window does not eat the edge.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
 use qrcode::types::Color;
 use qrcode::QrCode;
 
-use crate::session::{format_mac, HOST_MAC, PLAY_SERVICE_ID};
+use crate::session::{HOST_MAC, PLAY_SERVICE_ID};
+
+pub use etherquic::share::{offer_name, Share, ShareRow, NAME_LIMIT};
 
 /// Spec minimum. The white pad in the window is extra margin on top of this.
 const QUIET: usize = 4;
-/// Discovery offers clip the host name here. The QR uses the same cap.
-const NAME_LIMIT: usize = 32;
-
-/// What a phone needs in order to join this PC.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Share {
-    pub name: String,
-    /// MAC a player dials. This is the host identity, not the adapter's burned-in address.
-    pub mac: [u8; 6],
-    pub service: u16,
-    pub port: u16,
-    pub ipv4: Vec<Ipv4Addr>,
-    pub ipv6: Vec<Ipv6Addr>,
-}
-
-/// One labeled fact about this PC, in the order the window shows them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShareRow {
-    pub label: &'static str,
-    pub value: String,
-}
 
 /// Dark modules, row by row, including the quiet zone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QrGrid {
     pub modules: Vec<bool>,
     pub width: usize,
-}
-
-impl Share {
-    pub fn blank() -> Self {
-        Self {
-            name: String::new(),
-            mac: HOST_MAC,
-            service: PLAY_SERVICE_ID,
-            port: PLAY_SERVICE_ID,
-            ipv4: Vec::new(),
-            ipv6: Vec::new(),
-        }
-    }
-
-    /// Hostname, the L2 address to dial, then IPv4 and IPv6 on their own rows.
-    pub fn rows(&self) -> [ShareRow; 4] {
-        let name = self.name.trim();
-        let hostname = if name.is_empty() {
-            "unknown".to_string()
-        } else {
-            name.to_string()
-        };
-        [
-            ShareRow {
-                label: "Hostname",
-                value: hostname,
-            },
-            ShareRow {
-                label: "L2",
-                value: format!("{} · service {}", format_mac(self.mac), self.service),
-            },
-            ShareRow {
-                label: "IPv4",
-                value: l3_value(&self.ipv4, self.port),
-            },
-            ShareRow {
-                label: "IPv6",
-                value: l3_value(&self.ipv6, self.port),
-            },
-        ]
-    }
-
-    /// One field per line. A camera app shows this text as the scan result.
-    pub fn text(&self) -> String {
-        let mut out = String::from("etherquic\n");
-        let name = offer_name(&self.name);
-        if !name.is_empty() {
-            out.push_str("name ");
-            out.push_str(&name);
-            out.push('\n');
-        }
-        out.push_str("mac ");
-        out.push_str(&format_mac(self.mac));
-        out.push('\n');
-        out.push_str(&format!("service {}\nport {}\n", self.service, self.port));
-        for ip in &self.ipv4 {
-            out.push_str("ip ");
-            out.push_str(&ip.to_string());
-            out.push('\n');
-        }
-        for ip in &self.ipv6 {
-            out.push_str("ip ");
-            out.push_str(&ip.to_string());
-            out.push('\n');
-        }
-        out
-    }
-
-    pub fn parse(text: &str) -> Option<Self> {
-        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-        if lines.next()?.trim() != "etherquic" {
-            return None;
-        }
-        let mut name = None;
-        let mut mac = None;
-        let mut service = None;
-        let mut port = None;
-        let mut ipv4 = Vec::new();
-        let mut ipv6 = Vec::new();
-        for line in lines {
-            let (key, value) = line.trim().split_once(' ')?;
-            if value.is_empty() {
-                return None;
-            }
-            match key {
-                "name" => {
-                    if name.is_some() || value.len() > NAME_LIMIT {
-                        return None;
-                    }
-                    name = Some(value.to_string());
-                }
-                "mac" => {
-                    if mac.is_some() {
-                        return None;
-                    }
-                    mac = Some(etherquic::parse_mac(value)?);
-                }
-                "service" => {
-                    if service.is_some() {
-                        return None;
-                    }
-                    service = Some(value.parse().ok()?);
-                }
-                "port" => {
-                    if port.is_some() {
-                        return None;
-                    }
-                    port = Some(value.parse().ok()?);
-                }
-                "ip" => match value.parse::<IpAddr>().ok()? {
-                    IpAddr::V4(ip) => ipv4.push(ip),
-                    IpAddr::V6(ip) => ipv6.push(ip),
-                },
-                _ => return None,
-            }
-        }
-        Some(Self {
-            name: name.unwrap_or_default(),
-            mac: mac?,
-            service: service?,
-            port: port?,
-            ipv4,
-            ipv6,
-        })
-    }
-}
-
-fn l3_value<T: ToString>(addrs: &[T], port: u16) -> String {
-    if addrs.is_empty() {
-        return "no address".into();
-    }
-    let hosts = addrs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{hosts} · port {port}")
 }
 
 /// This PC, as the host card publishes it. A missing adapter still yields the MAC and service.
@@ -218,6 +60,10 @@ pub(crate) fn machine_name() -> String {
             return name.to_string();
         }
     }
+    #[cfg(target_os = "android")]
+    if let Some(name) = android_model() {
+        return name;
+    }
     std::fs::read_to_string("/etc/hostname")
         .ok()
         .map(|text| text.trim().to_string())
@@ -225,21 +71,18 @@ pub(crate) fn machine_name() -> String {
         .unwrap_or_else(|| "etherquic".into())
 }
 
-/// Newlines would split a field. Spaces keep the name on one line, then the discovery cap applies.
-fn offer_name(name: &str) -> String {
-    let flat: String = name
-        .chars()
-        .map(|ch| match ch {
-            '\n' | '\r' => ' ',
-            other => other,
-        })
-        .collect();
-    let flat = flat.trim();
-    let mut end = flat.len().min(NAME_LIMIT);
-    while end > 0 && !flat.is_char_boundary(end) {
-        end -= 1;
+#[cfg(target_os = "android")]
+fn android_model() -> Option<String> {
+    let text = std::fs::read_to_string("/system/build.prop").ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("ro.product.model=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
     }
-    flat[..end].to_string()
+    None
 }
 
 #[cfg(test)]

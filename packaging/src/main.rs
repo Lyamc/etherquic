@@ -17,15 +17,33 @@ fn main() -> ExitCode {
 
 fn build() -> Result<(), Error> {
     let mut args = std::env::args().skip(1);
-    let output = args
+    let first = args
         .next()
-        .ok_or_else(|| Error::message("usage: etherquic-installers <output-directory>"))?;
-    if args.next().is_some() {
-        return Err(Error::message(
-            "usage: etherquic-installers <output-directory>",
-        ));
+        .ok_or_else(|| Error::message(USAGE))?;
+    if first == "android" {
+        let output = args
+            .next()
+            .ok_or_else(|| Error::message(USAGE))?;
+        let version_code = args
+            .next()
+            .ok_or_else(|| Error::message(USAGE))?
+            .parse::<u32>()
+            .map_err(|_| Error::message("android version code must be an integer"))?;
+        let version_name = args
+            .next()
+            .ok_or_else(|| Error::message(USAGE))?;
+        if args.next().is_some() {
+            return Err(Error::message(USAGE));
+        }
+        let output = PathBuf::from(output);
+        build_android_package(&output, version_code, &version_name)?;
+        println!("wrote {}", output.display());
+        return Ok(());
     }
-    let output = PathBuf::from(output);
+    if args.next().is_some() {
+        return Err(Error::message(USAGE));
+    }
+    let output = PathBuf::from(first);
     std::fs::create_dir_all(&output)?;
     build_windows_installer(&output.join("etherquic-play-1.0.0.msi"), "1.0.0")?;
     build_windows_installer(&output.join("etherquic-play-1.1.0.msi"), "1.1.0")?;
@@ -34,3 +52,6 @@ fn build() -> Result<(), Error> {
     println!("wrote {}", output.display());
     Ok(())
 }
+
+const USAGE: &str = "usage: etherquic-installers <output-directory>
+       etherquic-installers android <apk-path> <version-code> <version-name>";

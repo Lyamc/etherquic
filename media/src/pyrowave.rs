@@ -208,12 +208,24 @@ fn linux_vulkan_loader() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
         dirs.extend(std::env::split_paths(&path));
     }
-    for dir in [
-        "/run/opengl-driver/lib",
-        "/run/current-system/sw/lib",
-        "/usr/lib",
-        "/usr/lib64",
-    ] {
+    let search = if cfg!(target_os = "android") {
+        [
+            "/system/lib64",
+            "/system/lib",
+            "/vendor/lib64",
+            "/vendor/lib",
+        ]
+        .as_slice()
+    } else {
+        [
+            "/run/opengl-driver/lib",
+            "/run/current-system/sw/lib",
+            "/usr/lib",
+            "/usr/lib64",
+        ]
+        .as_slice()
+    };
+    for dir in search {
         dirs.push(PathBuf::from(dir));
     }
     for dir in dirs {
@@ -628,6 +640,11 @@ impl Decoder {
         let mut handle: Handle = std::ptr::null_mut();
         check(unsafe { (device.api.decoder_create)(&info, &mut handle) }, "decoder")?;
         Ok(Decoder { device, handle, planes: I420::new(width as usize, height as usize) })
+    }
+
+    /// The Vulkan device this decoder runs on, when the library can say.
+    pub fn vulkan_device(&self) -> Option<VulkanDevice> {
+        self.device.vulkan_device()
     }
 
     pub fn decode(&mut self, record: &[u8]) -> Result<Frame, String> {

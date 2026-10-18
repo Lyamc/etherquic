@@ -17,6 +17,7 @@ mod clipboard;
 mod codec;
 mod desk_io;
 pub mod hostinfo;
+mod join;
 mod keystrokes;
 pub mod negotiated;
 mod outbox;
@@ -48,6 +49,7 @@ pub use desk_io::{
 };
 pub use etherquic::look::Look;
 pub use etherquic_media;
+pub use join::{join_udp, parse_share, udp_peer};
 pub use keystrokes::{focus_sends_keyboard, keystroke_events, paste_chord, submit_keystrokes};
 pub use negotiated::{CodecChoice, SessionLine};
 pub use outbox::Gate;
@@ -132,6 +134,16 @@ pub use client_desk::{
 pub use host_desk::set_input_recorder;
 #[cfg(feature = "desktop")]
 pub use host_desk::{audio_devices, display_hz, host_desktop, HostSession};
+
+#[cfg(not(feature = "desktop"))]
+pub fn display_hz() -> Option<u32> {
+    None
+}
+
+#[cfg(not(feature = "desktop"))]
+pub fn audio_devices() -> (Vec<String>, Vec<String>) {
+    (Vec::new(), Vec::new())
+}
 
 /// Where a desktop session reports a line the caller can show.
 #[cfg(feature = "desktop")]

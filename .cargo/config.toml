@@ -4,3 +4,12 @@
 [env]
 # Used by the pcap crate's build script when pkg-config is available.
 # PKG_CONFIG_PATH is also set in the build shell when needed.
+
+# NativeActivity looks up ANativeActivity_onCreate in the .so. Android 15
+# loads 16 KiB pages, so the ELF max-page-size has to match the APK align.
+[target.aarch64-linux-android]
+rustflags = [
+    "--cfg", "gles",
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,--undefined=ANativeActivity_onCreate",
+]

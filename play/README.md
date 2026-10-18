@@ -19,4 +19,6 @@ cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- connect --nic 
 
 `nix-shell nix/shell.nix` provides libpcap and the desktop libraries. `ETHERQUIC_CERTS` defaults to `etherquic/certs`. The player does not check the certificate.
 
+A phone uses [`join_udp`](src/join.rs) after it parses the host-card text. That path opens UDP only. Build it with `--no-default-features`. The APK crate is [`android`](../android/README.md).
+
 Linux capture lists monitors through X11, then takes the picture from the Wayland portal, GNOME Shell, or wlroots. A portal can ask. Keyboard injection is a Wayland virtual keyboard. The pointer tries KWin fake-input (version 3 or newer), then a virtual pointer the size of the screen, then libei from the remote-desktop portal. An X11-only session gets none of those events. Gamepads appear as `etherquic-play pad N` via `/dev/uinput`, or as an Xbox 360 controller when ViGEmBus is installed. Windows audio is the default output opened as loopback. Linux audio prefers an input whose name contains `monitor` or `loopback`.

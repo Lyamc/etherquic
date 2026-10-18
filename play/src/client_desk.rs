@@ -22,7 +22,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
@@ -1068,7 +1068,11 @@ impl ApplicationHandler for App {
                 ) {
                     return;
                 }
-                self.send_key(&event.logical_key, event.state == ElementState::Pressed);
+                self.send_key(
+                    &event.logical_key,
+                    event.physical_key,
+                    event.state == ElementState::Pressed,
+                );
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if !self.live() {
@@ -1657,11 +1661,11 @@ impl App {
         }
     }
 
-    fn send_key(&mut self, key: &Key, down: bool) {
+    fn send_key(&mut self, key: &Key, physical: PhysicalKey, down: bool) {
         if !crate::snapshot(&self.view).send_keyboard {
             return;
         }
-        let Some(code) = keysym(key) else {
+        let Some(code) = keysym(key, physical) else {
             return;
         };
         self.emit(vec![Event {
@@ -1784,7 +1788,12 @@ fn key_is_v(key: &Key) -> bool {
     }
 }
 
-fn keysym(key: &Key) -> Option<u32> {
+fn keysym(key: &Key, physical: PhysicalKey) -> Option<u32> {
+    // Dedicated arrows stay arrows even when the OS reports a digit (NumLock
+    // overlay). Numpad4 with NumLock on keeps physical Numpad4 and still types 4.
+    if let Some(code) = physical_nav_keysym(physical) {
+        return Some(code);
+    }
     match key {
         Key::Character(text) => {
             let mut chars = text.chars();
@@ -1799,6 +1808,25 @@ fn keysym(key: &Key) -> Option<u32> {
     }
 }
 
+fn physical_nav_keysym(physical: PhysicalKey) -> Option<u32> {
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
+    Some(match code {
+        KeyCode::ArrowLeft => 0xff51,
+        KeyCode::ArrowUp => 0xff52,
+        KeyCode::ArrowRight => 0xff53,
+        KeyCode::ArrowDown => 0xff54,
+        KeyCode::Home => 0xff50,
+        KeyCode::End => 0xff57,
+        KeyCode::PageUp => 0xff55,
+        KeyCode::PageDown => 0xff56,
+        KeyCode::Insert => 0xff63,
+        KeyCode::Delete => 0xffff,
+        _ => return None,
+    })
+}
+
 fn named_keysym(key: NamedKey) -> Option<u32> {
     Some(match key {
         NamedKey::Escape => 0xff1b,
@@ -1807,6 +1835,7 @@ fn named_keysym(key: NamedKey) -> Option<u32> {
         NamedKey::Backspace => 0xff08,
         NamedKey::Tab => 0xff09,
         NamedKey::Delete => 0xffff,
+        NamedKey::Insert => 0xff63,
         NamedKey::ArrowLeft => 0xff51,
         NamedKey::ArrowUp => 0xff52,
         NamedKey::ArrowRight => 0xff53,
@@ -1837,7 +1866,8 @@ fn named_keysym(key: NamedKey) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseAction, Phase};
+    use super::{keysym, named_keysym, physical_nav_keysym, CloseAction, Phase};
+    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
     #[test]
     fn close_keeps_pumping_until_the_window_is_destroyed() {
@@ -1847,5 +1877,30 @@ mod tests {
         assert_eq!(Phase::Closing.action(false), CloseAction::Ignore);
         assert_eq!(Phase::Closing.action(true), CloseAction::Ignore);
         assert_eq!(Phase::Closed.action(true), CloseAction::Ignore);
+    }
+
+    #[test]
+    fn dedicated_arrows_stay_arrows_when_the_os_reports_a_digit() {
+        assert_eq!(named_keysym(NamedKey::ArrowLeft), Some(0xff51));
+        assert_eq!(named_keysym(NamedKey::ArrowDown), Some(0xff54));
+        let left = PhysicalKey::Code(KeyCode::ArrowLeft);
+        assert_eq!(physical_nav_keysym(left), Some(0xff51));
+        assert_eq!(
+            keysym(&Key::Character("4".into()), left),
+            Some(0xff51)
+        );
+        assert_eq!(
+            keysym(&Key::Character("2".into()), PhysicalKey::Code(KeyCode::ArrowDown)),
+            Some(0xff54)
+        );
+        // Numpad 4 with NumLock on still types 4.
+        assert_eq!(
+            keysym(
+                &Key::Character("4".into()),
+                PhysicalKey::Code(KeyCode::Numpad4)
+            ),
+            Some(u32::from('4'))
+        );
+        assert_eq!(physical_nav_keysym(PhysicalKey::Code(KeyCode::Numpad4)), None);
     }
 }

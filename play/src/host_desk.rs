@@ -912,15 +912,16 @@ fn key_from_keysym(code: u32) -> Option<Key> {
         0xff0d | 0xff8d => Key::Return,
         0xff08 => Key::Backspace,
         0xff09 => Key::Tab,
-        0xffff => Key::Delete,
-        0xff51 => Key::LeftArrow,
-        0xff52 => Key::UpArrow,
-        0xff53 => Key::RightArrow,
-        0xff54 => Key::DownArrow,
-        0xff50 => Key::Home,
-        0xff57 => Key::End,
-        0xff55 => Key::PageUp,
-        0xff56 => Key::PageDown,
+        0xffff | 0xff9f => Key::Delete,
+        0xff63 | 0xff9e => Key::Insert,
+        0xff51 | 0xff96 => Key::LeftArrow,
+        0xff52 | 0xff97 => Key::UpArrow,
+        0xff53 | 0xff98 => Key::RightArrow,
+        0xff54 | 0xff99 => Key::DownArrow,
+        0xff50 | 0xff95 => Key::Home,
+        0xff57 | 0xff9c => Key::End,
+        0xff55 | 0xff9a => Key::PageUp,
+        0xff56 | 0xff9b => Key::PageDown,
         0xffe1 | 0xffe2 => Key::Shift,
         0xffe3 | 0xffe4 => Key::Control,
         0xffe9 | 0xffea => Key::Alt,
@@ -964,5 +965,9 @@ mod tests {
         ));
         assert!(matches!(key_from_keysym(0xff0d), Some(Key::Return)));
         assert!(key_from_keysym(u32::from('\n')).is_none());
+        assert!(matches!(key_from_keysym(0xff51), Some(Key::LeftArrow)));
+        assert!(matches!(key_from_keysym(0xff54), Some(Key::DownArrow)));
+        assert!(matches!(key_from_keysym(0xff96), Some(Key::LeftArrow)));
+        assert!(!matches!(key_from_keysym(0xff51), Some(Key::Unicode(_))));
     }
 }

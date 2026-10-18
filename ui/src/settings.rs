@@ -149,6 +149,9 @@ pub struct Settings {
     pub network: NetworkDriver,
     /// Only `en` exists.
     pub language: String,
+    /// macOS: hide the “install host service” prompt. The service can still
+    /// be installed from Settings.
+    pub skip_host_service_prompt: bool,
 }
 
 impl Default for Settings {
@@ -168,6 +171,7 @@ impl Default for Settings {
             share_device: None,
             network: NetworkDriver::Automatic,
             language: "en".into(),
+            skip_host_service_prompt: false,
         }
     }
 }
@@ -330,7 +334,7 @@ fn clean(text: &str) -> String {
 
 pub fn render_settings(settings: &Settings) -> String {
     let mut out = format!(
-        "scale={}\nsize-match={}\nlook={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\n",
+        "scale={}\nsize-match={}\nlook={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nhost-service-prompt={}\n",
         settings.scale.token(),
         settings.size_match.token(),
         settings.look.token(),
@@ -343,6 +347,11 @@ pub fn render_settings(settings: &Settings) -> String {
         clean(settings.share_device.as_deref().unwrap_or("")),
         settings.network.token(),
         clean(&settings.language),
+        if settings.skip_host_service_prompt {
+            "skip"
+        } else {
+            "ask"
+        },
     );
     for pin in &settings.pad_slots {
         out.push_str(&format!("pad-slot={}={}\n", pin.slot, clean(&pin.name)));
@@ -378,6 +387,9 @@ pub fn parse_settings(text: &str) -> Settings {
                 settings.network = NetworkDriver::from_token(value).unwrap_or(settings.network)
             }
             "language" if value == "en" => settings.language = value.to_string(),
+            "host-service-prompt" => {
+                settings.skip_host_service_prompt = value == "skip";
+            }
             "pad-slot" => {
                 if let Some((slot, name)) = value.split_once('=') {
                     if let Ok(slot) = slot.parse::<u8>() {
@@ -451,7 +463,10 @@ pub fn backends(part: Part, wayland: bool) -> Vec<Backend> {
     if cfg!(target_os = "macos") {
         return match part {
             Part::Network => vec![
-                Backend::active("libpcap (BPF)"),
+                match etherquic::l2_unavailable_reason() {
+                    Some(why) => Backend::missing("BPF", why),
+                    None => Backend::active("BPF"),
+                },
                 Backend::missing("Membrane", "Windows only"),
                 Backend::missing("Npcap", "Windows only"),
             ],
@@ -478,7 +493,10 @@ pub fn backends(part: Part, wayland: bool) -> Vec<Backend> {
             Backend::available("Npcap"),
         ],
         Part::Network => vec![
-            Backend::active("libpcap"),
+            match etherquic::l2_unavailable_reason() {
+                Some(why) => Backend::missing("libpcap", why),
+                None => Backend::active("libpcap"),
+            },
             Backend::missing("Membrane", "Windows only"),
             Backend::missing("Npcap", "Windows only"),
         ],
@@ -634,6 +652,7 @@ mod tests {
             share_device: Some("B".into()),
             network: NetworkDriver::Npcap,
             language: "en-x".into(),
+            skip_host_service_prompt: false,
         };
         let factory = Settings::default();
         for field in Field::ALL {
@@ -647,6 +666,16 @@ mod tests {
             settings.reset(section, &factory);
         }
         assert_eq!(settings, factory);
+    }
+
+    #[test]
+    fn host_service_prompt_skip_round_trips() {
+        let mut settings = Settings::default();
+        settings.skip_host_service_prompt = true;
+        let parsed = parse_settings(&render_settings(&settings));
+        assert!(parsed.skip_host_service_prompt);
+        assert!(!parse_settings("host-service-prompt=ask\n").skip_host_service_prompt);
+        assert!(parse_settings("host-service-prompt=skip\n").skip_host_service_prompt);
     }
 
     #[test]
@@ -668,6 +697,12 @@ mod tests {
         for part in [Part::Network, Part::Input, Part::Capture, Part::Render] {
             for wayland in [false, true] {
                 let list = backends(part, wayland);
+                if part == Part::Network && etherquic::l2_unavailable_reason().is_some() {
+                    assert!(list.iter().all(|backend| {
+                        matches!(backend.state, BackendState::Unavailable(_))
+                    }));
+                    continue;
+                }
                 assert!(list.iter().any(|backend| matches!(
                     backend.state,
                     BackendState::Active | BackendState::Available
@@ -680,5 +715,30 @@ mod tests {
             .iter()
             .filter(|backend| backend.label == "SDL")
             .all(|backend| matches!(backend.state, BackendState::Unavailable(_))));
+    }
+
+    #[test]
+    fn l2_backend_repeats_the_reason() {
+        let why = etherquic::l2_unavailable_reason();
+        let network = backends(Part::Network, false);
+        let l2 = network.iter().find(|backend| {
+            backend.label.contains("libpcap")
+                || backend.label == "BPF"
+                || backend.label == "Automatic"
+        });
+        match why {
+            Some(why) => {
+                let l2 = l2.expect("L2 backend");
+                assert_eq!(l2.state, BackendState::Unavailable(why));
+            }
+            None => {
+                assert!(l2.is_some_and(|backend| {
+                    matches!(
+                        backend.state,
+                        BackendState::Active | BackendState::Available
+                    )
+                }));
+            }
+        }
     }
 }

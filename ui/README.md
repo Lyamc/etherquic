@@ -1,6 +1,6 @@
 # etherquic
 
-One host, one player. `host` shares this machine. `connect` joins one. The taskbar button is on only while hosting. Alt-Tab still lists the window. On Windows the notification area shows `assets/etherquic.svg` on the taskbar for as long as the app is running. Closing the window hides it; Quit on that icon exits. A Start Menu launch has no console. `--console` opens one. Starting the program from a terminal prints to that terminal.
+One host, one player. `host` shares this machine. `connect` joins one. The taskbar button is on only while hosting. Alt-Tab still lists the window. On Windows the notification area shows `assets/etherquic.svg` on the taskbar for as long as the app is running. Closing the window hides it; Quit on that icon exits. A Start Menu launch has no console. `--console` opens one. Starting the program from a terminal prints to that terminal. On macOS the Host card prompts to install the host LaunchDaemon when it is missing, and Settings can install or remove it.
 
 ```text
 etherquic

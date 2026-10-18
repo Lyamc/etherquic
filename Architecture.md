@@ -27,7 +27,7 @@ The 14-byte Ethernet header sits outside the interface MTU. The 6-byte service h
 
 Service `4433` is the play connection on Ethernet and the video lab tool. `4434` is the audio lab tool. `4435` is the input lab tool. `4440` is discovery and is not a QUIC socket. On UDP, play asks for `4433` and binds the next free port when another program holds it, up to 16 ports later. When only `4433` is taken, that port is `4434`, which is also the audio lab tool's service. Discovery announces the port play actually bound. A desktop session is one QUIC connection. Picture, sound, and input are streams on that connection.
 
-The L2 socket is membrane (`\\.\MembraneNdis`) when that device is open, otherwise Npcap on Windows and libpcap on Linux. An in-memory fabric stands in for the adapter during tests. All three carry the same frame.
+The L2 socket is membrane (`\\.\MembraneNdis`) when that device is open, otherwise Npcap on Windows, libpcap on Linux, and BPF plus AF_NDRV on macOS. The macOS host LaunchDaemon (`dev.etherquic.host`) runs as root so BPF opens. An in-memory fabric stands in for the adapter during tests. All four carry the same frame.
 
 ## QUIC packet
 

@@ -359,11 +359,14 @@ pub fn offer_from(
     nvidia: bool,
     gpu: bool,
 ) -> (Vec<AnnouncedCodec>, Vec<AnnouncedCodec>) {
+    // Encode and decode are the same GPU. Direct3D 11 feature level 11_0 is
+    // that GPU on Windows; a CPU Vulkan driver sets neither bit.
+    let pyro_hw = pyrowave_hardware_encode();
     let video = vec![
         row(
             VIDEO_PYROWAVE,
-            pyrowave_hardware_encode(),
-            false,
+            pyro_hw,
+            pyro_hw,
             false,
             pyrowave_ready(gpu, pyrowave_library_present()),
             false,

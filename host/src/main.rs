@@ -24,6 +24,8 @@ mod link;
 #[cfg(windows)]
 mod service;
 
+mod macos_service;
+
 #[cfg(windows)]
 mod console_ctrl {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,6 +85,8 @@ fn main() {
         }
         cli::Mode::Service => dispatch_service(),
         cli::Mode::Desk => dispatch_desk(),
+        cli::Mode::InstallService => dispatch_install(),
+        cli::Mode::UninstallService { purge } => dispatch_uninstall(purge),
     }
 }
 
@@ -114,9 +118,32 @@ fn foreground_stop() -> &'static std::sync::atomic::AtomicBool {
     {
         console_ctrl::install()
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        unix_stop::install()
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        &STOP
+    }
+}
+
+#[cfg(unix)]
+mod unix_stop {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        STOP.store(true, Ordering::SeqCst);
+    }
+
+    pub fn install() -> &'static AtomicBool {
+        unsafe {
+            libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        }
         &STOP
     }
 }
@@ -130,9 +157,45 @@ fn dispatch_service() {
             std::process::exit(1);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        eprintln!("etherquic-host runs as a Windows service, or use --client / --console.");
+        let stop = foreground_stop();
+        let paths = config::HostPaths::from_env();
+        let log = run::Log::open(&paths.log);
+        let result = run::serve(stop, &log, |_| {});
+        if let Err(err) = &result {
+            log.line(&format!("host failed: {err}"));
+        }
+        exit_result(result);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        eprintln!("etherquic-host runs as a Windows service or a macOS LaunchDaemon, or use --client / --console.");
+        std::process::exit(1);
+    }
+}
+
+fn dispatch_install() {
+    #[cfg(target_os = "macos")]
+    {
+        exit_result(macos_service::install());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("etherquic-host --install-service installs the macOS LaunchDaemon.");
+        std::process::exit(1);
+    }
+}
+
+fn dispatch_uninstall(purge: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        exit_result(macos_service::uninstall(purge));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = purge;
+        eprintln!("etherquic-host --uninstall-service removes the macOS LaunchDaemon.");
         std::process::exit(1);
     }
 }

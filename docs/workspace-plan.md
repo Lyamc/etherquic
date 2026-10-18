@@ -8,7 +8,7 @@ The repo root is a Cargo workspace and still the `etherquic` package. Members:
 
 - `.` (`etherquic`)
 - `ui`, `play`, `host`, `setup`, `media`
-- `audio`, `video`, `input`, `container`, `packaging`
+- `audio`, `video`, `input`, `container`, `packaging`, `android`
 
 `default-members` is `.`, so `cargo test` and `nix/package.nix` still mean the root package. `cargo test --workspace` is the whole tree. `cargo build -p etherquic-ui` (and the other member names) builds that crate into the shared `target/`.
 

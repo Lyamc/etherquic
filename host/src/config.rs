@@ -64,10 +64,25 @@ impl HostPaths {
 }
 
 pub fn program_data_dir() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("etherquic")
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("etherquic")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/etherquic")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        PathBuf::from("/var/lib/etherquic")
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        PathBuf::from("etherquic")
+    }
 }
 
 /// Desktop-duplication subscription for the desk helper.

@@ -85,10 +85,13 @@ fn run_probe() -> Probe {
     // the CPU Vulkan row in place when that one succeeded.
     #[cfg(windows)]
     if try_d3d11 && !crate::pyrowave_d3d11::disabled() {
-        let d3d11 = crate::pyrowave_d3d11::Encoder::new(256, 144, 32 * 1024).and_then(|mut enc| {
-            let record = enc.encode(&test_frame(256, 144))?;
+        // 64x64 stays inside the 32 KiB probe budget. A 256x144 high-frequency
+        // frame does not: the packet walk then rejects it and the GPU row is
+        // dropped even though the HD 6670 encoded it.
+        let d3d11 = crate::pyrowave_d3d11::Encoder::new(64, 64, 32 * 1024).and_then(|mut enc| {
+            let record = enc.encode(&test_frame(64, 64))?;
             let adapter = enc.adapter().to_string();
-            crate::pyrowave_d3d11::record_acceptable(256, 144, &record)?;
+            crate::pyrowave_d3d11::record_acceptable(64, 64, &record)?;
             Ok(adapter)
         });
         match d3d11 {

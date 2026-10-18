@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>etherquic</title>
+    <options customize="allow" require-scripts="false" hostArchitectures="arm64"/>
+    <choices-outline>
+        <line choice="app"/>
+        <line choice="service"/>
+    </choices-outline>
+    <choice id="app" title="etherquic app"
+            description="The etherquic application."
+            enabled="false" selected="true">
+        <pkg-ref id="dev.etherquic.app"/>
+    </choice>
+    <choice id="service" title="Host service"
+            description="Accept incoming players while you are signed out. Layer-2 Ethernet uses BPF, which this service runs as root. Clearing this box installs the app only; the app will prompt to install the service."
+            start_selected="true">
+        <pkg-ref id="dev.etherquic.host"/>
+    </choice>
+    <pkg-ref id="dev.etherquic.app" version="@VERSION@" onConclusion="none">etherquic-app.pkg</pkg-ref>
+    <pkg-ref id="dev.etherquic.host" version="@VERSION@" onConclusion="none">etherquic-host-service.pkg</pkg-ref>
+</installer-gui-script>

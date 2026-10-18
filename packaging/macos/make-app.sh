@@ -1,10 +1,13 @@
 #!/bin/sh
 # Build etherquic.app and etherquic-<version>-macos-arm64.dmg.
+# packaging/macos/make-pkg.sh wraps the same app in a .pkg that can also
+# install LaunchDaemon dev.etherquic.host.
 #
 #   packaging/macos/make-app.sh [PYROWAVE_LIB_DIR] [OUT_DIR]
 #
-# The app carries the GUI (etherquic), the CLI player (etherquic-play), and
-# cjxl for discovery thumbnails, with every Homebrew dylib they load. When
+# The app carries the GUI (etherquic), the CLI player (etherquic-play), the
+# host service binary (etherquic-host), demo certs, and cjxl for discovery
+# thumbnails, with every Homebrew dylib they load. When
 # PYROWAVE_LIB_DIR holds libpyrowave-shared (packaging/pyrowave/build-macos.sh)
 # the app also carries PyroWave, the Vulkan loader, and Mesa's KosmicKrisp
 # Vulkan driver with its ICD manifest, so PyroWave runs without Homebrew.
@@ -17,7 +20,7 @@ here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 pyrowave=${1:-}
 out=${2:-$root/dist/macos}
-# VERSION=0.1.6 overrides the root package version, like build-msi.ps1 -Version.
+# VERSION=0.1.7 overrides the root package version, like build-msi.ps1 -Version.
 version=${VERSION:-$(awk '
   /^\[package\]/ { inpkg = 1; next }
   inpkg && /^\[/ { exit }
@@ -33,12 +36,16 @@ brew=${HOMEBREW_PREFIX:-/opt/homebrew}
 
 (cd "$root/ui" && cargo build --release)
 (cd "$root/play" && cargo build --release --bin etherquic-play)
+(cd "$root/host" && cargo build --release --bin etherquic-host)
 
 app=$out/etherquic.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources/licenses"
 cp "$target/release/etherquic" "$app/Contents/MacOS/etherquic"
 cp "$target/release/etherquic-play" "$app/Contents/MacOS/etherquic-play"
+cp "$target/release/etherquic-host" "$app/Contents/MacOS/etherquic-host"
+cp "$root/certs/cert.pem" "$app/Contents/MacOS/cert.pem"
+cp "$root/certs/key.pem" "$app/Contents/MacOS/key.pem"
 if [ -x "$brew/bin/cjxl" ]; then
     cp "$brew/bin/cjxl" "$app/Contents/MacOS/cjxl"
     for f in "$brew"/opt/jpeg-xl/LICENSE*; do

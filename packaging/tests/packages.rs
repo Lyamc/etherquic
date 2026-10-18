@@ -115,6 +115,21 @@ fn built_packages_share_one_identity_and_the_second_version_is_higher() {
         high_app.version_code,
         low_app.version_code
     );
+    for permission in [
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+    ] {
+        assert!(
+            low_app.permissions.iter().any(|name| name == permission),
+            "android package missing {permission}: {:?}",
+            low_app.permissions
+        );
+        assert!(
+            high_app.permissions.iter().any(|name| name == permission),
+            "android package missing {permission}: {:?}",
+            high_app.permissions
+        );
+    }
 
     println!("assertions=passed");
 }
@@ -130,6 +145,7 @@ struct Apk {
     application_id: String,
     version_code: u32,
     version_name: String,
+    permissions: Vec<String>,
 }
 
 fn read_msi(path: &Path) -> Msi {
@@ -185,11 +201,35 @@ fn read_apk(path: &Path) -> Apk {
         path.display()
     );
     assert!(
-        bytes.windows(11).any(|window| window == b"classes.dex"),
-        "{} has no classes.dex entry",
+        !bytes.windows(11).any(|window| window == b"classes.dex"),
+        "{} still packs a Java classes.dex; NativeActivity needs none",
         path.display()
     );
-    assert_classes_dex(path, &bytes);
+    let tree = tool(
+        "aapt2",
+        &[
+            "dump",
+            "xmltree",
+            &path.display().to_string(),
+            "--file",
+            "AndroidManifest.xml",
+        ],
+    );
+    let xml = format!(
+        "{}{}",
+        String::from_utf8_lossy(&tree.stdout),
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    assert!(
+        xml.contains("android.app.NativeActivity"),
+        "{} activity is not NativeActivity:\n{xml}",
+        path.display()
+    );
+    assert!(
+        xml.contains("etherquic_android"),
+        "{} is missing android.app.lib_name=etherquic_android:\n{xml}",
+        path.display()
+    );
     let verify = tool(
         "apksigner",
         &["verify", "--verbose", &path.display().to_string()],
@@ -227,6 +267,14 @@ fn read_apk(path: &Path) -> Apk {
         .lines()
         .find(|line| line.starts_with("package:"))
         .expect("package line");
+    let permissions: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("uses-permission: name='")
+                .and_then(|rest| rest.split('\'').next())
+                .map(str::to_string)
+        })
+        .collect();
     Apk {
         application_id: quoted_field(package, "name=")
             .unwrap_or_else(|| panic!("application id missing from {package}")),
@@ -235,10 +283,15 @@ fn read_apk(path: &Path) -> Apk {
             .unwrap_or_else(|| panic!("version code missing from {package}")),
         version_name: quoted_field(package, "versionName=")
             .unwrap_or_else(|| panic!("version name missing from {package}")),
+        permissions,
     }
 }
 
+fn _removed_dex_check() {}
+
+#[allow(dead_code)]
 fn assert_classes_dex(path: &Path, apk: &[u8]) {
+    let _ = (path, apk);
     let dex = stored_entry(apk, "classes.dex");
     assert_eq!(
         &dex[..8],
@@ -326,19 +379,44 @@ fn assert_classes_dex(path: &Path, apk: &[u8]) {
             code_off = offset as usize;
         }
     }
-    assert_eq!(
-        map_types,
-        vec![0x0000, 0x0001, 0x0002, 0x0003, 0x0005, 0x0006, 0x1000, 0x2000, 0x2001, 0x2002,],
-        "{} classes.dex map types",
+    assert!(
+        map_types.windows(2).all(|pair| pair[0] < pair[1]),
+        "{} map types are not strictly increasing: {map_types:?}",
         path.display()
     );
     assert!(code_off > 0 && class_data_off > 0);
+    assert!(
+        strings.iter().any(|value| value == "onCreate"),
+        "{} classes.dex has no onCreate",
+        path.display()
+    );
+    assert!(
+        strings.iter().any(|value| value == "Join"),
+        "{} classes.dex has no Join label",
+        path.display()
+    );
     let invoke_method = u16_at(&dex, code_off + 18) as usize;
     let (invoke_class, invoke_name) = &methods[invoke_method];
     assert_eq!(invoke_class, "Landroid/app/Activity;");
     assert_eq!(invoke_name, "<init>");
     let mut cursor = class_data_off;
-    for _ in 0..4 {
+    let (static_fields, next) = read_uleb(&dex, cursor);
+    cursor = next;
+    let (instance_fields, next) = read_uleb(&dex, cursor);
+    cursor = next;
+    let (_directs, next) = read_uleb(&dex, cursor);
+    cursor = next;
+    let (_virtuals, next) = read_uleb(&dex, cursor);
+    cursor = next;
+    for _ in 0..static_fields {
+        let (_, next) = read_uleb(&dex, cursor);
+        cursor = next;
+        let (_, next) = read_uleb(&dex, cursor);
+        cursor = next;
+    }
+    for _ in 0..instance_fields {
+        let (_, next) = read_uleb(&dex, cursor);
+        cursor = next;
         let (_, next) = read_uleb(&dex, cursor);
         cursor = next;
     }

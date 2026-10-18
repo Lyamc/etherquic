@@ -12,7 +12,8 @@ pub fn store_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
         let name_bytes = name.as_bytes();
         assert!(name_bytes.len() <= u16::MAX as usize, "zip name too long");
         let data_at = local.len() + 30 + name_bytes.len();
-        let extra_len = (4 - (data_at % 4)) % 4;
+        let align = if name.ends_with(".so") { 16384 } else { 4 };
+        let extra_len = (align - (data_at % align)) % align;
         let offset = local.len() as u32;
         let checksum = crc32(data);
         write_local(&mut local, name_bytes, data, checksum, extra_len);

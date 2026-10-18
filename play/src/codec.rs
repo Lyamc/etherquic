@@ -490,6 +490,7 @@ pub fn this_computer() -> MachineCodecs {
         etherquic::gpu_compute_present(),
         etherquic::pyrowave_library_present(),
     );
+    let pyro_hw = etherquic::pyrowave_hardware_encode();
     let asic = EndSupport {
         hardware_encode: nvidia,
         hardware_decode: nvidia,
@@ -500,7 +501,8 @@ pub fn this_computer() -> MachineCodecs {
         (
             CodecId::Pyrowave,
             EndSupport {
-                hardware_encode: etherquic::pyrowave_hardware_encode(),
+                hardware_encode: pyro_hw,
+                hardware_decode: pyro_hw,
                 gpu_compute: gpu,
                 ..EndSupport::default()
             },

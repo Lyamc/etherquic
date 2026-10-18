@@ -5,6 +5,7 @@
 //! and reads the application id from the un-namespaced `package` attribute.
 
 const ANDROID_NS: &str = "http://schemas.android.com/apk/res/android";
+const TYPE_REFERENCE: u8 = 0x01;
 const TYPE_STRING: u8 = 0x03;
 const TYPE_INT_DEC: u8 = 0x10;
 const TYPE_INT_BOOLEAN: u8 = 0x12;
@@ -19,14 +20,25 @@ pub fn manifest(application_id: &str, version_code: u32, version_name: &str) -> 
     let name_name = pool.attr("name", 0x0101_0003);
     let label_name = pool.attr("label", 0x0101_0001);
     let exported_name = pool.attr("exported", 0x0101_0010);
+    let debuggable_name = pool.attr("debuggable", 0x0101_000f);
+    let has_code_name = pool.attr("hasCode", 0x0101_000c);
+    let extract_libs_name = pool.attr("extractNativeLibs", 0x0101_04ea);
+    let window_soft_name = pool.attr("windowSoftInputMode", 0x0101_0016);
+    let config_changes_name = pool.attr("configChanges", 0x0101_001f);
+    let theme_name = pool.attr("theme", 0x0101_0000);
+    let value_name = pool.attr("value", 0x0101_0024);
     let package_name = pool.attr("package", 0);
 
     let uri = pool.string(ANDROID_NS);
     let prefix = pool.string("android");
     let manifest_elem = pool.string("manifest");
     let uses_sdk_elem = pool.string("uses-sdk");
+    let uses_permission_elem = pool.string("uses-permission");
+    let internet = pool.string("android.permission.INTERNET");
+    let network_state = pool.string("android.permission.ACCESS_NETWORK_STATE");
     let application_elem = pool.string("application");
     let activity_elem = pool.string("activity");
+    let meta_elem = pool.string("meta-data");
     let filter_elem = pool.string("intent-filter");
     let action_elem = pool.string("action");
     let category_elem = pool.string("category");
@@ -34,10 +46,15 @@ pub fn manifest(application_id: &str, version_code: u32, version_name: &str) -> 
     let version_name_val = pool.string(version_name);
     let version_code_raw = pool.string(&version_code.to_string());
     let min_sdk_raw = pool.string("21");
-    let target_sdk_raw = pool.string("28");
+    let target_sdk_raw = pool.string("35");
     let label_val = pool.string("EtherQuic Play");
-    let activity_class = pool.string(".MainActivity");
+    let activity_class = pool.string("android.app.NativeActivity");
+    let lib_name_key = pool.string("android.app.lib_name");
+    let lib_name_val = pool.string("etherquic_android");
     let true_val = pool.string("true");
+    let false_val = pool.string("false");
+    let window_soft_raw = pool.string("16");
+    let config_raw = pool.string("1200");
     let action_main = pool.string("android.intent.action.MAIN");
     let category_launcher = pool.string("android.intent.category.LAUNCHER");
 
@@ -65,15 +82,34 @@ pub fn manifest(application_id: &str, version_code: u32, version_name: &str) -> 
         uses_sdk_elem,
         &[
             Attr::int(0x0101_020c, min_sdk_name, uri, min_sdk_raw, 21),
-            Attr::int(0x0101_0270, target_sdk_name, uri, target_sdk_raw, 28),
+            Attr::int(0x0101_0270, target_sdk_name, uri, target_sdk_raw, 35),
         ],
     );
     end_element(&mut nodes, NO_STRING, uses_sdk_elem);
     start_element(
         &mut nodes,
         NO_STRING,
+        uses_permission_elem,
+        &[Attr::string(0x0101_0003, name_name, uri, internet)],
+    );
+    end_element(&mut nodes, NO_STRING, uses_permission_elem);
+    start_element(
+        &mut nodes,
+        NO_STRING,
+        uses_permission_elem,
+        &[Attr::string(0x0101_0003, name_name, uri, network_state)],
+    );
+    end_element(&mut nodes, NO_STRING, uses_permission_elem);
+    start_element(
+        &mut nodes,
+        NO_STRING,
         application_elem,
-        &[Attr::string(0x0101_0001, label_name, uri, label_val)],
+        &[
+            Attr::string(0x0101_0001, label_name, uri, label_val),
+            Attr::boolean(0x0101_000f, debuggable_name, uri, true_val, true),
+            Attr::boolean(0x0101_000c, has_code_name, uri, false_val, false),
+            Attr::boolean(0x0101_04ea, extract_libs_name, uri, true_val, true),
+        ],
     );
     start_element(
         &mut nodes,
@@ -81,9 +117,23 @@ pub fn manifest(application_id: &str, version_code: u32, version_name: &str) -> 
         activity_elem,
         &[
             Attr::string(0x0101_0003, name_name, uri, activity_class),
-            Attr::boolean(0x0101_0010, exported_name, uri, true_val),
+            Attr::boolean(0x0101_0010, exported_name, uri, true_val, true),
+            Attr::int(0x0101_0016, window_soft_name, uri, window_soft_raw, 16),
+            Attr::int(0x0101_001f, config_changes_name, uri, config_raw, 0x04b0),
+            // Theme.NoTitleBar.Fullscreen — NativeActivity has no Java layout.
+            Attr::reference(0x0101_0000, theme_name, uri, 0x0103_0007),
         ],
     );
+    start_element(
+        &mut nodes,
+        NO_STRING,
+        meta_elem,
+        &[
+            Attr::string(0x0101_0003, name_name, uri, lib_name_key),
+            Attr::string(0x0101_0024, value_name, uri, lib_name_val),
+        ],
+    );
+    end_element(&mut nodes, NO_STRING, meta_elem);
     start_element(&mut nodes, NO_STRING, filter_elem, &[]);
     start_element(
         &mut nodes,
@@ -153,14 +203,25 @@ impl Attr {
         }
     }
 
-    fn boolean(res_id: u32, name: u32, ns: u32, raw: u32) -> Self {
+    fn boolean(res_id: u32, name: u32, ns: u32, raw: u32, on: bool) -> Self {
         Self {
             res_id,
             name,
             ns,
             raw,
             data_type: TYPE_INT_BOOLEAN,
-            data: 0xffff_ffff,
+            data: if on { 0xffff_ffff } else { 0 },
+        }
+    }
+
+    fn reference(res_id: u32, name: u32, ns: u32, value: u32) -> Self {
+        Self {
+            res_id,
+            name,
+            ns,
+            raw: NO_STRING,
+            data_type: TYPE_REFERENCE,
+            data: value,
         }
     }
 }
@@ -318,5 +379,21 @@ mod tests {
             "application id is not in the binary manifest"
         );
         assert!(xml.windows(4).any(|window| window == 7u32.to_le_bytes()));
+        assert!(
+            xml.windows(4).any(|window| window == 35u32.to_le_bytes()),
+            "targetSdkVersion 35 is not in the binary manifest"
+        );
+        for permission in ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE"]
+        {
+            let encoded: Vec<u8> = permission
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            assert!(
+                xml.windows(encoded.len())
+                    .any(|window| window == encoded.as_slice()),
+                "{permission} is not in the binary manifest"
+            );
+        }
     }
 }

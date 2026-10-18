@@ -162,8 +162,14 @@ fn spawn_discovery(
         let _ = file.write_all(note.as_bytes());
     }
     eprint!("{note}");
+    let codecs = etherquic_media::caps::summary(etherquic_media::caps::probe());
+    let codecs = format!("{} {codecs}\n", utc_now());
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = file.write_all(codecs.as_bytes());
+    }
+    eprint!("{codecs}");
     let card = etherquic::discover::HostCard {
-        name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "etherquic".into()),
+        name: crate::identity::computer_name(),
         l2_mac: cfg.mac,
         l2_service: cfg.service,
         // The port the UDP listeners will take: another program can hold

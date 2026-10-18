@@ -373,7 +373,11 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        disabled, library_candidates, record_acceptable, Encoder, AdapterInfo, CpuBuffer, DeviceInfo,
+        EncInfo, Packet, RateControl,
+    };
+    use crate::Frame;
 
     #[test]
     fn abi_matches_the_c_header() {
@@ -390,14 +394,11 @@ mod tests {
         assert_eq!(std::mem::offset_of!(AdapterInfo, dedicated_video_memory), 136);
     }
 
-    /// Set ETHERQUIC_PYROWAVE_D3D11 to pyrowave_d3d11.dll. When libpyrowave
-    /// is installed, the Vulkan decoder has to accept the record.
+    /// Set ETHERQUIC_PYROWAVE_D3D11 to pyrowave_d3d11.dll. A GPU Vulkan decoder
+    /// has to accept the record. A CPU decoder (lavapipe) may reject it.
     #[test]
     fn encodes_a_frame_the_vulkan_decoder_can_read() {
-        let Some(path) = std::env::var_os("ETHERQUIC_PYROWAVE_D3D11") else {
-            return;
-        };
-        if path == "off" || !PathBuf::from(&path).is_file() {
+        if !d3d11_dll_present() {
             return;
         }
         let width = 64u32;
@@ -412,10 +413,241 @@ mod tests {
         let mut encoder = Encoder::new(width, height, 32 * 1024).expect("d3d11 encoder");
         let record = encoder.encode(&frame).expect("d3d11 encode");
         assert!(encoder.adapter().len() > 0, "adapter name");
-        match Decoder::new(width, height) {
-            Ok(mut decoder) => decoder.decode(&record).expect("vulkan decode of the d3d11 record"),
-            Err(error) => panic!("libpyrowave did not load, so the bitstream was not checked: {error}"),
+        println!("direct-720p bytes={} packets={}", record.len(), super::packet_count(&record));
+        record_acceptable(width, height, &record).expect("d3d11 record");
+    }
+
+    /// Desk capture is 1280×720. The host opens `pyrowave-d3d11` with kbps 0,
+    /// which is [`crate::pyrowave::default_frame_bytes`] (about 1.5 bits per
+    /// pixel, at least 32 KiB). Two successive low-frequency frames must each
+    /// produce a packet-bearing record. A CPU lavapipe reject is not a failure.
+    #[test]
+    fn encodes_two_desktop_frames_at_720p() {
+        if !d3d11_dll_present() {
+            return;
+        }
+        let width = 1280u32;
+        let height = 720u32;
+        let fps = 60u32;
+        let budget = crate::pyrowave::default_frame_bytes(width, height);
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let slot = std::sync::Arc::clone(&records);
+        let sink: crate::Sink<Vec<u8>> = std::sync::Arc::new(move |bytes| {
+            slot.lock().expect("records").push(bytes);
+            true
+        });
+        let setup = crate::video::EncodeSetup {
+            video: crate::negotiate::Video::Pyrowave,
+            encoder: "pyrowave-d3d11".into(),
+            width,
+            height,
+            fps,
+            kbps: 0,
         };
+        let (mut encoder, kbps) = crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
+        let expect_kbps = (budget.max(16 * 1024) * 8 * fps as usize / 1000) as u32;
+        assert_eq!(kbps, expect_kbps, "host default budget");
+        if let crate::video::VideoEncoder::PyrowaveD3d11 { inner, .. } = &encoder {
+            println!("desktop-720p adapter={} budget={budget} kbps={kbps}", inner.adapter());
+        }
+        let dump = std::env::var("ETHERQUIC_PYROWAVE_DUMP").ok();
+        let mut check_frame = |index: usize, kind: &str, frame: &crate::Frame| {
+            assert!(
+                encoder.push(frame).unwrap_or_else(|error| panic!("{kind} frame={index} encode: {error}")),
+                "sink accepted the record"
+            );
+            let record = {
+                let locked = records.lock().expect("records");
+                locked.last().cloned().expect("sink stored a record")
+            };
+            let count = packets_inside(&record).unwrap_or_else(|error| panic!("frame {index}: {error}"));
+            println!(
+                "{kind} frame={index} packets={count} bytes={} budget={budget}",
+                record.len()
+            );
+            assert!(count >= 1, "frame {index} produced no packets");
+            assert!(record.len() > 16, "frame {index} was only a sequence header");
+            record_acceptable(width, height, &record)
+                .unwrap_or_else(|error| panic!("frame {index}: {error}"));
+            match crate::pyrowave::Decoder::new(width, height) {
+                Ok(mut decoder) => match decoder.decode(&record) {
+                    Ok(got) => {
+                        let mae = rgb_mae(frame, &got);
+                        println!("{kind} frame={index} decode_mae={mae:.2}");
+                        assert!(
+                            mae < 28.0,
+                            "frame {index} decoded too far from the source (mae={mae:.2})"
+                        );
+                    }
+                    Err(error) => println!("{kind} frame={index} decode={error}"),
+                },
+                Err(error) => println!("{kind} frame={index} decoder={error}"),
+            }
+            if let Some(dir) = &dump {
+                let path = format!("{dir}/frame{index}.bin");
+                std::fs::write(&path, &record).unwrap_or_else(|error| panic!("write {path}: {error}"));
+            }
+        };
+        for generation in 0..2u32 {
+            let frame = desktop_frame(width, height, generation);
+            check_frame(generation as usize, "desktop-720p", &frame);
+        }
+        let busy = high_freq_frame(width, height);
+        check_frame(2, "busy-720p", &busy);
+        assert_eq!(
+            records.lock().expect("records").len(),
+            3,
+            "two desktop frames and one high-frequency frame"
+        );
+    }
+
+    /// Wall-clock burst of the shipped `VideoEncoder::push` path at 1280×720
+    /// and the host default budget. GPU timestamps are not the gate.
+    #[test]
+    fn encodes_720p_burst_at_60fps() {
+        if !d3d11_dll_present() {
+            return;
+        }
+        let width = 1280u32;
+        let height = 720u32;
+        let fps = 60u32;
+        let budget = crate::pyrowave::default_frame_bytes(width, height);
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let slot = std::sync::Arc::clone(&records);
+        let sink: crate::Sink<Vec<u8>> = std::sync::Arc::new(move |bytes| {
+            slot.lock().expect("records").push(bytes);
+            true
+        });
+        let setup = crate::video::EncodeSetup {
+            video: crate::negotiate::Video::Pyrowave,
+            encoder: "pyrowave-d3d11".into(),
+            width,
+            height,
+            fps,
+            kbps: 0,
+        };
+        let (mut encoder, kbps) = crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
+        let expect_kbps = (budget.max(16 * 1024) * 8 * fps as usize / 1000) as u32;
+        assert_eq!(kbps, expect_kbps, "host default budget");
+        let adapter = if let crate::video::VideoEncoder::PyrowaveD3d11 { inner, .. } = &encoder {
+            inner.adapter().to_string()
+        } else {
+            String::new()
+        };
+        println!("burst-720p adapter={adapter} budget={budget} kbps={kbps}");
+        let warmup = 3usize;
+        let burst = 30usize;
+        let frame = desktop_frame(width, height, 0);
+        for index in 0..warmup {
+            assert!(
+                encoder.push(&frame).unwrap_or_else(|error| panic!("warmup frame={index} encode: {error}")),
+                "sink accepted the warmup record"
+            );
+        }
+        records.lock().expect("records").clear();
+        let started = std::time::Instant::now();
+        for index in 0..burst {
+            assert!(
+                encoder.push(&frame).unwrap_or_else(|error| panic!("burst frame={index} encode: {error}")),
+                "sink accepted the burst record"
+            );
+        }
+        let elapsed = started.elapsed();
+        let got = records.lock().expect("records");
+        assert_eq!(got.len(), burst, "burst stored one record per push");
+        let secs = elapsed.as_secs_f64();
+        let measured = if secs > 0.0 { burst as f64 / secs } else { 0.0 };
+        println!(
+            "burst-720p fps={measured:.2} frames={burst} elapsed_ms={:.2}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+        for (index, record) in got.iter().enumerate() {
+            let count = packets_inside(record).unwrap_or_else(|error| panic!("frame {index}: {error}"));
+            println!("burst-720p frame={index} packets={count} bytes={}", record.len());
+            assert!(count >= 1, "frame {index} produced no packets");
+            assert!(record.len() > 16, "frame {index} was only a sequence header");
+        }
+        assert!(
+            measured >= 60.0,
+            "720p encode burst was {measured:.2} fps, need at least 60"
+        );
+    }
+
+    fn d3d11_dll_present() -> bool {
+        if disabled() {
+            return false;
+        }
+        library_candidates().iter().any(|path| path.is_file())
+    }
+
+    /// Low-frequency desktop: flat sidebar and taskbar, a ramp that steps every 32 pixels.
+    fn desktop_frame(width: u32, height: u32, generation: u32) -> Frame {
+        let mut rgb = vec![0u8; width as usize * height as usize * 3];
+        let shift = (generation * 24) as u8;
+        for y in 0..height {
+            for x in 0..width {
+                let i = ((y * width + x) * 3) as usize;
+                let (r, g, b) = if y + 48 >= height {
+                    (28, 30, 34)
+                } else if x < 72 {
+                    (36, 40, 48)
+                } else {
+                    let ramp = ((x / 32) as u8).wrapping_add(shift);
+                    (168u8.wrapping_add(ramp), 164, 156)
+                };
+                rgb[i] = r;
+                rgb[i + 1] = g;
+                rgb[i + 2] = b;
+            }
+        }
+        Frame { width, height, rgb }
+    }
+
+    /// High-frequency RGB, the picture that overflowed the 32 KiB probe and a
+    /// 512 KiB 720p budget when rate control was stuck at quant 0.
+    fn high_freq_frame(width: u32, height: u32) -> Frame {
+        let mut rgb = vec![0u8; width as usize * height as usize * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let i = ((y * width + x) * 3) as usize;
+                rgb[i] = (x.wrapping_mul(7)) as u8;
+                rgb[i + 1] = (y.wrapping_mul(5)) as u8;
+                rgb[i + 2] = (x.wrapping_add(y).wrapping_mul(3)) as u8;
+            }
+        }
+        Frame { width, height, rgb }
+    }
+
+    fn rgb_mae(src: &Frame, got: &Frame) -> f32 {
+        assert_eq!(src.rgb.len(), got.rgb.len());
+        let sum: u64 = src
+            .rgb
+            .iter()
+            .zip(got.rgb.iter())
+            .map(|(a, b)| a.abs_diff(*b) as u64)
+            .sum();
+        sum as f32 / src.rgb.len() as f32
+    }
+
+    /// Packet count when every packet's bytes sit inside the record.
+    fn packets_inside(record: &[u8]) -> Result<u32, String> {
+        if record.len() < 4 {
+            return Err("record shorter than the packet count".into());
+        }
+        let count = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        let mut rest = &record[4..];
+        for index in 0..count {
+            if rest.len() < 4 {
+                return Err(format!("packet {index} header is past the record"));
+            }
+            let size = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            rest = &rest[4..];
+            if size == 0 || rest.len() < size {
+                return Err(format!("packet {index} ({size} bytes) is outside the record"));
+            }
+            rest = &rest[size..];
+        }
+        Ok(count)
     }
 }
 
@@ -428,19 +660,39 @@ impl Drop for Encoder {
     }
 }
 
-/// The Vulkan decoder accepts this record, or no Vulkan library is installed
-/// and the record at least has a packet header. A failed decode means the
-/// D3D11 bitstream is not PyroWave and must not be advertised.
+/// The Vulkan decoder accepts this record, or the record has a packet and the
+/// only decoder is a CPU driver (lavapipe). A GPU decoder that rejects the
+/// record means it is not PyroWave and must not be advertised. CPU lavapipe
+/// on the HD 6670 rejects a bitstream the GPU decoder accepts, and that must
+/// not hide the Direct3D 11 encoder.
 pub fn record_acceptable(width: u32, height: u32, record: &[u8]) -> Result<(), String> {
     match Decoder::new(width, height) {
-        Ok(mut decoder) => decoder.decode(record).map(|_| ()),
+        Ok(mut decoder) => match decoder.decode(record) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let cpu = decoder.vulkan_device().is_some_and(|device| device.cpu);
+                if cpu && packet_count(record) >= 1 {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        },
         Err(error) => {
-            if record.len() >= 8 && u32::from_le_bytes([record[0], record[1], record[2], record[3]]) >= 1 {
+            if packet_count(record) >= 1 {
                 Ok(())
             } else {
                 Err(format!("no vulkan decoder ({error}) and the record is empty"))
             }
         }
+    }
+}
+
+fn packet_count(record: &[u8]) -> u32 {
+    if record.len() < 4 {
+        0
+    } else {
+        u32::from_le_bytes([record[0], record[1], record[2], record[3]])
     }
 }
 

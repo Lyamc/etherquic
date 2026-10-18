@@ -11,7 +11,7 @@ etherquic-host.exe --console
 
 `--client` connects out and holds the session until Ctrl+C or the host closes it. It does not install a service. Its local MAC is a second locally administered address derived from the machine id, so it does not collide with the host service on the same PC. `--nic` and `--service` override the adapter and the service id (default 4433).
 
-The Windows service `etherquic-service` (LocalSystem, delayed auto-start) listens on service **4433**. On UDP it binds that port, or the next free one when another program holds 4433, up to 16 ports later. When only 4433 is taken, the announced port is 4434. 4434 is also the audio lab tool's service. The service manager starts the exe with no arguments.
+The Windows service `etherquic-service` (LocalSystem, delayed auto-start) listens on service **4433**. On macOS the LaunchDaemon `dev.etherquic.host` does the same job as root, so `/dev/bpf*` opens. On UDP it binds that port, or the next free one when another program holds 4433, up to 16 ports later. When only 4433 is taken, the announced port is 4434. 4434 is also the audio lab tool's service. The service manager or launchd starts the exe with no arguments.
 
 | `host.conf` `unattended` | Incoming player |
 |--------------------------|-----------------|
@@ -20,16 +20,22 @@ The Windows service `etherquic-service` (LocalSystem, delayed auto-start) listen
 
 `--approve` and `--deny` write `control\approve` or `control\deny` next to the config. The service consumes the file for that one player. The installer grants Users modify on `control\` only, so a signed-in user can approve without changing `host.conf`.
 
-The host MAC comes from `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`. The installer writes it once. A later install keeps that MAC. It is not the console's built-in `02:00:00:00:00:01`. The player types the address from `%ProgramData%\etherquic\address.txt`.
+The host MAC comes from `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` on Windows, and from `IOPlatformUUID` (or `/etc/machine-id`) on macOS. The installer writes it once. A later install keeps that MAC. It is not the console's built-in `02:00:00:00:00:01`. The player types the address from `%ProgramData%\etherquic\address.txt` or `/Library/Application Support/etherquic/address.txt`.
 
 | Path | Role |
 |------|------|
-| `%ProgramFiles%\etherquic\etherquic-host.exe` | service binary |
-| `%ProgramFiles%\etherquic\cert.pem` and `key.pem` | certificate next to the exe |
-| `%ProgramData%\etherquic\host.conf` | `mac`, `nic`, `service`, `unattended` |
-| `%ProgramData%\etherquic\address.txt` | MAC the player types |
-| `%ProgramData%\etherquic\control\` | `approve`, `deny`, and `pending.txt` |
-| `%ProgramData%\etherquic\host.log` | accept log |
+| `%ProgramFiles%\etherquic\etherquic-host.exe` | Windows service binary |
+| `/Library/Application Support/etherquic/MacOS/etherquic-host` | macOS LaunchDaemon binary |
+| `%ProgramFiles%\etherquic\cert.pem` and `key.pem` | Windows certificates next to the exe |
+| `/Library/Application Support/etherquic/MacOS/cert.pem` | macOS certificates |
+| `%ProgramData%\etherquic\host.conf` | Windows `mac`, `nic`, `service`, `unattended` |
+| `/Library/Application Support/etherquic/host.conf` | macOS host.conf |
+| `address.txt` beside host.conf | MAC the player types |
+| `control/` beside host.conf | `approve`, `deny`, and `pending.txt` |
+| `host.log` beside host.conf | accept log |
+| `/Library/LaunchDaemons/dev.etherquic.host.plist` | macOS LaunchDaemon |
+
+On macOS, `etherquic-host --install-service` (root) copies this binary and its Frameworks into `/Library/Application Support/etherquic` and loads the plist. `packaging/macos/make-pkg.sh` offers that as a selected-by-default choice. Dragging the `.app` from the DMG leaves the service off; the app then prompts. `--uninstall-service` unloads the daemon and keeps `host.conf`. `--purge` removes the support directory.
 
 `nic` empty means the default adapter. NDIS (`\\.\MembraneNdis`) is tried first; Npcap is the fallback. Leave `service` at 4433 so `etherquic-ui` can connect.
 

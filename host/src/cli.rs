@@ -6,7 +6,7 @@ use crate::config;
 
 pub const USAGE: &str = "\
 etherquic-host
-    Run as the Windows service (the service manager starts it this way).
+    Run as the host service (Windows SCM, or macOS launchd).
 etherquic-host --console
     Same host loop in the foreground.
 etherquic-host --client --peer MAC [--nic NAME] [--service PORT]
@@ -17,6 +17,11 @@ etherquic-host --deny
     Refuse the waiting player.
 etherquic-host --desk
     Capture the console desktop for the service. The service starts this.
+etherquic-host --install-service
+    macOS: copy this binary into /Library/Application Support/etherquic and
+    load LaunchDaemon dev.etherquic.host. Needs root.
+etherquic-host --uninstall-service [--purge]
+    macOS: unload that LaunchDaemon. --purge also removes host.conf.
 
 A service installed without --unattended waits for --approve.
 A service installed with --unattended accepts the player immediately.
@@ -35,6 +40,10 @@ pub enum Mode {
     Approve,
     Deny,
     Desk,
+    InstallService,
+    UninstallService {
+        purge: bool,
+    },
 }
 
 pub fn parse<I, S>(args: I) -> Result<Mode, String>
@@ -54,6 +63,9 @@ where
     let mut approve = false;
     let mut deny = false;
     let mut desk = false;
+    let mut install_service = false;
+    let mut uninstall_service = false;
+    let mut purge = false;
     let mut peer = None;
     let mut nic = None;
     let mut service = None;
@@ -70,6 +82,12 @@ where
             deny = true;
         } else if arg == "--desk" {
             desk = true;
+        } else if arg == "--install-service" {
+            install_service = true;
+        } else if arg == "--uninstall-service" {
+            uninstall_service = true;
+        } else if arg == "--purge" {
+            purge = true;
         } else if let Some(value) = takes_value(arg, &args, &mut i, "--peer")? {
             peer = Some(config::parse_mac(&value).ok_or_else(|| format!("invalid mac {value}"))?);
         } else if let Some(value) = takes_value(arg, &args, &mut i, "--nic")? {
@@ -88,19 +106,48 @@ where
         }
         i += 1;
     }
-    let signals = [approve, deny, client].iter().filter(|flag| **flag).count();
+    let signals = [approve, deny, client, install_service, uninstall_service]
+        .iter()
+        .filter(|flag| **flag)
+        .count();
     if signals > 1 {
-        return Err("choose one of --client, --approve, or --deny".into());
+        return Err(
+            "choose one of --client, --approve, --deny, --install-service, or --uninstall-service"
+                .into(),
+        );
+    }
+    if purge && !uninstall_service {
+        return Err("--purge is only valid with --uninstall-service".into());
     }
     if (approve || deny) && (console || nic.is_some() || peer.is_some() || service.is_some()) {
         return Err("--approve and --deny take no other arguments".into());
     }
-    if desk && (console || client || approve || deny || peer.is_some() || nic.is_some() || service.is_some())
+    if desk
+        && (console
+            || client
+            || approve
+            || deny
+            || install_service
+            || uninstall_service
+            || peer.is_some()
+            || nic.is_some()
+            || service.is_some())
     {
         return Err("--desk takes no other arguments".into());
     }
+    if (install_service || uninstall_service)
+        && (console || nic.is_some() || peer.is_some() || service.is_some() || desk)
+    {
+        return Err("--install-service and --uninstall-service take no other arguments".into());
+    }
     if desk {
         return Ok(Mode::Desk);
+    }
+    if install_service {
+        return Ok(Mode::InstallService);
+    }
+    if uninstall_service {
+        return Ok(Mode::UninstallService { purge });
     }
     if approve {
         return Ok(Mode::Approve);
@@ -175,5 +222,17 @@ mod tests {
         assert_eq!(parse(["--help"]).unwrap(), Mode::Help);
         assert_eq!(parse(["--desk"]).unwrap(), Mode::Desk);
         assert!(parse(["--desk", "--console"]).is_err());
+        assert_eq!(parse(["--install-service"]).unwrap(), Mode::InstallService);
+        assert_eq!(
+            parse(["--uninstall-service"]).unwrap(),
+            Mode::UninstallService { purge: false }
+        );
+        assert_eq!(
+            parse(["--uninstall-service", "--purge"]).unwrap(),
+            Mode::UninstallService { purge: true }
+        );
+        assert!(parse(["--purge"]).is_err());
+        assert!(parse(["--install-service", "--console"]).is_err());
+        assert!(parse(["--install-service", "--approve"]).is_err());
     }
 }

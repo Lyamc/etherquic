@@ -1,0 +1,22 @@
+[package]
+name = "etherquic-android"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "UDP player loaded by the EtherQuic Play APK"
+
+[lib]
+name = "etherquic_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+etherquic = { path = ".." }
+etherquic-play = { path = "../play", default-features = false }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+android_logger = "0.14"
+etherquic-ui = { path = "../ui", default-features = false, features = ["ui"] }
+log = "0.4"

@@ -1321,6 +1321,10 @@ mod tests {
         assert_eq!(chosen, Some(PicturePref::Pyrowave));
         let line = remote_hardware_line(Some(&remote));
         assert!(line.contains("Pyrowave HW encode"), "{line}");
+        let mut both = remote;
+        both[0].hardware_decode = true;
+        let line = remote_hardware_line(Some(&both));
+        assert!(line.contains("Pyrowave encode+decode"), "{line}");
     }
 
     #[test]

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Load LaunchDaemon dev.etherquic.host from the app that this package just
+# copied into /Applications. Needs the elevated installer session.
+set -eu
+host=/Applications/etherquic.app/Contents/MacOS/etherquic-host
+if [ -x "$host" ]; then
+    "$host" --install-service
+fi
+exit 0

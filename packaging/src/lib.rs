@@ -5,12 +5,16 @@
 //! ProductCode, which Windows Installer installs as a major upgrade.
 //! The Android package is a signed APK with one application id. A later build
 //! passes a higher version code so the package manager updates that id in place.
+//! The manifest targets SDK 35, allows `INTERNET` and `ACCESS_NETWORK_STATE`,
+//! and launches `android.app.NativeActivity` with `libetherquic_android.so`
+//! so the phone runs the same GPUI Desk as the desktop window.
 //!
 //! Neither package is the Membrane NDIS driver under `windows/`.
 
 #![forbid(unsafe_code)]
 
 mod axml;
+#[allow(dead_code)]
 mod dex;
 mod hash;
 mod zipstore;
@@ -104,11 +108,12 @@ pub fn build_android_package(output: &Path, version_code: u32, version_name: &st
     }
 
     let manifest = axml::manifest(APPLICATION_ID, version_code, version_name);
-    let classes = dex::activity_dex();
-    let unsigned_bytes = zipstore::store_zip(&[
-        ("AndroidManifest.xml", manifest.as_slice()),
-        ("classes.dex", classes.as_slice()),
-    ]);
+    let native = android_library();
+    let mut files: Vec<(&str, &[u8])> = vec![("AndroidManifest.xml", manifest.as_slice())];
+    if let Some((name, bytes)) = native.as_ref() {
+        files.push((name.as_str(), bytes.as_slice()));
+    }
+    let unsigned_bytes = zipstore::store_zip(&files);
     let work = WorkDir::new("apk")?;
     let unsigned = work.path.join("unsigned.apk");
     fs::write(&unsigned, unsigned_bytes)?;
@@ -148,6 +153,22 @@ pub fn build_android_package(output: &Path, version_code: u32, version_name: &st
         )));
     }
     Ok(())
+}
+
+/// `lib/arm64-v8a/libetherquic_android.so` when a release build of the
+/// NativeActivity crate is on disk, or `ETHERQUIC_ANDROID_SO` points at one.
+fn android_library() -> Option<(String, Vec<u8>)> {
+    let path = std::env::var_os("ETHERQUIC_ANDROID_SO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/aarch64-linux-android/release/libetherquic_android.so")
+        });
+    let bytes = fs::read(&path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(("lib/arm64-v8a/libetherquic_android.so".into(), bytes))
 }
 
 fn stage_play_exe(dest: &Path, version: &str) -> Result<()> {

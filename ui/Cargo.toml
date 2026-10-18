@@ -10,7 +10,7 @@ autobins = false
 
 [features]
 default = ["ui"]
-ui = ["dep:gpui", "dep:etherquic-play", "etherquic-play/desktop", "dep:image"]
+ui = ["dep:gpui", "dep:etherquic-play", "dep:image"]
 
 [dependencies]
 etherquic = { path = ".." }
@@ -23,9 +23,17 @@ image = { version = "0.25.1", default-features = false, optional = true }
 tokio = { version = "1.28", features = ["rt", "macros", "sync", "time"] }
 gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true }
 
+# Desktop play (capture, winit picture window) is not built for the phone.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+etherquic-play = { path = "../play", default-features = false, optional = true, features = ["desktop"] }
+
 # The Windows backend is built in. Linux needs a window system, and this machine is Wayland.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true, features = ["wayland"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true }
 
 # macOS draws text through font-kit; without it GPUI uses a text system that
 # draws nothing. Runtime shaders build without Xcode's separate Metal Toolchain.

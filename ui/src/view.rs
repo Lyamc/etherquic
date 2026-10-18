@@ -20,7 +20,7 @@ use etherquic_play::{
     display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
 };
 use etherquic_play::{CursorMode, Look, ScaleMode, SizeMatch, PAD_SLOTS};
-use etherquic_ui::{
+use crate::{
     active_layer, apply_override, audio_for, audio_hint, audio_match_line, backend_hint,
     backend_label, backend_line, capture_rate, dial_target, format_mac, lanes, list_nics,
     listed_top, load_connections, load_preferences, local_video_line, mac_key, qr_grid,
@@ -29,26 +29,25 @@ use etherquic_ui::{
     ConnectionPrefs, ConnectionTabs, DialTarget, FrameRate, HexMac, Layer, Link, NicChoice,
     Preferences, QrGrid, Role, Share, CLIENT_MAC, FPS_CHOICES, HOST_MAC, SOFTWARE_FPS,
 };
-use etherquic_ui::{
+use crate::{
     ago, caps_details, caps_summary, decode_thumbnail, load_hosts, matches_filter, scrollbar,
     store_hosts, HostAddr, HostBook, Presence, Roster, Sighting, ThisMachine,
 };
-use etherquic_ui::{
+use crate::{
     backends as backend_list, chosen_audio, chosen_video, default_audio, default_video,
     load_defaults, load_settings, move_to_front, store_defaults, store_settings, BackendState,
     Field, NetworkDriver, Part, RosterRow, Section, Settings,
 };
-use etherquic_ui::{codec_choice_for, last_session, predicted_pair, Predicted};
+use crate::{codec_choice_for, last_session, predicted_pair, Predicted};
 
 use crate::badge::os_badge;
 use crate::scan::Scan;
 use gpui::{
-    anchored, canvas, deferred, div, fill, img, point, prelude::*, px, rgb, size, AnyElement, App,
-    AppContext,
-    Application, Bounds, ClickEvent, Context, Div, FocusHandle, FontWeight, ImageSource,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    anchored, canvas, deferred, div, fill, img, point, prelude::*, px, rgb, size, AnyElement,
+    AnyView, App, AppContext, Application, Bounds, ClickEvent, Context, Div, FocusHandle,
+    FontWeight, ImageSource, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
+    TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 
 const BG: u32 = 0x12141a;
@@ -335,6 +334,8 @@ struct Desk {
     connections: ConnectionPrefs,
     /// Packet capture. Not written to the preferences file.
     capturing: bool,
+    /// macOS: hide the host-service prompt for this session only.
+    host_service_hidden: bool,
     /// Collapsible sections. All start closed.
     open: Panels,
     /// The page and the host list scroll separately.
@@ -444,6 +445,7 @@ impl Desk {
             display_hz: display_hz(),
             connections: load_connections(),
             capturing: etherquic::capture_active(),
+            host_service_hidden: false,
             open: Panels::default(),
             page_scroll: ScrollHandle::new(),
             list_scroll: ScrollHandle::new(),
@@ -685,6 +687,34 @@ impl Desk {
         self.message = None;
     }
 
+    fn show_host_service_prompt(&self) -> bool {
+        cfg!(target_os = "macos")
+            && !self.host_service_hidden
+            && !self.settings.skip_host_service_prompt
+            && !crate::macos_service::service_installed()
+    }
+
+    fn install_host_service(&mut self, cx: &mut Context<Self>) {
+        match crate::macos_service::install_with_prompt() {
+            Ok(()) => {
+                self.host_service_hidden = true;
+                self.message = Some("Host service installed.".into());
+            }
+            Err(err) => self.message = Some(err),
+        }
+        cx.notify();
+    }
+
+    fn remove_host_service(&mut self, cx: &mut Context<Self>) {
+        match crate::macos_service::uninstall_with_prompt() {
+            Ok(()) => {
+                self.message = Some("Host service removed. Saved settings were kept.".into());
+            }
+            Err(err) => self.message = Some(err),
+        }
+        cx.notify();
+    }
+
     fn on_host(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.reap_links();
         if self.link.role() == Role::Host {
@@ -753,7 +783,14 @@ impl Desk {
         };
         let layer = active_layer(self.layer, &v4, &v6);
         let udp = match dial_target(layer, port, ipv6_scope(self.nic.as_deref(), &self.nics)) {
-            DialTarget::L2 => None,
+            DialTarget::L2 => {
+                if let Some(why) = etherquic::l2_unavailable_reason() {
+                    self.message = Some(why.into());
+                    cx.notify();
+                    return;
+                }
+                None
+            }
             DialTarget::Udp(addr) => Some(addr),
             DialTarget::NeedsNic => {
                 self.message =
@@ -1108,6 +1145,49 @@ impl Desk {
                     desk.on_host(window, cx);
                 }),
             ))
+            .when(self.show_host_service_prompt(), |card| {
+                card.child(muted_line(
+                    "Install the host as a background service so players can connect when you are signed out. Layer-2 Ethernet uses BPF, which that service runs as root. An administrator password is required.".into(),
+                ))
+                .child(action_button(
+                    "host-svc-install",
+                    "Install host service",
+                    true,
+                    HOST_GREEN,
+                    cx.listener(|desk, _, _, cx| {
+                        desk.install_host_service(cx);
+                    }),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .child(small_chip(
+                            SharedString::from("host-svc-later"),
+                            "Not now",
+                            None,
+                            true,
+                            cx.listener(|desk, _, _, cx| {
+                                desk.host_service_hidden = true;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(small_chip(
+                            SharedString::from("host-svc-skip"),
+                            "Don't ask again",
+                            None,
+                            true,
+                            cx.listener(|desk, _, _, cx| {
+                                desk.host_service_hidden = true;
+                                desk.edit_settings(|settings| {
+                                    settings.skip_host_service_prompt = true;
+                                });
+                                cx.notify();
+                            }),
+                        )),
+                )
+            })
             .child(disclosure(
                 "host-more",
                 "Hosting options",
@@ -1329,7 +1409,10 @@ impl Desk {
             .map(|row| (row.ipv4.clone(), row.ipv6.clone()))
             .unwrap_or_default();
         match active_layer(self.layer, &v4, &v6) {
-            Layer::L2 => "via Ethernet (L2)".into(),
+            Layer::L2 => match etherquic::l2_unavailable_reason() {
+                Some(why) => format!("L2 unavailable: {why}"),
+                None => "via Ethernet (L2)".into(),
+            },
             Layer::V4(ip) => format!("via IPv4 {ip}"),
             Layer::V6(ip) => format!("via IPv6 {ip}"),
         }
@@ -1354,6 +1437,8 @@ impl Desk {
             .map(|device| device.ipv6.clone())
             .unwrap_or_default();
         let active = active_layer(self.layer, &v4, &v6);
+        let l2_why = etherquic::l2_unavailable_reason();
+        let l2_ok = l2_why.is_none();
         let mut chips = div()
             .flex()
             .flex_row()
@@ -1364,9 +1449,15 @@ impl Desk {
         chips = chips.child(path_chip(
             "path-l2",
             "L2",
-            matches!(active, Layer::L2),
-            cx.listener(|desk, _, _, cx| {
-                desk.layer = Layer::L2;
+            matches!(active, Layer::L2) && l2_ok,
+            l2_ok,
+            l2_why,
+            cx.listener(move |desk, _, _, cx| {
+                if let Some(why) = l2_why {
+                    desk.message = Some(why.into());
+                } else {
+                    desk.layer = Layer::L2;
+                }
                 cx.notify();
             }),
         ));
@@ -1376,6 +1467,8 @@ impl Desk {
                 SharedString::from(format!("path-v4-{index}")),
                 format!("IPv4 {ip}"),
                 on,
+                true,
+                None,
                 cx.listener(move |desk, _, _, cx| {
                     desk.layer = Layer::V4(ip);
                     cx.notify();
@@ -1388,6 +1481,8 @@ impl Desk {
                 SharedString::from(format!("path-v6-{index}")),
                 format!("IPv6 {ip}"),
                 on,
+                true,
+                None,
                 cx.listener(move |desk, _, _, cx| {
                     desk.layer = Layer::V6(ip);
                     cx.notify();
@@ -2866,7 +2961,7 @@ impl Desk {
                 "{} · {}{note} · {}",
                 predicted.video.name(),
                 predicted.audio.name(),
-                etherquic_ui::fps_headline(
+                crate::fps_headline(
                     applied.fps,
                     None,
                     matches!(
@@ -2921,13 +3016,13 @@ impl Desk {
     /// Push Settings to whatever reads them now: the open view, the next shared
     /// session's sound source, and the network driver. `persist` also saves them.
     fn apply_settings(&mut self, persist: bool) {
-        let view = etherquic_ui::live_view();
+        let view = crate::live_view();
         let next = self.settings.view();
         match view.lock() {
             Ok(mut guard) => *guard = next,
             Err(poisoned) => *poisoned.into_inner() = next,
         }
-        etherquic_ui::set_host_audio_device(self.settings.share_device.clone());
+        crate::set_host_audio_device(self.settings.share_device.clone());
         etherquic::set_l2_preference(self.settings.network.l2_id());
         if persist {
             if let Err(err) = store_settings(&self.settings) {
@@ -3064,45 +3159,51 @@ impl Desk {
                 Layer::V6(_) => 2,
             },
         };
-        let tab =
-            |id: &'static str, (kind, address): (&'static str, String), on: bool, enabled: bool| {
-                div()
-                    .id(id)
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .h(px(38.))
-                    .px_2()
-                    .justify_center()
-                    .overflow_hidden()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
-                    .bg(rgb(if on { 0x243044 } else { BG }))
-                    .text_xs()
-                    .text_color(rgb(if on { TEXT } else { MUTED }))
-                    .when(!enabled, |tab| tab.opacity(0.45))
-                    .when(enabled, |tab| tab.cursor_pointer())
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(16.))
-                            .line_height(px(16.))
-                            .overflow_hidden()
-                            .when(on, |line| line.font_weight(FontWeight::BOLD))
-                            .child(kind),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(16.))
-                            .line_height(px(16.))
-                            .overflow_hidden()
-                            .whitespace_normal()
-                            .child(address),
-                    )
-            };
+        let tab = |id: &'static str,
+                   (kind, address): (&'static str, String),
+                   on: bool,
+                   enabled: bool,
+                   why: Option<&'static str>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .h(px(38.))
+                .px_2()
+                .justify_center()
+                .overflow_hidden()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+                .bg(rgb(if on { 0x243044 } else { BG }))
+                .text_xs()
+                .text_color(rgb(if on { TEXT } else { MUTED }))
+                .when(!enabled, |tab| tab.opacity(0.45))
+                .when(enabled, |tab| tab.cursor_pointer())
+                .when_some(why, |tab, why| tab.tooltip(why_tip(why)))
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(16.))
+                        .line_height(px(16.))
+                        .overflow_hidden()
+                        .when(on, |line| line.font_weight(FontWeight::BOLD))
+                        .child(kind),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(16.))
+                        .line_height(px(16.))
+                        .overflow_hidden()
+                        .whitespace_normal()
+                        .child(address),
+                )
+        };
+        let l2_why = etherquic::l2_unavailable_reason();
+        let ether_ok = mac.is_some() && l2_why.is_none();
         let ether_label = (
             "Ethernet",
             mac.map(format_mac)
@@ -3124,21 +3225,36 @@ impl Desk {
             .gap_1()
             .w_full()
             .min_w_0()
-            .child(
-                tab("via-l2", ether_label, active == 0, mac.is_some()).when_some(
-                    mac,
-                    |tab, mac| {
+            .child({
+                let tab = tab(
+                    "via-l2",
+                    ether_label,
+                    active == 0 && ether_ok,
+                    ether_ok,
+                    l2_why,
+                );
+                if ether_ok {
+                    if let Some(mac) = mac {
                         tab.on_click(cx.listener(move |desk, _, _, cx| {
                             desk.direct = None;
                             desk.layer = Layer::L2;
                             desk.peer = HexMac::from_bytes(mac);
                             cx.notify();
                         }))
-                    },
-                ),
-            )
+                    } else {
+                        tab
+                    }
+                } else if let Some(why) = l2_why {
+                    tab.on_click(cx.listener(move |desk, _, _, cx| {
+                        desk.message = Some(why.into());
+                        cx.notify();
+                    }))
+                } else {
+                    tab
+                }
+            })
             .child(
-                tab("via-v4", v4_label, active == 1, v4.is_some()).when_some(v4, |tab, ip| {
+                tab("via-v4", v4_label, active == 1, v4.is_some(), None).when_some(v4, |tab, ip| {
                     tab.on_click(cx.listener(move |desk, _, _, cx| {
                         desk.direct = Some(HostAddr::Ip {
                             ip: IpAddr::V4(ip),
@@ -3150,7 +3266,7 @@ impl Desk {
                 }),
             )
             .child(
-                tab("via-v6", v6_label, active == 2, v6.is_some()).when_some(v6, |tab, ip| {
+                tab("via-v6", v6_label, active == 2, v6.is_some(), None).when_some(v6, |tab, ip| {
                     tab.on_click(cx.listener(move |desk, _, _, cx| {
                         desk.direct = Some(HostAddr::Ip {
                             ip: IpAddr::V6(ip),
@@ -3690,18 +3806,27 @@ impl Desk {
             let selectable = matches!(backend.state, BackendState::Available);
             let label = backend.label;
             row = row.child(
-                backend_chip(id, label, note, on, enabled).when(selectable, |chip| {
-                    chip.cursor_pointer()
-                        .on_click(cx.listener(move |desk, _, _, cx| {
-                            let driver = match label {
-                                "Membrane" => NetworkDriver::Membrane,
-                                "Npcap" => NetworkDriver::Npcap,
-                                _ => NetworkDriver::Automatic,
-                            };
-                            desk.edit_settings(|settings| settings.network = driver);
-                            cx.notify();
-                        }))
-                }),
+                backend_chip(id, label, note, on, enabled)
+                    .when(selectable, |chip| {
+                        chip.cursor_pointer()
+                            .on_click(cx.listener(move |desk, _, _, cx| {
+                                let driver = match label {
+                                    "Membrane" => NetworkDriver::Membrane,
+                                    "Npcap" => NetworkDriver::Npcap,
+                                    _ => NetworkDriver::Automatic,
+                                };
+                                desk.edit_settings(|settings| settings.network = driver);
+                                cx.notify();
+                            }))
+                    })
+                    .when(!enabled, |chip| {
+                        chip.when_some(note, |chip, why| {
+                            chip.on_click(cx.listener(move |desk, _, _, cx| {
+                                desk.message = Some(why.into());
+                                cx.notify();
+                            }))
+                        })
+                    }),
             );
         }
         row.into_any_element()
@@ -4346,9 +4471,40 @@ impl Desk {
             .min_w_0()
             .child(muted_line(if cfg!(windows) {
                 "Automatic uses Membrane when its driver is installed and Npcap otherwise. A change applies to the next session.".into()
+            } else if cfg!(target_os = "macos") {
+                "Raw Ethernet uses BPF. The host service runs as root so BPF is available, and so players can connect when you are signed out. Membrane and Npcap are Windows drivers.".into()
             } else {
                 "Raw Ethernet goes through libpcap here. Membrane and Npcap are Windows drivers.".into()
             }))
+            .when(cfg!(target_os = "macos"), |col| {
+                let installed = crate::macos_service::service_installed();
+                col.child(muted_line(if installed {
+                    "Host service: installed (LaunchDaemon dev.etherquic.host).".into()
+                } else {
+                    "Host service: not installed.".into()
+                }))
+                .child(action_button(
+                    if installed {
+                        "host-svc-remove"
+                    } else {
+                        "host-svc-settings-install"
+                    },
+                    if installed {
+                        "Remove host service"
+                    } else {
+                        "Install host service"
+                    },
+                    true,
+                    if installed { DANGER } else { HOST_GREEN },
+                    cx.listener(move |desk, _, _, cx| {
+                        if installed {
+                            desk.remove_host_service(cx);
+                        } else {
+                            desk.install_host_service(cx);
+                        }
+                    }),
+                ))
+            })
             .child(toggle_row(
                 "capture-traffic",
                 "Capture traffic",
@@ -5267,7 +5423,7 @@ fn thumb_slot(picture: Option<Arc<RenderImage>>) -> AnyElement {
 }
 
 /// RGBA from the decoder into the BGRA frame the renderer takes.
-fn render_image(thumb: etherquic_ui::Thumb) -> Option<Arc<RenderImage>> {
+fn render_image(thumb: crate::Thumb) -> Option<Arc<RenderImage>> {
     let mut bgra = thumb.rgba;
     for px in bgra.chunks_exact_mut(4) {
         px.swap(0, 2);
@@ -5524,9 +5680,34 @@ fn path_chip(
     id: impl Into<gpui::ElementId>,
     label: impl Into<String>,
     on: bool,
+    enabled: bool,
+    why: Option<&'static str>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    choice_chip(id, label, on, 280., on_click)
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .max_w(px(280.))
+        .h(px(28.))
+        .px_2()
+        .items_center()
+        .overflow_hidden()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { CARD }))
+        .text_color(rgb(if on { TEXT } else { MUTED }))
+        .when(enabled, |chip| chip.cursor_pointer())
+        .when(!enabled, |chip| chip.opacity(0.45).cursor_default())
+        .when_some(why, |chip, why| chip.tooltip(why_tip(why)))
+        .child(
+            div()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(label.into()),
+        )
+        .on_click(on_click)
 }
 
 fn nic_chip(
@@ -5948,8 +6129,42 @@ fn backend_chip(
         .bg(rgb(if on { 0x243044 } else { BG }))
         .text_xs()
         .text_color(rgb(if on { TEXT } else { MUTED }))
-        .when(!enabled, |chip| chip.opacity(0.45))
+        .when(!enabled, |chip| {
+            chip.opacity(0.45)
+                .when_some(note, |chip, why| chip.tooltip(why_tip(why)))
+        })
         .child(text)
+}
+
+/// Hover text for a greyed control. Press writes the same sentence to status.
+struct Tip {
+    text: SharedString,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .max_w(px(280.))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(CARD_EDGE))
+            .bg(rgb(CARD))
+            .text_xs()
+            .text_color(rgb(TEXT))
+            .whitespace_normal()
+            .child(self.text.clone())
+    }
+}
+
+fn why_tip(why: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    move |_, cx| {
+        cx.new(|_| Tip {
+            text: why.into(),
+        })
+        .into()
+    }
 }
 
 /// One sound device in a column. The name is clipped to the column.

@@ -527,6 +527,9 @@ enum PacketIo {
 impl PacketIo {
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(target_os = "macos")]
+            PacketIo::Pcap(_) => "bpf",
+            #[cfg(not(target_os = "macos"))]
             PacketIo::Pcap(_) => "pcap",
             #[cfg(windows)]
             PacketIo::Ndis(_) => "rust-ndis",

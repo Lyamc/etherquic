@@ -283,11 +283,11 @@ fn announced_media(
 /// Capabilities and a desktop thumbnail for version-3 offers, refreshed in
 /// the background until `stop` is set.
 fn discovery_extras(stop: Arc<AtomicBool>) -> Arc<dyn etherquic::discover::OfferExtras> {
-    #[cfg(feature = "ui")]
+    #[cfg(all(feature = "ui", not(target_os = "android")))]
     {
         etherquic_play::hostinfo::host_extras(stop)
     }
-    #[cfg(not(feature = "ui"))]
+    #[cfg(not(all(feature = "ui", not(target_os = "android"))))]
     {
         let _ = stop;
         Arc::new(etherquic::discover::NoExtras)
@@ -355,7 +355,17 @@ fn host_thread(
             }
         })
         .ok();
-    #[cfg(feature = "ui")]
+    #[cfg(all(feature = "ui", target_os = "android"))]
+    {
+        let _ = (net, cert, key, fps, up, peers, stop);
+        write_status(&status, "Android cannot host a desktop.");
+        discovery_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = discovery {
+            let _ = handle.join();
+        }
+        return;
+    }
+    #[cfg(all(feature = "ui", not(target_os = "android")))]
     {
         let slot = Arc::clone(&status);
         let report: etherquic_play::Status = Arc::new(move |text: &str| write_status(&slot, text));
@@ -574,7 +584,12 @@ fn client_thread(
             drop(picture);
             child_view(nic, peer, udp, trace_input, codecs, stop, status);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "android")]
+        {
+            let _ = (net, nic, picture, trace_input);
+            android_join(peer, udp, codecs, stop, status);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "android")))]
         {
             let _ = nic;
             open_view(net, peer, udp, trace_input, codecs, stop, status, picture);
@@ -639,7 +654,68 @@ fn child_view(
     }
 }
 
-#[cfg(all(feature = "ui", not(target_os = "macos")))]
+#[cfg(all(feature = "ui", target_os = "android"))]
+fn android_join(
+    peer: [u8; 6],
+    udp: Option<SocketAddr>,
+    codecs: CodecOffer,
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+) {
+    let Some(addr) = udp else {
+        write_status(
+            &status,
+            "Connect needs a UDP address. Android has no Ethernet.",
+        );
+        return;
+    };
+    write_status(&status, format!("Dialing {addr}."));
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            write_status(&status, format!("Connect failed: {err}"));
+            return;
+        }
+    };
+    let offer = codecs.offer();
+    let look = offer.look;
+    let (_look_tx, look_rx) = tokio::sync::watch::channel(look);
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<etherquic_play::AudioChunk>(8);
+    let (_input_tx, input_rx) = tokio::sync::mpsc::channel(8);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let frames: etherquic_play::etherquic_media::Sink<etherquic_play::etherquic_media::Frame> =
+        std::sync::Arc::new(|_| true);
+    let media = etherquic_play::PlayerMedia {
+        offer,
+        frames,
+        events: event_tx,
+        look: look_rx,
+    };
+    let stop_flag = Arc::clone(&stop);
+    let outcome = runtime.block_on(async move {
+        tokio::spawn(async move {
+            while audio_rx.recv().await.is_some() {}
+        });
+        tokio::spawn(async move {
+            while event_rx.recv().await.is_some() {}
+        });
+        etherquic_play::join_udp(addr, media, audio_tx, input_rx, stop_flag).await
+    });
+    match outcome {
+        Ok(()) => {
+            if !stop.load(Ordering::SeqCst) {
+                write_status(&status, "The view closed.");
+            }
+        }
+        Err(err) => write_status(&status, etherquic_play::session_end_status(&err.to_string())),
+    }
+    let _ = peer;
+}
+
+#[cfg(all(feature = "ui", not(any(target_os = "macos", target_os = "android"))))]
 fn open_view(
     net: Option<Arc<L2Net>>,
     peer: [u8; 6],

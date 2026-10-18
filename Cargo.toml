@@ -11,6 +11,7 @@ members = [
     "input",
     "container",
     "packaging",
+    "android",
 ]
 # The root package is this manifest. Listing "." would mark every path under
 # it as an explicit member, and then exclude cannot keep vendor/quinn out.
@@ -22,6 +23,7 @@ exclude = [
     "vendor/rustls-rustcrypto/validation/consumer-no_std",
     "vendor/softbuffer",
     "vendor/xattr",
+    "vendor/blade-graphics",
 ]
 
 # The published gpui_http_client 0.2.2 has no install_tls_provider. The Lyamc
@@ -32,15 +34,24 @@ gpui_http_client = { path = "../../interfaces/gpui_http_client" }
 # xattr 0.2.3 reads libc::ENOATTR, which this libc no longer defines.
 # On Linux that value is ENODATA.
 xattr = { path = "vendor/xattr" }
+# Adreno 640 (Vulkan 1.1) has no dynamic rendering / timeline semaphores.
+# Blade draws through GLES on Android instead.
+blade-graphics = { path = "vendor/blade-graphics" }
 
 [package]
 name = "etherquic"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "QUIC over a pure-Rust Ethernet datagram backend (Quinn + rustls-rustcrypto)"
 publish = false
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+pcap = "2.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -54,7 +65,6 @@ windows-sys = { version = "0.59", features = [
 
 [dependencies]
 bytes = "1"
-pcap = "2.2"
 quinn = { path = "vendor/quinn/quinn", default-features = false, features = [
     "runtime-tokio",
     "rustls-pure",

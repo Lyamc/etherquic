@@ -23,9 +23,12 @@ pub mod l2_endpoint;
 pub mod look;
 #[cfg(windows)]
 pub mod ndis_link;
+#[cfg(target_os = "macos")]
+mod macos_link;
 pub mod negotiate;
 pub mod pcap_link;
 pub mod priority;
+pub mod share;
 pub mod socket;
 pub mod thumbnail;
 pub mod tls;
@@ -55,7 +58,8 @@ pub use frame::{max_quic_datagram, Frame, DEFAULT_ETHER_TYPE};
 pub use l2_endpoint::{
     l2_client_endpoint, l2_preference, l2_server_endpoint, set_l2_preference, L2Net,
 };
-pub use pcap_link::{parse_mac, ETHERTYPE_QUIC};
+pub use pcap_link::{l2_unavailable_reason, parse_mac, ETHERTYPE_QUIC};
+pub use share::{Share, ShareRow};
 pub use priority::{
     AUDIO as PRIORITY_AUDIO, INPUT as PRIORITY_INPUT, TRACE as PRIORITY_TRACE,
     VIDEO as PRIORITY_VIDEO,

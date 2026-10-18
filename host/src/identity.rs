@@ -1,4 +1,4 @@
-//! MachineGuid from HKLM, used only when host.conf has no MAC yet.
+//! Stable machine id used only when host.conf has no MAC yet.
 
 #[cfg(windows)]
 pub fn machine_id() -> String {
@@ -8,7 +8,55 @@ pub fn machine_id() -> String {
 
 #[cfg(not(windows))]
 pub fn machine_id() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "etherquic".into())
+    if let Ok(text) = std::fs::read_to_string("/etc/machine-id") {
+        let text = text.trim();
+        if !text.is_empty() {
+            return text.to_string();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(uuid) = io_platform_uuid() {
+        return uuid;
+    }
+    computer_name()
+}
+
+/// Hostname a discovery offer shows.
+pub fn computer_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| "etherquic".into())
+}
+
+/// `"IOPlatformUUID" = "A1B2C3D4-…"` from `ioreg -rd1 -c IOPlatformExpertDevice`.
+pub fn parse_io_platform_uuid(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.contains("IOPlatformUUID") {
+            continue;
+        }
+        let Some(end) = line.rfind('"') else {
+            continue;
+        };
+        let Some(start) = line[..end].rfind('"') else {
+            continue;
+        };
+        let uuid = &line[start + 1..end];
+        if uuid.len() >= 8 {
+            return Some(uuid.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn io_platform_uuid() -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    parse_io_platform_uuid(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(windows)]
@@ -78,5 +126,25 @@ fn machine_guid() -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_platform_uuid_reads_the_quoted_value() {
+        let ioreg = r#"
++-o Macbook <class IOPlatformExpertDevice, id 0x100000112, registered, matched, active, busy 0>
+    {
+      "IOPlatformUUID" = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+    }
+"#;
+        assert_eq!(
+            parse_io_platform_uuid(ioreg).as_deref(),
+            Some("A1B2C3D4-E5F6-7890-ABCD-EF1234567890")
+        );
+        assert_eq!(parse_io_platform_uuid("no uuid here"), None);
     }
 }

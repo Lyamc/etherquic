@@ -53,10 +53,11 @@ use winapi::um::winuser::{
     MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, SM_CXSCREEN, SM_CYSCREEN,
-    VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
-    VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
-    VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VK_BACK, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
+    VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_OEM_1, VK_OEM_2, VK_OEM_3,
+    VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+    VK_OEM_PLUS, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RWIN, VK_SHIFT,
+    VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
 };
 use winapi::Interface;
 
@@ -893,8 +894,8 @@ pub fn key_keysym(code: u32, down: bool) -> Result<bool, String> {
     input.type_ = INPUT_KEYBOARD;
     unsafe {
         let key = input.u.ki_mut();
-        if let Some(vk) = virtual_key(code).or_else(|| ascii_key(code)) {
-            fill_virtual_key(key, vk, down);
+        if let Some((vk, extended)) = mapped_virtual_key(code) {
+            fill_virtual_key(key, vk, down, extended);
         } else if code < 0x80 {
             let up = if down { 0 } else { KEYEVENTF_KEYUP };
             key.wScan = code as u16;
@@ -946,22 +947,63 @@ fn ascii_key(code: u32) -> Option<u16> {
 
 /// Scan code plus the virtual key. Games read the scan code. `wVk` is still
 /// set for callers that ignore the scan-code flag.
-unsafe fn fill_virtual_key(key: &mut winapi::um::winuser::KEYBDINPUT, vk: u16, down: bool) {
+///
+/// Arrow, Home, End, Page Up/Down, Insert, and Delete share a scan code with
+/// the numpad. Without `KEYEVENTF_EXTENDEDKEY`, NumLock on the host types
+/// 2/4/6/8 instead of moving. `MapVirtualKeyW` often omits the 0xE0 prefix
+/// for those keys, so the flag is taken from [`extended_virtual_key`] as well.
+unsafe fn fill_virtual_key(
+    key: &mut winapi::um::winuser::KEYBDINPUT,
+    vk: u16,
+    down: bool,
+    extended: bool,
+) {
     let up = if down { 0 } else { KEYEVENTF_KEYUP };
     let mapped = MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX);
     key.wVk = vk;
     if mapped == 0 {
-        key.dwFlags = up;
+        key.dwFlags = up | if extended { KEYEVENTF_EXTENDEDKEY } else { 0 };
         return;
     }
     let mut flags = KEYEVENTF_SCANCODE | up;
     let mut scan = mapped as u16;
-    if mapped & 0xFF00 == 0xE000 || mapped & 0xFF00 == 0xE100 {
+    if extended || mapped & 0xFF00 == 0xE000 || mapped & 0xFF00 == 0xE100 {
         flags |= KEYEVENTF_EXTENDEDKEY;
         scan = (mapped & 0xFF) as u16;
     }
     key.wScan = scan;
     key.dwFlags = flags;
+}
+
+fn mapped_virtual_key(code: u32) -> Option<(u16, bool)> {
+    if let Some(vk) = virtual_key(code) {
+        // Keypad Enter is VK_RETURN with the extended flag. The main Enter
+        // key is the same VK without it.
+        let extended = extended_virtual_key(vk) || code == 0xff8d;
+        return Some((vk, extended));
+    }
+    Some((ascii_key(code)?, false))
+}
+
+/// Navigation keys on the 101-key layout. MSDN "Extended-Key Flag".
+fn extended_virtual_key(vk: u16) -> bool {
+    vk == VK_LEFT as u16
+        || vk == VK_RIGHT as u16
+        || vk == VK_UP as u16
+        || vk == VK_DOWN as u16
+        || vk == VK_HOME as u16
+        || vk == VK_END as u16
+        || vk == VK_PRIOR as u16
+        || vk == VK_NEXT as u16
+        || vk == VK_INSERT as u16
+        || vk == VK_DELETE as u16
+        || vk == VK_DIVIDE as u16
+        || vk == VK_NUMLOCK as u16
+        || vk == VK_RCONTROL as u16
+        || vk == VK_RMENU as u16
+        || vk == VK_LWIN as u16
+        || vk == VK_RWIN as u16
+        || vk == VK_SNAPSHOT as u16
 }
 
 fn virtual_key(code: u32) -> Option<u16> {
@@ -970,15 +1012,16 @@ fn virtual_key(code: u32) -> Option<u16> {
         0xff0d | 0xff8d => VK_RETURN,
         0xff08 => VK_BACK,
         0xff09 => VK_TAB,
-        0xffff => VK_DELETE,
-        0xff51 => VK_LEFT,
-        0xff52 => VK_UP,
-        0xff53 => VK_RIGHT,
-        0xff54 => VK_DOWN,
-        0xff50 => VK_HOME,
-        0xff57 => VK_END,
-        0xff55 => VK_PRIOR,
-        0xff56 => VK_NEXT,
+        0xffff | 0xff9f => VK_DELETE,
+        0xff63 | 0xff9e => VK_INSERT,
+        0xff51 | 0xff96 => VK_LEFT,
+        0xff52 | 0xff97 => VK_UP,
+        0xff53 | 0xff98 => VK_RIGHT,
+        0xff54 | 0xff99 => VK_DOWN,
+        0xff50 | 0xff95 => VK_HOME,
+        0xff57 | 0xff9c => VK_END,
+        0xff55 | 0xff9a => VK_PRIOR,
+        0xff56 | 0xff9b => VK_NEXT,
         0xffe1 | 0xffe2 => VK_SHIFT,
         0xffe3 | 0xffe4 => VK_CONTROL,
         0xffe9 | 0xffea => VK_MENU,
@@ -1350,7 +1393,12 @@ fn float_to_i16(sample: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ascii_key, decode_samples, float_to_i16, recover_step, virtual_key, Recover, STALE_LIMIT,
+        ascii_key, decode_samples, extended_virtual_key, float_to_i16, mapped_virtual_key,
+        recover_step, virtual_key, Recover, STALE_LIMIT,
+    };
+    use winapi::um::winuser::{
+        VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
+        VK_RIGHT, VK_UP,
     };
     use std::time::Duration;
 
@@ -1381,6 +1429,35 @@ mod tests {
         assert_eq!(ascii_key(u32::from(b'A')), Some(0x41));
         assert_eq!(ascii_key(u32::from(b'!')), Some(0x31));
         assert_eq!(ascii_key(u32::from(b' ')), Some(0x20));
+    }
+
+    #[test]
+    fn arrows_inject_as_extended_keys_not_numpad_digits() {
+        assert_eq!(virtual_key(0xff51), Some(VK_LEFT as u16));
+        assert_eq!(virtual_key(0xff52), Some(VK_UP as u16));
+        assert_eq!(virtual_key(0xff53), Some(VK_RIGHT as u16));
+        assert_eq!(virtual_key(0xff54), Some(VK_DOWN as u16));
+        assert_eq!(virtual_key(0xff96), Some(VK_LEFT as u16));
+        assert_eq!(mapped_virtual_key(0xff51), Some((VK_LEFT as u16, true)));
+        assert_eq!(mapped_virtual_key(0xff54), Some((VK_DOWN as u16, true)));
+        assert_eq!(mapped_virtual_key(0xff50), Some((VK_HOME as u16, true)));
+        assert_eq!(mapped_virtual_key(0xff57), Some((VK_END as u16, true)));
+        assert_eq!(mapped_virtual_key(0xff55), Some((VK_PRIOR as u16, true)));
+        assert_eq!(mapped_virtual_key(0xff56), Some((VK_NEXT as u16, true)));
+        assert_eq!(mapped_virtual_key(0xff63), Some((VK_INSERT as u16, true)));
+        assert_eq!(mapped_virtual_key(0xffff), Some((VK_DELETE as u16, true)));
+        assert!(extended_virtual_key(VK_LEFT as u16));
+        assert!(extended_virtual_key(VK_UP as u16));
+        assert!(extended_virtual_key(VK_RIGHT as u16));
+        assert!(extended_virtual_key(VK_DOWN as u16));
+        assert!(!extended_virtual_key(VK_RETURN as u16));
+        assert!(!extended_virtual_key(0x31));
+        // Main Enter is not extended; keypad Enter is.
+        assert_eq!(mapped_virtual_key(0xff0d), Some((VK_RETURN as u16, false)));
+        assert_eq!(mapped_virtual_key(0xff8d), Some((VK_RETURN as u16, true)));
+        // Digit keys stay unextended so they cannot be confused with arrows.
+        assert_eq!(mapped_virtual_key(u32::from(b'4')), Some((0x34, false)));
+        assert_eq!(mapped_virtual_key(u32::from(b'8')), Some((0x38, false)));
     }
 
     #[test]
