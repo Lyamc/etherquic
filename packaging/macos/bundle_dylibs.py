@@ -17,6 +17,22 @@ import subprocess
 import sys
 
 SYSTEM = ("/usr/lib/", "/System/")
+MACH_MAGIC = (
+    b"\xcf\xfa\xed\xfe",  # 64-le
+    b"\xfe\xed\xfa\xcf",  # 64-be
+    b"\xce\xfa\xed\xfe",  # 32-le
+    b"\xfe\xed\xfa\xce",  # 32-be
+    b"\xca\xfe\xba\xbe",  # fat
+    b"\xbe\xba\xfe\xca",
+)
+
+
+def is_macho(path):
+    if os.path.islink(path) or not os.path.isfile(path):
+        return False
+    with open(path, "rb") as fh:
+        magic = fh.read(4)
+    return magic in MACH_MAGIC
 
 
 def run(*args):
@@ -83,7 +99,10 @@ def main():
     # (path in bundle, directory it was built or copied from)
     queue = []
     for name in sorted(os.listdir(macos)):
-        queue.append((os.path.join(macos, name), macos))
+        path = os.path.join(macos, name)
+        if not is_macho(path):
+            continue
+        queue.append((path, macos))
     for name in sorted(os.listdir(frameworks)):
         path = os.path.join(frameworks, name)
         if os.path.isfile(path) and not os.path.islink(path):

@@ -232,6 +232,12 @@ pub fn cert_paths() -> (PathBuf, PathBuf) {
             if cert.is_file() && key.is_file() {
                 return (cert, key);
             }
+            let resources = dir.join("..").join("Resources");
+            let cert = resources.join("cert.pem");
+            let key = resources.join("key.pem");
+            if cert.is_file() && key.is_file() {
+                return (cert, key);
+            }
         }
     }
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../certs");

@@ -552,13 +552,19 @@ fn cert_paths() -> Result<(PathBuf, PathBuf), String> {
     };
     let cert = dir.join("cert.pem");
     let key = dir.join("key.pem");
-    if !cert.is_file() || !key.is_file() {
-        return Err(format!(
-            "missing cert.pem or key.pem in {} (set ETHERQUIC_CERTS, or install them next to etherquic-host.exe)",
-            dir.display()
-        ));
+    if cert.is_file() && key.is_file() {
+        return Ok((cert, key));
     }
-    Ok((cert, key))
+    let resources = dir.join("..").join("Resources");
+    let cert = resources.join("cert.pem");
+    let key = resources.join("key.pem");
+    if cert.is_file() && key.is_file() {
+        return Ok((cert, key));
+    }
+    Err(format!(
+        "missing cert.pem or key.pem in {} (set ETHERQUIC_CERTS, or install them next to etherquic-host.exe)",
+        dir.display()
+    ))
 }
 
 fn write_text(path: &Path, body: &str) -> Result<(), String> {

@@ -87,10 +87,16 @@ pub fn collect_copies(exe: &Path) -> Vec<(PathBuf, PathBuf)> {
         return copies;
     };
     for name in ["cert.pem", "key.pem", "cjxl"] {
-        let from = dir.join(name);
-        if from.is_file() {
-            copies.push((from, dest.join("MacOS").join(name)));
-        }
+        let beside = dir.join(name);
+        let resources = dir.join("..").join("Resources").join(name);
+        let from = if beside.is_file() {
+            beside
+        } else if resources.is_file() {
+            resources
+        } else {
+            continue;
+        };
+        copies.push((from, dest.join("MacOS").join(name)));
     }
     let frameworks = dir.join("..").join("Frameworks");
     if let Ok(entries) = fs::read_dir(&frameworks) {
@@ -300,6 +306,33 @@ mod tests {
         assert!(dests
             .iter()
             .any(|p| p.ends_with("/etherquic/Frameworks/libopus.0.dylib")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copies_certs_from_bundle_resources() {
+        let root = std::env::temp_dir().join(format!(
+            "eq-macos-svc-res-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let macos = root.join("Contents").join("MacOS");
+        let resources = root.join("Contents").join("Resources");
+        fs::create_dir_all(&macos).unwrap();
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(macos.join("etherquic-host"), b"bin").unwrap();
+        fs::write(resources.join("cert.pem"), b"cert").unwrap();
+        fs::write(resources.join("key.pem"), b"key").unwrap();
+        let copies = collect_copies(&macos.join("etherquic-host"));
+        let dests: Vec<String> = copies
+            .iter()
+            .map(|(_, to)| to.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(dests.iter().any(|p| p.ends_with("/etherquic/MacOS/cert.pem")));
+        assert!(dests.iter().any(|p| p.ends_with("/etherquic/MacOS/key.pem")));
         let _ = fs::remove_dir_all(root);
     }
 

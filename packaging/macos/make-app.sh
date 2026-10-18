@@ -44,8 +44,10 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resourc
 cp "$target/release/etherquic" "$app/Contents/MacOS/etherquic"
 cp "$target/release/etherquic-play" "$app/Contents/MacOS/etherquic-play"
 cp "$target/release/etherquic-host" "$app/Contents/MacOS/etherquic-host"
-cp "$root/certs/cert.pem" "$app/Contents/MacOS/cert.pem"
-cp "$root/certs/key.pem" "$app/Contents/MacOS/key.pem"
+# Certs live in Resources. codesign treats extra files in MacOS as nested
+# code and then fails on the PEM files.
+cp "$root/certs/cert.pem" "$app/Contents/Resources/cert.pem"
+cp "$root/certs/key.pem" "$app/Contents/Resources/key.pem"
 if [ -x "$brew/bin/cjxl" ]; then
     cp "$brew/bin/cjxl" "$app/Contents/MacOS/cjxl"
     for f in "$brew"/opt/jpeg-xl/LICENSE*; do
