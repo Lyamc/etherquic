@@ -913,7 +913,10 @@ fn key_from_keysym(code: u32) -> Option<Key> {
         0xff08 => Key::Backspace,
         0xff09 => Key::Tab,
         0xffff | 0xff9f => Key::Delete,
+        #[cfg(not(target_os = "macos"))]
         0xff63 | 0xff9e => Key::Insert,
+        #[cfg(target_os = "macos")]
+        0xff63 | 0xff9e => Key::Help,
         0xff51 | 0xff96 => Key::LeftArrow,
         0xff52 | 0xff97 => Key::UpArrow,
         0xff53 | 0xff98 => Key::RightArrow,
