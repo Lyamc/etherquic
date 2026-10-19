@@ -1061,12 +1061,32 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                if !crate::focus_sends_keyboard(
-                    self.focused,
-                    event.repeat,
-                    crate::snapshot(&self.view).send_keyboard,
-                ) {
+                if !crate::snapshot(&self.view).send_keyboard || !self.focused {
                     return;
+                }
+                // Auto-repeat of letters floods the host. Arrows, Home, and
+                // the other dedicated nav keys must keep repeating so a hold
+                // still moves.
+                if event.repeat && event.state == ElementState::Pressed {
+                    let nav = physical_nav_keysym(event.physical_key).is_some()
+                        || matches!(
+                            event.logical_key,
+                            Key::Named(
+                                NamedKey::ArrowLeft
+                                    | NamedKey::ArrowRight
+                                    | NamedKey::ArrowUp
+                                    | NamedKey::ArrowDown
+                                    | NamedKey::Home
+                                    | NamedKey::End
+                                    | NamedKey::PageUp
+                                    | NamedKey::PageDown
+                                    | NamedKey::Insert
+                                    | NamedKey::Delete
+                            )
+                        );
+                    if !nav {
+                        return;
+                    }
                 }
                 self.send_key(
                     &event.logical_key,
@@ -1789,9 +1809,13 @@ fn key_is_v(key: &Key) -> bool {
 }
 
 fn keysym(key: &Key, physical: PhysicalKey) -> Option<u32> {
-    // Dedicated arrows stay arrows even when the OS reports a digit (NumLock
-    // overlay). Numpad4 with NumLock on keeps physical Numpad4 and still types 4.
-    if let Some(code) = physical_nav_keysym(physical) {
+    // Dedicated cluster (ArrowLeft, Home, …) stays that cluster even when
+    // NumLock makes the OS report a digit. The numpad is a different physical
+    // key: NumLock on sends KP_4, NumLock off sends KP_Left.
+    if let Some(code) = dedicated_nav_keysym(physical) {
+        return Some(code);
+    }
+    if let Some(code) = keypad_keysym(physical, key) {
         return Some(code);
     }
     match key {
@@ -1808,7 +1832,7 @@ fn keysym(key: &Key, physical: PhysicalKey) -> Option<u32> {
     }
 }
 
-fn physical_nav_keysym(physical: PhysicalKey) -> Option<u32> {
+fn dedicated_nav_keysym(physical: PhysicalKey) -> Option<u32> {
     let PhysicalKey::Code(code) = physical else {
         return None;
     };
@@ -1825,6 +1849,41 @@ fn physical_nav_keysym(physical: PhysicalKey) -> Option<u32> {
         KeyCode::Delete => 0xffff,
         _ => return None,
     })
+}
+
+fn physical_nav_keysym(physical: PhysicalKey) -> Option<u32> {
+    dedicated_nav_keysym(physical)
+}
+
+/// Numpad physical keys. NumLock on is a KP digit. NumLock off is KP navigation.
+fn keypad_keysym(physical: PhysicalKey, key: &Key) -> Option<u32> {
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
+    let (nav, digit) = match code {
+        KeyCode::Numpad0 => (0xff9e, 0xffb0),
+        KeyCode::Numpad1 => (0xff9c, 0xffb1),
+        KeyCode::Numpad2 => (0xff99, 0xffb2),
+        KeyCode::Numpad3 => (0xff9b, 0xffb3),
+        KeyCode::Numpad4 => (0xff96, 0xffb4),
+        KeyCode::Numpad5 => (0xff9d, 0xffb5),
+        KeyCode::Numpad6 => (0xff98, 0xffb6),
+        KeyCode::Numpad7 => (0xff95, 0xffb7),
+        KeyCode::Numpad8 => (0xff97, 0xffb8),
+        KeyCode::Numpad9 => (0xff9a, 0xffb9),
+        KeyCode::NumpadDecimal => (0xff9f, 0xffae),
+        KeyCode::NumpadEnter => return Some(0xff8d),
+        KeyCode::NumpadAdd => return Some(0xffab),
+        KeyCode::NumpadSubtract => return Some(0xffad),
+        KeyCode::NumpadMultiply => return Some(0xffaa),
+        KeyCode::NumpadDivide => return Some(0xffaf),
+        _ => return None,
+    };
+    match key {
+        Key::Character(_) => Some(digit),
+        Key::Named(_) | Key::Unidentified(_) => Some(nav),
+        Key::Dead(_) => None,
+    }
 }
 
 fn named_keysym(key: NamedKey) -> Option<u32> {
@@ -1893,14 +1952,31 @@ mod tests {
             keysym(&Key::Character("2".into()), PhysicalKey::Code(KeyCode::ArrowDown)),
             Some(0xff54)
         );
-        // Numpad 4 with NumLock on still types 4.
+        let pad4 = PhysicalKey::Code(KeyCode::Numpad4);
+        assert_eq!(physical_nav_keysym(pad4), None);
+        // Numpad 4, NumLock on: keypad 4, not the top-row 4 and not Left.
+        assert_eq!(
+            keysym(&Key::Character("4".into()), pad4),
+            Some(0xffb4)
+        );
+        // Numpad 4, NumLock off: KP_Left, not the dedicated Left arrow.
+        assert_eq!(
+            keysym(&Key::Named(NamedKey::ArrowLeft), pad4),
+            Some(0xff96)
+        );
         assert_eq!(
             keysym(
-                &Key::Character("4".into()),
-                PhysicalKey::Code(KeyCode::Numpad4)
+                &Key::Named(NamedKey::ArrowUp),
+                PhysicalKey::Code(KeyCode::Numpad8)
             ),
-            Some(u32::from('4'))
+            Some(0xff97)
         );
-        assert_eq!(physical_nav_keysym(PhysicalKey::Code(KeyCode::Numpad4)), None);
+        assert_eq!(
+            keysym(
+                &Key::Character("8".into()),
+                PhysicalKey::Code(KeyCode::Numpad8)
+            ),
+            Some(0xffb8)
+        );
     }
 }

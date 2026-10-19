@@ -906,25 +906,52 @@ fn open_ei() -> Option<crate::seat_ei::EiSeat> {
     }
 }
 
+/// Linux xdotool can emit KP_Left as a keysym. Windows and macOS enigo have
+/// no keypad-left variant, so those hosts fall back to the dedicated key.
+fn keypad_key(dedicated: Key, keysym: u32) -> Key {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = dedicated;
+        Key::Other(keysym)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = keysym;
+        dedicated
+    }
+}
+
 fn key_from_keysym(code: u32) -> Option<Key> {
     Some(match code {
         0xff1b => Key::Escape,
         0xff0d | 0xff8d => Key::Return,
         0xff08 => Key::Backspace,
         0xff09 => Key::Tab,
-        0xffff | 0xff9f => Key::Delete,
+        0xffff => Key::Delete,
+        0xff9f => keypad_key(Key::Delete, 0xff9f),
         #[cfg(not(target_os = "macos"))]
-        0xff63 | 0xff9e => Key::Insert,
+        0xff63 => Key::Insert,
+        #[cfg(not(target_os = "macos"))]
+        0xff9e => keypad_key(Key::Insert, 0xff9e),
         #[cfg(target_os = "macos")]
         0xff63 | 0xff9e => Key::Help,
-        0xff51 | 0xff96 => Key::LeftArrow,
-        0xff52 | 0xff97 => Key::UpArrow,
-        0xff53 | 0xff98 => Key::RightArrow,
-        0xff54 | 0xff99 => Key::DownArrow,
-        0xff50 | 0xff95 => Key::Home,
-        0xff57 | 0xff9c => Key::End,
-        0xff55 | 0xff9a => Key::PageUp,
-        0xff56 | 0xff9b => Key::PageDown,
+        0xff51 => Key::LeftArrow,
+        0xff96 => keypad_key(Key::LeftArrow, 0xff96),
+        0xff52 => Key::UpArrow,
+        0xff97 => keypad_key(Key::UpArrow, 0xff97),
+        0xff53 => Key::RightArrow,
+        0xff98 => keypad_key(Key::RightArrow, 0xff98),
+        0xff54 => Key::DownArrow,
+        0xff99 => keypad_key(Key::DownArrow, 0xff99),
+        0xff50 => Key::Home,
+        0xff95 => keypad_key(Key::Home, 0xff95),
+        0xff57 => Key::End,
+        0xff9c => keypad_key(Key::End, 0xff9c),
+        0xff55 => Key::PageUp,
+        0xff9a => keypad_key(Key::PageUp, 0xff9a),
+        0xff56 => Key::PageDown,
+        0xff9b => keypad_key(Key::PageDown, 0xff9b),
+        0xffb0..=0xffb9 => Key::Unicode(char::from(b'0' + (code - 0xffb0) as u8)),
         0xffe1 | 0xffe2 => Key::Shift,
         0xffe3 | 0xffe4 => Key::Control,
         0xffe9 | 0xffea => Key::Alt,
@@ -970,7 +997,11 @@ mod tests {
         assert!(key_from_keysym(u32::from('\n')).is_none());
         assert!(matches!(key_from_keysym(0xff51), Some(Key::LeftArrow)));
         assert!(matches!(key_from_keysym(0xff54), Some(Key::DownArrow)));
-        assert!(matches!(key_from_keysym(0xff96), Some(Key::LeftArrow)));
         assert!(!matches!(key_from_keysym(0xff51), Some(Key::Unicode(_))));
+        assert_eq!(key_from_keysym(0xffb4), Some(Key::Unicode('4')));
+        #[cfg(target_os = "linux")]
+        assert!(matches!(key_from_keysym(0xff96), Some(Key::Other(0xff96))));
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(key_from_keysym(0xff96), Some(Key::LeftArrow)));
     }
 }

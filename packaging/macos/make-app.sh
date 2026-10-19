@@ -20,7 +20,7 @@ here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 pyrowave=${1:-}
 out=${2:-$root/dist/macos}
-# VERSION=0.1.7 overrides the root package version, like build-msi.ps1 -Version.
+# VERSION=0.1.8 overrides the root package version, like build-msi.ps1 -Version.
 version=${VERSION:-$(awk '
   /^\[package\]/ { inpkg = 1; next }
   inpkg && /^\[/ { exit }
