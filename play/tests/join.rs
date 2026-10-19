@@ -12,9 +12,7 @@ use etherquic::{install_pure_crypto, udp_server_endpoint};
 use etherquic_play::etherquic_media::host::FrameSlot;
 use etherquic_play::etherquic_media::negotiate::{Audio, Limit, Offer, Video};
 use etherquic_play::etherquic_media::{Frame, Sink};
-use etherquic_play::{
-    join_udp, parse_share, serve, udp_peer, AudioChunk, HostMedia, PlayerMedia,
-};
+use etherquic_play::{join_udp, parse_share, serve, udp_peer, AudioChunk, HostMedia, PlayerMedia};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -27,7 +25,9 @@ fn mjpeg_offer() -> Offer {
         bitrate_kbps: 0,
         failed: Vec::new(),
         knows_pyrowave_cpu: true,
+        knows_dirty_rects: true,
         look: etherquic::look::Look::Off,
+        quality: 0,
     }
 }
 
@@ -61,7 +61,11 @@ fn player_media(offer: Offer, shown: std::sync::mpsc::Sender<Frame>) -> PlayerMe
         offer,
         frames: sink,
         events,
-        look: tokio::sync::watch::channel(etherquic::look::Look::Off).1,
+        live: tokio::sync::watch::channel(etherquic_play::LiveOffer {
+            look: etherquic::look::Look::Off,
+            quality: 0,
+        })
+        .1,
     }
 }
 

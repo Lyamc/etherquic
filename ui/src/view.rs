@@ -14,12 +14,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use etherquic::discover::Found;
-use etherquic::{BackendProbe, MediaBackend};
-use etherquic_play::{
-    display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
-};
-use etherquic_play::{CursorMode, Look, ScaleMode, SizeMatch, PAD_SLOTS};
 use crate::{
     active_layer, apply_override, audio_for, audio_hint, audio_match_line, backend_hint,
     backend_label, backend_line, capture_rate, dial_target, format_mac, lanes, list_nics,
@@ -39,15 +33,21 @@ use crate::{
     Field, NetworkDriver, Part, RosterRow, Section, Settings,
 };
 use crate::{codec_choice_for, last_session, predicted_pair, Predicted};
+use etherquic::discover::Found;
+use etherquic::{BackendProbe, MediaBackend};
+use etherquic_play::{
+    display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
+};
+use etherquic_play::{CursorMode, Look, ScaleMode, SizeMatch, PAD_SLOTS};
 
 use crate::badge::os_badge;
 use crate::scan::Scan;
 use gpui::{
-    anchored, canvas, deferred, div, fill, img, point, prelude::*, px, rgb, size, AnyElement,
-    AnyView, App, AppContext, Application, Bounds, ClickEvent, Context, Div, FocusHandle,
-    FontWeight, ImageSource, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    anchored, canvas, deferred, div, fill, img, point, prelude::*, px, relative, rgb, size,
+    AnyElement, AnyView, App, AppContext, Application, Bounds, ClickEvent, Context, Div,
+    FocusHandle, FontWeight, ImageSource, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, RenderImage, ScrollHandle, ScrollWheelEvent,
+    SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 
 const BG: u32 = 0x12141a;
@@ -401,6 +401,8 @@ struct Desk {
     settings_y: Rc<Cell<f32>>,
     /// Frames left before scrolling to Settings.
     scroll_to_settings: u8,
+    /// Left edge and width of the quality slider while the pointer is down.
+    quality_drag: Option<(f32, f32)>,
 }
 
 impl Desk {
@@ -489,6 +491,7 @@ impl Desk {
             devices_loading: false,
             settings_y: Rc::new(Cell::new(0.)),
             scroll_to_settings: 0,
+            quality_drag: None,
         };
         desk.refresh_devices(cx);
         desk.apply_settings(false);
@@ -2503,7 +2506,139 @@ impl Desk {
             })
     }
 
+    fn set_quality(&mut self, quality: u8, persist: bool) {
+        let quality = quality.clamp(1, 100);
+        if self.settings.quality == quality {
+            if persist {
+                self.apply_settings(true);
+            }
+            return;
+        }
+        self.settings.quality = quality;
+        self.apply_settings(persist);
+    }
+
+    fn set_quality_from_x(&mut self, x: f32, left: f32, width: f32, persist: bool) {
+        let t = ((x - left) / width.max(1.)).clamp(0., 1.);
+        self.set_quality(((t * 99.0).round() as u8).saturating_add(1), persist);
+    }
+
+    fn picture_quality_slider(
+        &mut self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let quality = self.settings.quality.clamp(1, 100);
+        let track = Rc::new(Cell::new((0f32, 1f32)));
+        let mark = Rc::clone(&track);
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(rgb(TEXT))
+                            .child(format!("Quality {quality}%")),
+                    )
+                    .child(choice_chip(
+                        SharedString::from(format!("{id}-minus")),
+                        "−",
+                        false,
+                        48.,
+                        cx.listener(move |desk, _, _, cx| {
+                            desk.set_quality(desk.settings.quality.saturating_sub(1).max(1), true);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(choice_chip(
+                        SharedString::from(format!("{id}-plus")),
+                        "+",
+                        false,
+                        48.,
+                        cx.listener(move |desk, _, _, cx| {
+                            desk.set_quality(
+                                desk.settings.quality.saturating_add(1).min(100),
+                                true,
+                            );
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .id(id)
+                    .relative()
+                    .h(px(22.))
+                    .w_full()
+                    .rounded_full()
+                    .bg(rgb(0x1a1e27))
+                    .border_1()
+                    .border_color(rgb(CARD_EDGE))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let track = Rc::clone(&track);
+                            move |desk, ev: &MouseDownEvent, _, cx| {
+                                let (left, width) = track.get();
+                                desk.quality_drag = Some((left, width.max(1.)));
+                                desk.set_quality_from_x(
+                                    f32::from(ev.position.x),
+                                    left,
+                                    width,
+                                    false,
+                                );
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                mark.set((
+                                    f32::from(bounds.origin.x),
+                                    f32::from(bounds.size.width).max(1.),
+                                ));
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(relative(quality as f32 / 100.))
+                            .rounded_full()
+                            .bg(rgb(PLAYER_BLUE)),
+                    ),
+            )
+    }
+
     fn on_drag_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if let Some((left, width)) = self.quality_drag {
+            if ev.pressed_button != Some(MouseButton::Left) {
+                self.quality_drag = None;
+                self.apply_settings(true);
+                cx.notify();
+                return;
+            }
+            self.set_quality_from_x(f32::from(ev.position.x), left, width, false);
+            cx.notify();
+            return;
+        }
         let Some(drag) = self.drag else {
             return;
         };
@@ -2703,6 +2838,11 @@ impl Desk {
             .child(muted_line(format!(
                 "Auto uses this computer's rate when the picture is hardware-encoded. Without that, Auto is {SOFTWARE_FPS} fps. A host that does not read a rate still sends its own."
             )))
+            .child(section_label("Quality"))
+            .child(self.picture_quality_slider("conn-quality", cx))
+            .child(muted_line(
+                "Applies to an open view at once. MJPEG uses this as JPEG quality (7% is very small files). PyroWave and the other codecs scale their default bitrate from 40%.".into(),
+            ))
             .child(
                 div()
                     .flex()
@@ -3023,6 +3163,7 @@ impl Desk {
             Err(poisoned) => *poisoned.into_inner() = next,
         }
         crate::set_host_audio_device(self.settings.share_device.clone());
+        etherquic_play::etherquic_media::host::set_dirty_rects(self.settings.dirty_rects);
         etherquic::set_l2_preference(self.settings.network.l2_id());
         if persist {
             if let Err(err) = store_settings(&self.settings) {
@@ -3254,28 +3395,34 @@ impl Desk {
                 }
             })
             .child(
-                tab("via-v4", v4_label, active == 1, v4.is_some(), None).when_some(v4, |tab, ip| {
-                    tab.on_click(cx.listener(move |desk, _, _, cx| {
-                        desk.direct = Some(HostAddr::Ip {
-                            ip: IpAddr::V4(ip),
-                            port,
-                        });
-                        desk.layer = Layer::V4(ip);
-                        cx.notify();
-                    }))
-                }),
+                tab("via-v4", v4_label, active == 1, v4.is_some(), None).when_some(
+                    v4,
+                    |tab, ip| {
+                        tab.on_click(cx.listener(move |desk, _, _, cx| {
+                            desk.direct = Some(HostAddr::Ip {
+                                ip: IpAddr::V4(ip),
+                                port,
+                            });
+                            desk.layer = Layer::V4(ip);
+                            cx.notify();
+                        }))
+                    },
+                ),
             )
             .child(
-                tab("via-v6", v6_label, active == 2, v6.is_some(), None).when_some(v6, |tab, ip| {
-                    tab.on_click(cx.listener(move |desk, _, _, cx| {
-                        desk.direct = Some(HostAddr::Ip {
-                            ip: IpAddr::V6(ip),
-                            port,
-                        });
-                        desk.layer = Layer::V6(ip);
-                        cx.notify();
-                    }))
-                }),
+                tab("via-v6", v6_label, active == 2, v6.is_some(), None).when_some(
+                    v6,
+                    |tab, ip| {
+                        tab.on_click(cx.listener(move |desk, _, _, cx| {
+                            desk.direct = Some(HostAddr::Ip {
+                                ip: IpAddr::V6(ip),
+                                port,
+                            });
+                            desk.layer = Layer::V6(ip);
+                            cx.notify();
+                        }))
+                    },
+                ),
             )
     }
 
@@ -3302,6 +3449,7 @@ impl Desk {
             &applied,
             self.session_video.or(saved.video),
             self.session_audio.or(saved.audio),
+            self.settings.quality,
         )
     }
 
@@ -3962,6 +4110,8 @@ impl Desk {
         let capture_backends = self.backend_row(Part::Capture, cx);
         let capture = self.capture_fps();
         let rates = self.global_fps_row("pref-fps", cx);
+        let dirty_rects = self.settings.dirty_rects;
+        let dirty_head = self.field_head("Dirty rectangles", &[Field::DirtyRects], cx);
         let capture_body = div()
             .flex()
             .flex_col()
@@ -3972,7 +4122,20 @@ impl Desk {
             .child(rates)
             .child(muted_line(format!(
                 "This PC captures its primary monitor at {capture} fps. Auto uses the display rate when the picture this PC sends has a hardware encoder. Without one, or when the display rate cannot be read, Auto is {SOFTWARE_FPS} fps."
-            )));
+            )))
+            .child(dirty_head)
+            .child(toggle_row(
+                "dirty-rects",
+                "Send only changed tiles",
+                dirty_rects,
+                cx.listener(|desk, _, _, cx| {
+                    desk.edit_settings(|settings| settings.dirty_rects = !settings.dirty_rects);
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "When this PC hosts: skip a picture that did not change. The pointer already rides its own record. With MJPEG or MJ2K, and a player that knows dirty rectangles, only the changed tiles are encoded. Inter-frame codecs still encode a full picture when anything moved. Off by default.".into(),
+            ));
         let capture_section =
             self.section(Section::Capture, Some(capture_backends), capture_body, cx);
 
@@ -4237,6 +4400,8 @@ impl Desk {
             ));
         }
         let skip_without_hw = self.skip_without_hw;
+        let quality_head = self.field_head("Picture quality", &[Field::Quality], cx);
+        let quality_slider = self.picture_quality_slider("settings-quality", cx);
         let codecs_body = div()
             .flex()
             .flex_col()
@@ -4265,7 +4430,12 @@ impl Desk {
                 "Pyrowave library: found.".into()
             } else {
                 "Pyrowave library: not found.".into()
-            }));
+            }))
+            .child(quality_head)
+            .child(quality_slider)
+            .child(muted_line(
+                "Applies to an open view at once. MJPEG uses this percent as JPEG quality. PyroWave and H.264/H.265/AV1 scale their default bitrate from 40%.".into(),
+            ));
         let codecs = self.section(Section::Codecs, None, codecs_body, cx);
 
         // Input
@@ -4800,7 +4970,12 @@ impl Render for Desk {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|desk, _: &MouseUpEvent, _, cx| {
-                    if desk.drag.take().is_some() {
+                    let quality = desk.quality_drag.take().is_some();
+                    let bar = desk.drag.take().is_some();
+                    if quality {
+                        desk.apply_settings(true);
+                    }
+                    if quality || bar {
                         cx.notify();
                     }
                 }),
@@ -4808,7 +4983,12 @@ impl Render for Desk {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|desk, _: &MouseUpEvent, _, cx| {
-                    if desk.drag.take().is_some() {
+                    let quality = desk.quality_drag.take().is_some();
+                    let bar = desk.drag.take().is_some();
+                    if quality {
+                        desk.apply_settings(true);
+                    }
+                    if quality || bar {
                         cx.notify();
                     }
                 }),
@@ -4860,15 +5040,15 @@ impl Render for Desk {
                             )
                             .child(prefs_button(
                                 settings_open,
-                                cx.listener(|desk, _, window, cx| {
+                                cx.listener(|desk, _, _, cx| {
                                     // Open Settings and bring it into view; a second
-                                    // press closes it.
+                                    // press closes it. Scroll after layout, not here:
+                                    // request_animation_frame is only legal during paint.
                                     if desk.open.settings {
                                         desk.open.settings = false;
                                     } else {
                                         desk.open.settings = true;
                                         desk.scroll_to_settings = 2;
-                                        window.request_animation_frame();
                                     }
                                     cx.notify();
                                 }),
@@ -6159,12 +6339,7 @@ impl Render for Tip {
 }
 
 fn why_tip(why: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView {
-    move |_, cx| {
-        cx.new(|_| Tip {
-            text: why.into(),
-        })
-        .into()
-    }
+    move |_, cx| cx.new(|_| Tip { text: why.into() }).into()
 }
 
 /// One sound device in a column. The name is clipped to the column.

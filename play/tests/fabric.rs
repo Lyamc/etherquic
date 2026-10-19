@@ -32,7 +32,9 @@ fn mjpeg_offer() -> Offer {
         bitrate_kbps: 0,
         failed: Vec::new(),
         knows_pyrowave_cpu: true,
+        knows_dirty_rects: true,
         look: etherquic::look::Look::Off,
+        quality: 0,
     }
 }
 
@@ -128,7 +130,11 @@ fn player_media(offer: Offer, shown: std::sync::mpsc::Sender<Frame>) -> PlayerMe
         offer,
         frames: sink,
         events,
-        look: tokio::sync::watch::channel(etherquic::look::Look::Off).1,
+        live: tokio::sync::watch::channel(etherquic_play::LiveOffer {
+            look: etherquic::look::Look::Off,
+            quality: 0,
+        })
+        .1,
     }
 }
 

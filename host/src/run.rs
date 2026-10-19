@@ -164,7 +164,11 @@ fn spawn_discovery(
     eprint!("{note}");
     let codecs = etherquic_media::caps::summary(etherquic_media::caps::probe());
     let codecs = format!("{} {codecs}\n", utc_now());
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log_path) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
         let _ = file.write_all(codecs.as_bytes());
     }
     eprint!("{codecs}");
@@ -179,8 +183,11 @@ fn spawn_discovery(
         audio: Some(audio),
         l2_backend,
     };
-    let extras: Arc<crate::extras::HostExtras> =
-        Arc::new(crate::extras::HostExtras::start(picture, cfg.mac, Arc::clone(&stop)));
+    let extras: Arc<crate::extras::HostExtras> = Arc::new(crate::extras::HostExtras::start(
+        picture,
+        cfg.mac,
+        Arc::clone(&stop),
+    ));
     let card = Arc::new(card);
     let mut handles = Vec::new();
     for udp in [false, true] {
@@ -189,7 +196,11 @@ fn spawn_discovery(
         let extras = Arc::clone(&extras);
         let stop = Arc::clone(&stop);
         let log_path = log_path.to_path_buf();
-        let name = if udp { "etherquic-discover-udp" } else { "etherquic-discover" };
+        let name = if udp {
+            "etherquic-discover-udp"
+        } else {
+            "etherquic-discover"
+        };
         match thread::Builder::new().name(name.into()).spawn(move || {
             let nic = if nic.is_empty() { None } else { Some(nic) };
             let served = if udp {

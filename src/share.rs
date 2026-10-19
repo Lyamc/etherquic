@@ -342,7 +342,10 @@ mod tests {
         };
         assert_eq!(
             link_v4.udp_peer(),
-            Some(SocketAddr::from((Ipv4Addr::new(169, 254, 1, 1), DEFAULT_SERVICE)))
+            Some(SocketAddr::from((
+                Ipv4Addr::new(169, 254, 1, 1),
+                DEFAULT_SERVICE
+            )))
         );
     }
 }

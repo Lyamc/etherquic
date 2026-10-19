@@ -12,7 +12,10 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (w, h) = args
         .next()
-        .and_then(|s| s.split_once('x').map(|(a, b)| (a.parse().unwrap_or(1280), b.parse().unwrap_or(720))))
+        .and_then(|s| {
+            s.split_once('x')
+                .map(|(a, b)| (a.parse().unwrap_or(1280), b.parse().unwrap_or(720)))
+        })
         .unwrap_or((1280, 720));
     let count: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
     let started = Instant::now();
@@ -30,7 +33,15 @@ fn main() {
         let can_decode = probe.decodes.contains(&video.codec());
         let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let rx = received.clone();
-        let setup = EncodeSetup { video, encoder: cap.encoder.clone(), width: w, height: h, fps: 30, kbps: 0 };
+        let setup = EncodeSetup {
+            video,
+            encoder: cap.encoder.clone(),
+            width: w,
+            height: h,
+            fps: 30,
+            kbps: 0,
+            quality: 0,
+        };
         let sink: etherquic_media::Sink<Vec<u8>> = Arc::new(move |b: Vec<u8>| {
             rx.lock().unwrap().push(b);
             true
@@ -51,7 +62,10 @@ fn main() {
             }
         }
         let enc_time = t.elapsed();
-        if video != Video::Mjpeg && video.codec() != etherquic_media::negotiate::VideoCodec::Pyrowave {
+        if video != Video::Mjpeg
+            && video != Video::Mj2k
+            && video.codec() != etherquic_media::negotiate::VideoCodec::Pyrowave
+        {
             std::thread::sleep(Duration::from_millis(800));
         }
         drop(enc);
@@ -100,5 +114,9 @@ fn moving(w: u32, h: u32, i: usize) -> Frame {
             rgb[p + 2] = (((x ^ y) + i) & 255) as u8;
         }
     }
-    Frame { width: w, height: h, rgb }
+    Frame {
+        width: w,
+        height: h,
+        rgb,
+    }
 }

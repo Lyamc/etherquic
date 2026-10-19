@@ -12,7 +12,9 @@ use std::process::Command;
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let svg_path = manifest_dir.join("assets").join("etherquic.svg");
-    let manifest_path = manifest_dir.join("resources").join("etherquic.manifest.xml");
+    let manifest_path = manifest_dir
+        .join("resources")
+        .join("etherquic.manifest.xml");
     println!("cargo:rerun-if-changed={}", svg_path.display());
     println!("cargo:rerun-if-changed={}", manifest_path.display());
 

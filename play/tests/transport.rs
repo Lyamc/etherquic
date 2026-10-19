@@ -176,11 +176,17 @@ async fn exchange(
                 bitrate_kbps: 0,
                 failed: Vec::new(),
                 knows_pyrowave_cpu: true,
+                knows_dirty_rects: true,
                 look: etherquic::look::Look::Off,
+                quality: 0,
             },
             frames: sink,
             events,
-            look: tokio::sync::watch::channel(etherquic::look::Look::Off).1,
+            live: tokio::sync::watch::channel(etherquic_play::LiveOffer {
+                look: etherquic::look::Look::Off,
+                quality: 0,
+            })
+            .1,
         };
         play(conn, media, heard_tx, player_rx, None).await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())

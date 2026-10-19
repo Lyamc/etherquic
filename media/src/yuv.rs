@@ -79,7 +79,11 @@ pub fn i420_to_rgb(planes: &I420) -> Frame {
             rgb[i + 2] = clamp(y + ((454 * u + 128) >> 8));
         }
     }
-    Frame { width: w as u32, height: h as u32, rgb }
+    Frame {
+        width: w as u32,
+        height: h as u32,
+        rgb,
+    }
 }
 
 /// Nearest-neighbour shrink so the width is at most `max_width` (and the
@@ -113,7 +117,11 @@ pub fn fit(frame: &Frame, max_width: u32, max_height: u32) -> Frame {
             rgb[d..d + 3].copy_from_slice(&frame.rgb[s..s + 3]);
         }
     }
-    Frame { width: w, height: h, rgb }
+    Frame {
+        width: w,
+        height: h,
+        rgb,
+    }
 }
 
 #[cfg(test)]
@@ -131,22 +139,43 @@ mod tests {
         // 4 solid 2x2 blocks laid out as a 8x2 picture would mix colours, so
         // test each block as its own 2x2 frame.
         for block in rgb.chunks_exact(12) {
-            let frame = Frame { width: 2, height: 2, rgb: block.to_vec() };
+            let frame = Frame {
+                width: 2,
+                height: 2,
+                rgb: block.to_vec(),
+            };
             let mut planes = I420::new(2, 2);
             rgb_to_i420(&frame, &mut planes);
             let back = i420_to_rgb(&planes);
             for (a, b) in frame.rgb.iter().zip(back.rgb.iter()) {
-                assert!((*a as i32 - *b as i32).abs() <= 3, "{:?} -> {:?}", frame.rgb, back.rgb);
+                assert!(
+                    (*a as i32 - *b as i32).abs() <= 3,
+                    "{:?} -> {:?}",
+                    frame.rgb,
+                    back.rgb
+                );
             }
         }
     }
 
     #[test]
     fn fit_keeps_even_sides() {
-        let frame = Frame { width: 1921, height: 1081, rgb: vec![7; 1921 * 1081 * 3] };
+        let frame = Frame {
+            width: 1921,
+            height: 1081,
+            rgb: vec![7; 1921 * 1081 * 3],
+        };
         let out = fit(&frame, 1280, 0);
         assert_eq!((out.width, out.height), (1280, 720));
-        let same = fit(&Frame { width: 4, height: 2, rgb: vec![0; 24] }, 1280, 0);
+        let same = fit(
+            &Frame {
+                width: 4,
+                height: 2,
+                rgb: vec![0; 24],
+            },
+            1280,
+            0,
+        );
         assert_eq!((same.width, same.height), (4, 2));
     }
 }

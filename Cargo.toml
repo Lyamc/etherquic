@@ -40,7 +40,7 @@ blade-graphics = { path = "vendor/blade-graphics" }
 
 [package]
 name = "etherquic"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"

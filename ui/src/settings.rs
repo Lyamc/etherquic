@@ -89,6 +89,8 @@ pub enum Field {
     ClipboardAsKeystrokes,
     Cursor,
     Look,
+    Quality,
+    DirtyRects,
     PadSlots,
     OutputDevice,
     ShareDevice,
@@ -97,10 +99,12 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 13] = [
+    pub const ALL: [Field; 15] = [
         Self::Scale,
         Self::SizeMatch,
         Self::Look,
+        Self::Quality,
+        Self::DirtyRects,
         Self::SendKeyboard,
         Self::SendMouse,
         Self::SendPads,
@@ -116,6 +120,8 @@ impl Field {
     pub fn section(self) -> Section {
         match self {
             Self::Scale | Self::SizeMatch | Self::Look => Section::Appearance,
+            Self::Quality => Section::Codecs,
+            Self::DirtyRects => Section::Capture,
             Self::SendKeyboard
             | Self::SendMouse
             | Self::SendPads
@@ -141,6 +147,12 @@ pub struct Settings {
     pub cursor: CursorMode,
     /// Host paints this before it encodes. Saved as `look=`.
     pub look: Look,
+    /// Picture quality 1–100. MJPEG JPEG quality, and a scale on other codecs'
+    /// default bitrate. Saved as `quality=`.
+    pub quality: u8,
+    /// When this PC hosts: skip unchanged pictures, and send MJPEG/MJ2K dirty
+    /// tiles. Saved as `dirty-rects=`.
+    pub dirty_rects: bool,
     pub pad_slots: Vec<PadSlot>,
     /// Where remote sound plays. `None` is the system default.
     pub output_device: Option<String>,
@@ -166,6 +178,8 @@ impl Default for Settings {
             clipboard_as_keystrokes: false,
             cursor: view.cursor,
             look: view.look,
+            quality: view.quality,
+            dirty_rects: false,
             pad_slots: view.pad_slots,
             output_device: view.output_device,
             share_device: None,
@@ -187,6 +201,7 @@ impl Settings {
             send_pads: self.send_pads,
             cursor: self.cursor,
             look: self.look,
+            quality: self.quality,
             pad_slots: self.pad_slots.clone(),
             output_device: self.output_device.clone(),
         }
@@ -216,6 +231,8 @@ impl Settings {
             }
             Field::Cursor => self.cursor == other.cursor,
             Field::Look => self.look == other.look,
+            Field::Quality => self.quality == other.quality,
+            Field::DirtyRects => self.dirty_rects == other.dirty_rects,
             Field::PadSlots => self.pad_slots == other.pad_slots,
             Field::OutputDevice => self.output_device == other.output_device,
             Field::ShareDevice => self.share_device == other.share_device,
@@ -237,6 +254,8 @@ impl Settings {
             }
             Field::Cursor => self.cursor = from.cursor,
             Field::Look => self.look = from.look,
+            Field::Quality => self.quality = from.quality,
+            Field::DirtyRects => self.dirty_rects = from.dirty_rects,
             Field::PadSlots => self.pad_slots = from.pad_slots.clone(),
             Field::OutputDevice => self.output_device = from.output_device.clone(),
             Field::ShareDevice => self.share_device = from.share_device.clone(),
@@ -334,10 +353,12 @@ fn clean(text: &str) -> String {
 
 pub fn render_settings(settings: &Settings) -> String {
     let mut out = format!(
-        "scale={}\nsize-match={}\nlook={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nhost-service-prompt={}\n",
+        "scale={}\nsize-match={}\nlook={}\nquality={}\ndirty-rects={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nhost-service-prompt={}\n",
         settings.scale.token(),
         settings.size_match.token(),
         settings.look.token(),
+        settings.quality,
+        flag(settings.dirty_rects),
         flag(settings.send_keyboard),
         flag(settings.send_mouse),
         flag(settings.send_pads),
@@ -381,6 +402,14 @@ pub fn parse_settings(text: &str) -> Settings {
             "clipboard-as-keystrokes" => settings.clipboard_as_keystrokes = value != "0",
             "cursor" => settings.cursor = CursorMode::from_token(value).unwrap_or(settings.cursor),
             "look" => settings.look = Look::from_token(value).unwrap_or(settings.look),
+            "dirty-rects" => settings.dirty_rects = value != "0",
+            "quality" => {
+                if let Ok(q) = value.parse::<u8>() {
+                    if (1..=100).contains(&q) {
+                        settings.quality = q;
+                    }
+                }
+            }
             "output-device" => settings.output_device = device(),
             "share-device" => settings.share_device = device(),
             "network" => {
@@ -556,6 +585,8 @@ mod tests {
             clipboard_as_keystrokes: true,
             cursor: CursorMode::Copy,
             look: Look::Poster,
+            quality: 7,
+            dirty_rects: true,
             output_device: Some("Speakers (USB)".into()),
             share_device: Some("Line In".into()),
             network: NetworkDriver::Npcap,
@@ -644,6 +675,8 @@ mod tests {
             clipboard_as_keystrokes: true,
             cursor: CursorMode::Remote,
             look: Look::Pico8,
+            quality: 7,
+            dirty_rects: true,
             pad_slots: vec![PadSlot {
                 name: "Pad".into(),
                 slot: 1,
@@ -698,9 +731,9 @@ mod tests {
             for wayland in [false, true] {
                 let list = backends(part, wayland);
                 if part == Part::Network && etherquic::l2_unavailable_reason().is_some() {
-                    assert!(list.iter().all(|backend| {
-                        matches!(backend.state, BackendState::Unavailable(_))
-                    }));
+                    assert!(list
+                        .iter()
+                        .all(|backend| { matches!(backend.state, BackendState::Unavailable(_)) }));
                     continue;
                 }
                 assert!(list.iter().any(|backend| matches!(

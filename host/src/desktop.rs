@@ -22,43 +22,45 @@ use winapi::shared::mmreg::{
     WAVE_FORMAT_PCM,
 };
 use winapi::shared::windef::{HDESK, HGDIOBJ, POINT};
-use winapi::um::d3d11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-};
-use winapi::um::d3dcommon::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use winapi::um::audioclient::{
-    IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED,
+    IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED,
 };
 use winapi::um::audiosessiontypes::{AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK};
-use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL};
+use winapi::um::combaseapi::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+};
+use winapi::um::d3d11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
+use winapi::um::d3dcommon::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::mmdeviceapi::{
     eConsole, eRender, CLSID_MMDeviceEnumerator, IMMDevice, IMMDeviceEnumerator,
 };
+use winapi::um::processthreadsapi::GetCurrentThreadId;
 use winapi::um::unknwnbase::IUnknown;
+use winapi::um::winbase::SetThreadExecutionState;
 use winapi::um::wingdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
-use winapi::um::processthreadsapi::GetCurrentThreadId;
-use winapi::um::winbase::SetThreadExecutionState;
 use winapi::um::winnt::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, HANDLE};
 use winapi::um::winuser::{
     CloseDesktop, GetCursorPos, GetDC, GetSystemMetrics, GetThreadDesktop,
     GetUserObjectInformationW, MapVirtualKeyW, OpenInputDesktop, ReleaseDC, SendInput,
-    SetCursorPos, SetThreadDesktop, INPUT, INPUT_KEYBOARD, UOI_NAME,
-    INPUT_MOUSE, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
-    MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, SM_CXSCREEN, SM_CYSCREEN,
-    VK_BACK, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
-    VK_ADD, VK_CLEAR, VK_DECIMAL, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT,
-    VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6,
-    VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR, VK_RCONTROL,
-    VK_RETURN, VK_RIGHT, VK_RMENU, VK_RWIN, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT,
-    VK_TAB, VK_UP,
+    SetCursorPos, SetThreadDesktop, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC_EX,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, SM_CXSCREEN, SM_CYSCREEN, UOI_NAME, VK_ADD, VK_BACK,
+    VK_CLEAR, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1,
+    VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0,
+    VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
+    VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RWIN, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use winapi::Interface;
 
@@ -112,7 +114,13 @@ pub enum Recover {
 }
 
 /// Pure decision so the policy is testable without a desktop.
-pub fn recover_step(moved: bool, stale: u32, gdi_only: bool, since_retry: Duration, wants_dup: bool) -> Recover {
+pub fn recover_step(
+    moved: bool,
+    stale: u32,
+    gdi_only: bool,
+    since_retry: Duration,
+    wants_dup: bool,
+) -> Recover {
     if moved {
         Recover::NewDesktop
     } else if stale >= STALE_LIMIT {
@@ -224,7 +232,8 @@ impl ScreenCapture {
                 self.bitblt_or_held()
             }
             Err(PumpError::Failed(error)) => {
-                let broken = error.starts_with("AcquireNextFrame") || error.starts_with("ReleaseFrame");
+                let broken =
+                    error.starts_with("AcquireNextFrame") || error.starts_with("ReleaseFrame");
                 if broken {
                     self.drop_to_gdi(error);
                 } else {
@@ -380,7 +389,8 @@ unsafe fn desktop_name(desk: HDESK) -> Option<String> {
 
 /// Desktop the calling thread is on, for logging.
 pub fn thread_desktop_name() -> String {
-    unsafe { desktop_name(GetThreadDesktop(GetCurrentThreadId())) }.unwrap_or_else(|| "unknown".into())
+    unsafe { desktop_name(GetThreadDesktop(GetCurrentThreadId())) }
+        .unwrap_or_else(|| "unknown".into())
 }
 
 /// Move the calling thread onto the desktop that receives input.
@@ -603,7 +613,10 @@ unsafe fn open_from_factory() -> Result<Duplication, String> {
             break;
         }
         if hr < 0 || adapter.is_null() {
-            errors.push(format!("adapter {adapter_index}: EnumAdapters {}", hresult(hr)));
+            errors.push(format!(
+                "adapter {adapter_index}: EnumAdapters {}",
+                hresult(hr)
+            ));
             break;
         }
         match duplicate_on_adapter(adapter) {
@@ -659,7 +672,13 @@ unsafe fn duplicate_with(
     let mut failure = "no outputs".to_string();
     for require_origin in [true, false] {
         match first_duplication(adapter, device, require_origin) {
-            Ok(Some(output)) => return Ok(Duplication { device, context, output }),
+            Ok(Some(output)) => {
+                return Ok(Duplication {
+                    device,
+                    context,
+                    output,
+                })
+            }
             Ok(None) => {}
             Err(error) => failure = error,
         }
@@ -1379,7 +1398,12 @@ unsafe fn init_loopback(
     Err("loopback initialize failed".into())
 }
 
-fn copy_packet(data: *mut u8, frames: usize, flags: DWORD, audio: &Loopback) -> Result<AudioChunk, String> {
+fn copy_packet(
+    data: *mut u8,
+    frames: usize,
+    flags: DWORD,
+    audio: &Loopback,
+) -> Result<AudioChunk, String> {
     let channels = audio.channels as usize;
     let samples = frames.saturating_mul(channels);
     if samples == 0 {
@@ -1392,7 +1416,12 @@ fn copy_packet(data: *mut u8, frames: usize, flags: DWORD, audio: &Loopback) -> 
             (_, 16) => 2,
             (_, 24) => 3,
             (_, 32) => 4,
-            _ => return Err(format!("unsupported audio format tag {} bits {}", audio.tag, audio.bits)),
+            _ => {
+                return Err(format!(
+                    "unsupported audio format tag {} bits {}",
+                    audio.tag, audio.bits
+                ))
+            }
         };
         let bytes = frames.saturating_mul(channels).saturating_mul(width);
         let src = unsafe { std::slice::from_raw_parts(data, bytes) };
@@ -1465,20 +1494,32 @@ mod tests {
         ascii_key, decode_samples, extended_virtual_key, float_to_i16, inject_plan,
         mapped_virtual_key, recover_step, virtual_key, Recover, STALE_LIMIT,
     };
+    use std::time::Duration;
     use winapi::um::winuser::{
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VK_DELETE, VK_DOWN, VK_END,
         VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_UP,
     };
-    use std::time::Duration;
 
     #[test]
     fn capture_rebuilds_after_a_desktop_switch_or_a_stale_run() {
         let soon = Duration::from_millis(100);
         let late = Duration::from_secs(6);
-        assert_eq!(recover_step(true, 0, false, soon, true), Recover::NewDesktop);
-        assert_eq!(recover_step(false, STALE_LIMIT, false, soon, true), Recover::Stale);
-        assert_eq!(recover_step(false, STALE_LIMIT - 1, false, late, true), Recover::Nothing);
-        assert_eq!(recover_step(false, 0, true, late, true), Recover::RetryDuplication);
+        assert_eq!(
+            recover_step(true, 0, false, soon, true),
+            Recover::NewDesktop
+        );
+        assert_eq!(
+            recover_step(false, STALE_LIMIT, false, soon, true),
+            Recover::Stale
+        );
+        assert_eq!(
+            recover_step(false, STALE_LIMIT - 1, false, late, true),
+            Recover::Nothing
+        );
+        assert_eq!(
+            recover_step(false, 0, true, late, true),
+            Recover::RetryDuplication
+        );
         assert_eq!(recover_step(false, 0, true, soon, true), Recover::Nothing);
         assert_eq!(recover_step(false, 0, true, late, false), Recover::Nothing);
     }
@@ -1520,8 +1561,14 @@ mod tests {
         assert_eq!(mapped_virtual_key(0xff98), Some((VK_RIGHT as u16, false)));
         assert_eq!(mapped_virtual_key(0xff99), Some((VK_DOWN as u16, false)));
         // Numpad digits (NumLock on) are VK_NUMPADn, not top-row 4/8.
-        assert_eq!(mapped_virtual_key(0xffb4), Some((VK_NUMPAD0 as u16 + 4, false)));
-        assert_eq!(mapped_virtual_key(0xffb8), Some((VK_NUMPAD0 as u16 + 8, false)));
+        assert_eq!(
+            mapped_virtual_key(0xffb4),
+            Some((VK_NUMPAD0 as u16 + 4, false))
+        );
+        assert_eq!(
+            mapped_virtual_key(0xffb8),
+            Some((VK_NUMPAD0 as u16 + 8, false))
+        );
         assert!(extended_virtual_key(VK_LEFT as u16));
         assert!(extended_virtual_key(VK_UP as u16));
         assert!(extended_virtual_key(VK_RIGHT as u16));

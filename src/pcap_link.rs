@@ -498,10 +498,7 @@ mod tests {
         assert_eq!(reason_for(HostOs::Linux, true), None);
         assert_eq!(reason_for(HostOs::Windows, false), None);
         assert_eq!(reason_for(HostOs::Mac, true), None);
-        assert_eq!(
-            reason_for(HostOs::Mac, false),
-            Some("macOS BPF needs root")
-        );
+        assert_eq!(reason_for(HostOs::Mac, false), Some("macOS BPF needs root"));
     }
 
     #[test]

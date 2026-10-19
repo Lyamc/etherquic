@@ -3,8 +3,8 @@
 //! Every codec here is real end to end: PyroWave through `libpyrowave-shared`
 //! (CPU buffers in and out, Vulkan compute inside) or, on Windows without a
 //! hardware Vulkan device, `pyrowave_d3d11.dll`, Opus through libopus,
-//! H.264, H.265 and AV1 through an `ffmpeg` child process, and MJPEG and PCM
-//! in Rust. [`caps`] runs a test encode or decode before a codec is offered,
+//! H.264, H.265 and AV1 through an `ffmpeg` child process, and MJPEG, MJ2K
+//! and PCM in Rust. [`caps`] runs a test encode or decode before a codec is offered,
 //! so nothing is advertised that cannot run on this computer.
 //!
 //! FFI to the C libraries is the only `unsafe` in etherquic; it sits in
@@ -13,9 +13,11 @@
 
 pub mod audio;
 pub mod caps;
+pub mod dirty;
 pub mod ffmpeg;
 pub mod host;
 pub mod jpeg;
+pub mod jpeg2000;
 pub mod opus;
 pub mod player;
 pub mod pyrowave;
@@ -85,7 +87,11 @@ impl Pcm {
             .chunks_exact(2)
             .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        Ok(Pcm { sample_rate, channels, samples })
+        Ok(Pcm {
+            sample_rate,
+            channels,
+            samples,
+        })
     }
 }
 

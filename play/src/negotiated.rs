@@ -16,6 +16,8 @@ pub struct CodecChoice {
     /// Largest picture width to ask for. Zero is the host's choice.
     pub max_width: u32,
     pub bitrate_kbps: u32,
+    /// Picture quality 1–100. Zero is the host default (40).
+    pub quality: u8,
 }
 
 pub fn video_row(pref: PicturePref) -> Video {
@@ -56,6 +58,7 @@ impl CodecChoice {
                 fps: 0,
             },
             self.bitrate_kbps,
+            self.quality,
         )
     }
 
@@ -81,6 +84,9 @@ impl CodecChoice {
         }
         if self.bitrate_kbps > 0 {
             out.extend(["--bitrate".to_string(), self.bitrate_kbps.to_string()]);
+        }
+        if self.quality > 0 {
+            out.extend(["--quality".to_string(), self.quality.to_string()]);
         }
         out
     }

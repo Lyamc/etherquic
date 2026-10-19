@@ -76,7 +76,7 @@ The host opens the picture stream and the audio stream before it accepts input, 
 
 After the kind, every record is a little-endian `u32` length and then that many bytes. A record over 12 MiB is rejected. A clean end of stream before the next length finishes that stream.
 
-The live path negotiates PyroWave, MJPEG, or H.264. H.265 and AV1 hardware sit ahead of those in the preference list, and CPU PyroWave sits last. When both ends agree on ALPN `etherquic/2`, the picture stream is `EVI2` and the audio stream is `EAU2`: a config record, then coded bytes. Quality applies to MJPEG.
+The live path negotiates PyroWave, MJPEG, or H.264. H.265 and AV1 hardware sit ahead of those in the preference list, and CPU PyroWave sits last. When both ends agree on ALPN `etherquic/2`, the picture stream is `EVI2` and the audio stream is `EAU2`: a config record, then coded bytes. Quality applies to MJPEG. A player that lists `knows dirty-rects` can receive type-`R` patch records for MJPEG and MJ2K when the host has dirty rectangles on. An unchanged picture is not encoded; the pointer still rides its own cursor record.
 
 An original `EVID` payload is a JPEG. The decoder treats `FF D8` as JPEG and an `EINT` prefix as an intra frame. An original `EAUD` payload is a little-endian sample rate (`u32`), a channel count (`u16`), and interleaved `i16` samples.
 

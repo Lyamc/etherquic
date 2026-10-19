@@ -633,13 +633,28 @@ async fn connect_player(
     let negotiates = etherquic::negotiates(&conn);
     let mut offer = connect.codecs.offer();
     let view_look = connect.view.clone();
-    let initial_look = crate::snapshot(&view_look).look;
-    offer.look = initial_look;
-    let (look_tx, look_rx) = tokio::sync::watch::channel(initial_look);
+    let initial = crate::snapshot(&view_look);
+    offer.look = initial.look;
+    if connect.codecs.quality > 0 {
+        offer.quality = connect.codecs.quality;
+    } else {
+        offer.quality = initial.quality;
+    }
+    let (live_tx, live_rx) = tokio::sync::watch::channel(crate::LiveOffer {
+        look: offer.look,
+        quality: offer.quality,
+    });
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            if look_tx.send(crate::snapshot(&view_look).look).is_err() {
+            let snap = crate::snapshot(&view_look);
+            if live_tx
+                .send(crate::LiveOffer {
+                    look: snap.look,
+                    quality: snap.quality,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -648,10 +663,11 @@ async fn connect_player(
         let video: Vec<&str> = offer.video.iter().map(|row| row.token()).collect();
         let audio: Vec<&str> = offer.audio.iter().map(|row| row.token()).collect();
         eprintln!(
-            "etherquic-play: offer video [{}] audio [{}] look {}",
+            "etherquic-play: offer video [{}] audio [{}] look {} quality {}",
             video.join(" "),
             audio.join(" "),
-            offer.look.token()
+            offer.look.token(),
+            offer.quality
         );
     } else {
         eprintln!("etherquic-play: the host does not negotiate codecs; MJPEG and PCM");
@@ -672,7 +688,7 @@ async fn connect_player(
         offer,
         frames: sink,
         events: event_tx,
-        look: look_rx,
+        live: live_rx,
     };
     let mut session =
         tokio::spawn(async move { play_session(conn, media, audio_tx, input, acks, pipes).await });
@@ -1944,26 +1960,20 @@ mod tests {
         assert_eq!(named_keysym(NamedKey::ArrowDown), Some(0xff54));
         let left = PhysicalKey::Code(KeyCode::ArrowLeft);
         assert_eq!(physical_nav_keysym(left), Some(0xff51));
+        assert_eq!(keysym(&Key::Character("4".into()), left), Some(0xff51));
         assert_eq!(
-            keysym(&Key::Character("4".into()), left),
-            Some(0xff51)
-        );
-        assert_eq!(
-            keysym(&Key::Character("2".into()), PhysicalKey::Code(KeyCode::ArrowDown)),
+            keysym(
+                &Key::Character("2".into()),
+                PhysicalKey::Code(KeyCode::ArrowDown)
+            ),
             Some(0xff54)
         );
         let pad4 = PhysicalKey::Code(KeyCode::Numpad4);
         assert_eq!(physical_nav_keysym(pad4), None);
         // Numpad 4, NumLock on: keypad 4, not the top-row 4 and not Left.
-        assert_eq!(
-            keysym(&Key::Character("4".into()), pad4),
-            Some(0xffb4)
-        );
+        assert_eq!(keysym(&Key::Character("4".into()), pad4), Some(0xffb4));
         // Numpad 4, NumLock off: KP_Left, not the dedicated Left arrow.
-        assert_eq!(
-            keysym(&Key::Named(NamedKey::ArrowLeft), pad4),
-            Some(0xff96)
-        );
+        assert_eq!(keysym(&Key::Named(NamedKey::ArrowLeft), pad4), Some(0xff96));
         assert_eq!(
             keysym(
                 &Key::Named(NamedKey::ArrowUp),

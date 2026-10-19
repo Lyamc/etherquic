@@ -67,7 +67,8 @@ pub use picture_hub::{
 pub use pipes::Pipes;
 pub use pointer::{ei_absolute, place_pointer, wayland_wheel, PointerPlace};
 pub use session::{
-    play, play_session, resample, serve, serve_session, AudioChunk, HostMedia, PlayerMedia,
+    play, play_session, resample, serve, serve_session, AudioChunk, HostMedia, LiveOffer,
+    PlayerMedia,
 };
 pub use svc::{drop_jitter_enhancement, SvcLayer};
 pub use transfer::{submit_file, NamedFile};

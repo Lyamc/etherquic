@@ -681,8 +681,10 @@ fn android_join(
         }
     };
     let offer = codecs.offer();
-    let look = offer.look;
-    let (_look_tx, look_rx) = tokio::sync::watch::channel(look);
+    let (_live_tx, live_rx) = tokio::sync::watch::channel(etherquic_play::LiveOffer {
+        look: offer.look,
+        quality: offer.quality,
+    });
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<etherquic_play::AudioChunk>(8);
     let (_input_tx, input_rx) = tokio::sync::mpsc::channel(8);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -692,16 +694,12 @@ fn android_join(
         offer,
         frames,
         events: event_tx,
-        look: look_rx,
+        live: live_rx,
     };
     let stop_flag = Arc::clone(&stop);
     let outcome = runtime.block_on(async move {
-        tokio::spawn(async move {
-            while audio_rx.recv().await.is_some() {}
-        });
-        tokio::spawn(async move {
-            while event_rx.recv().await.is_some() {}
-        });
+        tokio::spawn(async move { while audio_rx.recv().await.is_some() {} });
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
         etherquic_play::join_udp(addr, media, audio_tx, input_rx, stop_flag).await
     });
     match outcome {
@@ -710,7 +708,10 @@ fn android_join(
                 write_status(&status, "The view closed.");
             }
         }
-        Err(err) => write_status(&status, etherquic_play::session_end_status(&err.to_string())),
+        Err(err) => write_status(
+            &status,
+            etherquic_play::session_end_status(&err.to_string()),
+        ),
     }
     let _ = peer;
 }

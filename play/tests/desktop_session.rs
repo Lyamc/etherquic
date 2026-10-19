@@ -138,6 +138,7 @@ fn host_desktop_and_connect_view_carry_file_clipboard_keys_and_chat() {
                     audio_pin: Some(AudioId::Pcm),
                     max_width: 320,
                     bitrate_kbps: 0,
+                    quality: 0,
                 },
                 picture: Arc::new(AtomicU64::new(0)),
             },

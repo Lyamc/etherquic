@@ -42,14 +42,29 @@ unsafe fn cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
 fn android_main(app: android_activity::AndroidApp) {
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
+            .with_max_level(log::LevelFilter::Debug)
             .with_tag("etherquic"),
     );
+    let _ = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("etherquic panic: {info}");
+        if let Some(location) = info.location() {
+            log::error!(
+                "etherquic panic at {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
+        }
+    }));
     log::info!("etherquic play starting");
     wait_for_window(&app);
     log::info!("native window ready, starting desk");
     etherquic_ui::bind_android_app(app);
-    etherquic_ui::run();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(etherquic_ui::run)) {
+        Ok(()) => log::info!("desk exited"),
+        Err(_) => log::error!("desk panicked"),
+    }
 }
 
 #[cfg(target_os = "android")]

@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use crate::negotiate::{Audio, EncodeCap, HostCaps, Limit, Video, VideoCodec};
-use crate::{ffmpeg, opus, pyrowave, Frame};
+use crate::{ffmpeg, jpeg2000, opus, pyrowave, Frame};
 
 /// Why a codec is missing, for logs and the Settings panel.
 #[derive(Clone, Debug, Default)]
@@ -26,9 +26,17 @@ fn test_frame(width: u32, height: u32) -> Frame {
 
 fn limit_for(name: &str) -> Limit {
     if name.contains("264") {
-        Limit { width: 4096, height: 4096, fps: 0 }
+        Limit {
+            width: 4096,
+            height: 4096,
+            fps: 0,
+        }
     } else {
-        Limit { width: 8192, height: 8192, fps: 0 }
+        Limit {
+            width: 8192,
+            height: 8192,
+            fps: 0,
+        }
     }
 }
 
@@ -60,12 +68,22 @@ fn run_probe() -> Probe {
                     d.name,
                     if d.cpu { "CPU" } else { "GPU" }
                 )),
-                None => probe.notes.push("pyrowave vulkan: device type unknown, counted as GPU".into()),
+                None => probe
+                    .notes
+                    .push("pyrowave vulkan: device type unknown, counted as GPU".into()),
             }
             probe.caps.video.push(EncodeCap {
-                video: if cpu { Video::PyrowaveCpu } else { Video::Pyrowave },
+                video: if cpu {
+                    Video::PyrowaveCpu
+                } else {
+                    Video::Pyrowave
+                },
                 encoder: "pyrowave".into(),
-                limit: Limit { width: 7680, height: 4320, fps: 0 },
+                limit: Limit {
+                    width: 7680,
+                    height: 4320,
+                    fps: 0,
+                },
             });
             match pyrowave::Decoder::new(256, 144).and_then(|mut dec| dec.decode(&record)) {
                 Ok(_) => probe.decodes.push(VideoCodec::Pyrowave),
@@ -100,9 +118,15 @@ fn run_probe() -> Probe {
                 probe.caps.video.push(EncodeCap {
                     video: Video::Pyrowave,
                     encoder: "pyrowave-d3d11".into(),
-                    limit: Limit { width: 7680, height: 4320, fps: 0 },
+                    limit: Limit {
+                        width: 7680,
+                        height: 4320,
+                        fps: 0,
+                    },
                 });
-                if !probe.decodes.contains(&VideoCodec::Pyrowave) && pyrowave::Decoder::new(256, 144).is_ok() {
+                if !probe.decodes.contains(&VideoCodec::Pyrowave)
+                    && pyrowave::Decoder::new(256, 144).is_ok()
+                {
                     probe.decodes.push(VideoCodec::Pyrowave);
                 }
             }
@@ -111,6 +135,19 @@ fn run_probe() -> Probe {
     }
     #[cfg(not(windows))]
     let _ = try_d3d11;
+    match jpeg2000::encode(&test_frame(64, 48), crate::negotiate::DEFAULT_QUALITY)
+        .and_then(|record| jpeg2000::decode(&record).map(|_| record))
+    {
+        Ok(_) => {
+            probe.caps.video.push(EncodeCap {
+                video: Video::Mj2k,
+                encoder: "jpeg2000".into(),
+                limit: Limit::NONE,
+            });
+            probe.decodes.push(VideoCodec::Mj2k);
+        }
+        Err(error) => probe.notes.push(format!("mj2k: {error}")),
+    }
     match ffmpeg::binary() {
         Some(path) => {
             for spec in ffmpeg::working_encoders() {
@@ -128,8 +165,13 @@ fn run_probe() -> Probe {
         None => probe.notes.push("ffmpeg: not found".into()),
     }
     // Keep the host list in preference order.
-    probe.caps.video.sort_by_key(|cap| Video::ALL.iter().position(|v| *v == cap.video));
-    match opus::Encoder::new(2, opus::DEFAULT_BITRATE).and_then(|mut enc| enc.push(&[0i16; opus::FRAME * 2])) {
+    probe
+        .caps
+        .video
+        .sort_by_key(|cap| Video::ALL.iter().position(|v| *v == cap.video));
+    match opus::Encoder::new(2, opus::DEFAULT_BITRATE)
+        .and_then(|mut enc| enc.push(&[0i16; opus::FRAME * 2]))
+    {
         Ok(_) => probe.caps.audio.insert(0, Audio::Opus),
         Err(error) => probe.notes.push(format!("opus encode: {error}")),
     }
@@ -155,7 +197,9 @@ pub fn ready() -> Option<&'static Probe> {
 /// The host caps text for the discovery capability block. Empty until the
 /// probe has finished, so an offer never waits on it.
 pub fn caps_text_if_ready() -> String {
-    ready().map(|probe| probe.caps.to_text()).unwrap_or_default()
+    ready()
+        .map(|probe| probe.caps.to_text())
+        .unwrap_or_default()
 }
 
 /// Start the probe on a background thread so a later [`probe`] is instant.
@@ -171,9 +215,18 @@ pub fn host_caps() -> HostCaps {
 
 /// One line per codec, for logs.
 pub fn summary(probe: &Probe) -> String {
-    let enc: Vec<String> = probe.caps.video.iter().map(|c| format!("{}={}", c.video.token(), c.encoder)).collect();
+    let enc: Vec<String> = probe
+        .caps
+        .video
+        .iter()
+        .map(|c| format!("{}={}", c.video.token(), c.encoder))
+        .collect();
     let aud: Vec<&str> = probe.caps.audio.iter().map(|a| a.token()).collect();
-    let dec: Vec<String> = probe.decodes.iter().map(|c| format!("{c:?}").to_lowercase()).collect();
+    let dec: Vec<String> = probe
+        .decodes
+        .iter()
+        .map(|c| format!("{c:?}").to_lowercase())
+        .collect();
     let adec: Vec<&str> = probe.audio_decodes.iter().map(|a| a.token()).collect();
     format!(
         "encode video [{}] audio [{}]; decode video [{}] audio [pcm {}]; {}",

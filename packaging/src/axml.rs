@@ -383,8 +383,10 @@ mod tests {
             xml.windows(4).any(|window| window == 35u32.to_le_bytes()),
             "targetSdkVersion 35 is not in the binary manifest"
         );
-        for permission in ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE"]
-        {
+        for permission in [
+            "android.permission.INTERNET",
+            "android.permission.ACCESS_NETWORK_STATE",
+        ] {
             let encoded: Vec<u8> = permission
                 .encode_utf16()
                 .flat_map(|unit| unit.to_le_bytes())

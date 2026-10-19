@@ -16,7 +16,11 @@ pub async fn write_magic(send: &mut SendStream, magic: &[u8; 4]) -> Result<(), S
     Ok(())
 }
 
-pub async fn write_record(send: &mut SendStream, magic: &[u8; 4], payload: &[u8]) -> Result<(), String> {
+pub async fn write_record(
+    send: &mut SendStream,
+    magic: &[u8; 4],
+    payload: &[u8],
+) -> Result<(), String> {
     let len = u32::try_from(payload.len()).map_err(|_| "record too large".to_string())?;
     send.write_all(&len.to_le_bytes()).await.map_err(err)?;
     send.write_all(payload).await.map_err(err)?;
@@ -25,7 +29,12 @@ pub async fn write_record(send: &mut SendStream, magic: &[u8; 4], payload: &[u8]
 }
 
 /// A record whose payload is `kind` then `payload`, without copying.
-pub async fn write_typed(send: &mut SendStream, magic: &[u8; 4], kind: u8, payload: &[u8]) -> Result<(), String> {
+pub async fn write_typed(
+    send: &mut SendStream,
+    magic: &[u8; 4],
+    kind: u8,
+    payload: &[u8],
+) -> Result<(), String> {
     let len = u32::try_from(payload.len() + 1).map_err(|_| "record too large".to_string())?;
     send.write_all(&len.to_le_bytes()).await.map_err(err)?;
     send.write_all(&[kind]).await.map_err(err)?;
@@ -43,7 +52,10 @@ pub async fn read_magic(recv: &mut RecvStream) -> Result<Option<[u8; 4]>, String
     Ok(Some(magic))
 }
 
-pub async fn read_record(recv: &mut RecvStream, magic: &[u8; 4]) -> Result<Option<Vec<u8>>, String> {
+pub async fn read_record(
+    recv: &mut RecvStream,
+    magic: &[u8; 4],
+) -> Result<Option<Vec<u8>>, String> {
     let mut len_buf = [0u8; 4];
     if !read_exact(recv, &mut len_buf).await? {
         return Ok(None);

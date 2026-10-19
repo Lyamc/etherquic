@@ -15,9 +15,9 @@ mod run;
 #[cfg(windows)]
 mod bridge;
 #[cfg(windows)]
-mod desktop;
-#[cfg(windows)]
 mod desk;
+#[cfg(windows)]
+mod desktop;
 #[cfg(windows)]
 mod link;
 

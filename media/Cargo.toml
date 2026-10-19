@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Negotiated codecs for etherquic: PyroWave, Opus, ffmpeg H.264/HEVC/AV1, MJPEG, PCM"
+description = "Negotiated codecs for etherquic: PyroWave, Opus, ffmpeg H.264/HEVC/AV1, MJPEG, MJ2K, PCM"
 publish = false
 
 [dependencies]
 etherquic = { path = ".." }
 jpeg-encoder = "0.6"
 libloading = "0.8"
+openjpeg2-pure-rs = "0.1.1"
 quinn = { path = "../vendor/quinn/quinn", default-features = false, features = [
     "runtime-tokio",
     "rustls-pure",

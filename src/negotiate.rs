@@ -24,6 +24,25 @@ use crate::look::Look;
 pub const ALPN_NEGOTIATE: &[u8] = b"etherquic/2";
 /// Negotiation record version written by this build.
 pub const VERSION: u32 = 1;
+/// JPEG quality and the 100% mark for bitrate scaling when the offer omits
+/// `quality` or sends 0.
+pub const DEFAULT_QUALITY: u8 = 40;
+
+/// `quality` 0 is the default. Anything else is 1–100.
+pub fn clamp_quality(quality: u8) -> u8 {
+    if quality == 0 {
+        DEFAULT_QUALITY
+    } else {
+        quality.clamp(1, 100)
+    }
+}
+
+/// Scale a codec's default budget by the offer's quality. 40% is the default.
+pub fn scale_budget(default: u32, quality: u8) -> u32 {
+    let q = u64::from(clamp_quality(quality));
+    let scaled = u64::from(default) * q / u64::from(DEFAULT_QUALITY);
+    scaled.clamp(1, u64::from(u32::MAX)) as u32
+}
 /// Player to host, one stream, offers.
 pub const OFFER_MAGIC: &[u8; 4] = b"ENEG";
 /// Host to player, negotiated pictures.
@@ -37,6 +56,11 @@ pub const RECORD_DATA: u8 = b'D';
 /// First byte of an `EVI2` record: the host cursor. A player that does not
 /// know it skips the record. It is not sent on the legacy `EVID` stream.
 pub const RECORD_CURSOR: u8 = b'P';
+/// First byte of an `EVI2` record: a dirty-rectangle update. Payload is
+/// x, y, w, h (u16le) then a coded tile. A player that does not know it
+/// skips the record. The host only sends these when the offer has
+/// `knows dirty-rects`.
+pub const RECORD_PATCH: u8 = b'R';
 
 /// One row of a picture preference list. The suffix is the sender's encoder:
 /// `-hw` is an encode ASIC (NVENC, VideoToolbox, AMF, Quick Sync), `-sw` the CPU.
@@ -50,6 +74,7 @@ pub enum Video {
     H265Hw,
     H264Hw,
     Pyrowave,
+    Mj2k,
     Mjpeg,
     H264Sw,
     PyrowaveCpu,
@@ -62,17 +87,19 @@ pub enum VideoCodec {
     H265,
     H264,
     Pyrowave,
+    Mj2k,
     Mjpeg,
 }
 
 impl Video {
     /// Default order. PyroWave on a CPU is last: it works, but takes many
-    /// cores and about 40 Mbit/s, so Auto prefers MJPEG and x264.
-    pub const ALL: [Video; 7] = [
+    /// cores and about 40 Mbit/s, so Auto prefers MJ2K, MJPEG, and x264.
+    pub const ALL: [Video; 8] = [
         Video::Av1Hw,
         Video::H265Hw,
         Video::H264Hw,
         Video::Pyrowave,
+        Video::Mj2k,
         Video::Mjpeg,
         Video::H264Sw,
         Video::PyrowaveCpu,
@@ -84,6 +111,7 @@ impl Video {
             Video::H265Hw => "h265-hw",
             Video::H264Hw => "h264-hw",
             Video::Pyrowave => "pyrowave",
+            Video::Mj2k => "mj2k",
             Video::Mjpeg => "mjpeg",
             Video::H264Sw => "h264-sw",
             Video::PyrowaveCpu => "pyrowave-cpu",
@@ -100,6 +128,7 @@ impl Video {
             Video::H265Hw => "H.265 (HW)",
             Video::H264Hw => "H.264 (HW)",
             Video::Pyrowave => "PyroWave (GPU)",
+            Video::Mj2k => "MJ2K",
             Video::Mjpeg => "MJPEG",
             Video::H264Sw => "H.264 (SW)",
             Video::PyrowaveCpu => "PyroWave (CPU)",
@@ -112,6 +141,7 @@ impl Video {
             Video::H265Hw => VideoCodec::H265,
             Video::H264Hw | Video::H264Sw => VideoCodec::H264,
             Video::Pyrowave | Video::PyrowaveCpu => VideoCodec::Pyrowave,
+            Video::Mj2k => VideoCodec::Mj2k,
             Video::Mjpeg => VideoCodec::Mjpeg,
         }
     }
@@ -125,6 +155,20 @@ impl Video {
             self,
             Video::Av1Hw | Video::H265Hw | Video::H264Hw | Video::Pyrowave
         )
+    }
+
+    /// One bad coded picture can be skipped. The decoder stays up. H.264,
+    /// H.265, and AV1 still fail the row: a gap there needs a new IDR.
+    pub fn skip_bad_frame(self) -> bool {
+        matches!(
+            self,
+            Video::Mjpeg | Video::Mj2k | Video::Pyrowave | Video::PyrowaveCpu
+        )
+    }
+
+    /// A dirty tile can be coded on its own. The player composites it.
+    pub fn patch_updates(self) -> bool {
+        matches!(self, Video::Mjpeg | Video::Mj2k)
     }
 }
 
@@ -304,9 +348,15 @@ pub struct Offer {
     /// from before the split does not, and its plain `pyrowave` also takes a
     /// CPU PyroWave encoder, as it did then.
     pub knows_pyrowave_cpu: bool,
+    /// The player composites [`RECORD_PATCH`] tiles (`knows dirty-rects`).
+    pub knows_dirty_rects: bool,
     /// Picture look the host paints before it encodes. An offer without the
     /// line is [`Look::Off`].
     pub look: Look,
+    /// Picture quality, 1–100. Zero lets the host use [`DEFAULT_QUALITY`].
+    /// MJPEG uses this as JPEG quality. MJ2K maps it to a JPEG 2000 byte
+    /// budget. Other codecs scale their default bitrate.
+    pub quality: u8,
 }
 
 impl Offer {
@@ -322,10 +372,18 @@ impl Offer {
             let failed: Vec<&str> = self.failed.iter().map(|row| row.token()).collect();
             let _ = writeln!(out, "failed {}", failed.join(" "));
         }
+        let mut knows = Vec::new();
         if self.knows_pyrowave_cpu {
-            let _ = writeln!(out, "knows pyrowave-cpu");
+            knows.push("pyrowave-cpu");
+        }
+        if self.knows_dirty_rects {
+            knows.push("dirty-rects");
+        }
+        if !knows.is_empty() {
+            let _ = writeln!(out, "knows {}", knows.join(" "));
         }
         let _ = writeln!(out, "look {}", self.look.token());
+        let _ = writeln!(out, "quality {}", self.quality);
         out.into_bytes()
     }
 
@@ -347,7 +405,9 @@ impl Offer {
             bitrate_kbps: 0,
             failed: Vec::new(),
             knows_pyrowave_cpu: false,
+            knows_dirty_rects: false,
             look: Look::Off,
+            quality: 0,
         };
         for (key, words) in &lines.rows {
             match key.as_str() {
@@ -363,12 +423,18 @@ impl Offer {
                     offer.bitrate_kbps = words.first().and_then(|w| w.parse().ok()).unwrap_or(0)
                 }
                 "failed" => offer.failed = dedup(words.iter().filter_map(|w| Video::from_token(w))),
-                "knows" => offer.knows_pyrowave_cpu |= words.contains(&"pyrowave-cpu"),
+                "knows" => {
+                    offer.knows_pyrowave_cpu |= words.contains(&"pyrowave-cpu");
+                    offer.knows_dirty_rects |= words.contains(&"dirty-rects");
+                }
                 "look" => {
                     offer.look = words
                         .first()
                         .and_then(|word| Look::from_token(word))
                         .unwrap_or(Look::Off);
+                }
+                "quality" => {
+                    offer.quality = words.first().and_then(|w| w.parse().ok()).unwrap_or(0)
                 }
                 _ => {}
             }
@@ -559,6 +625,7 @@ pub struct OfferInput<'a> {
     pub audio_decodes: &'a [Audio],
     pub max: Limit,
     pub bitrate_kbps: u32,
+    pub quality: u8,
 }
 
 /// Pin first, then the Settings order, then anything left over, keeping only
@@ -594,7 +661,9 @@ pub fn build_offer(input: &OfferInput<'_>) -> Offer {
         bitrate_kbps: input.bitrate_kbps,
         failed: Vec::new(),
         knows_pyrowave_cpu: true,
+        knows_dirty_rects: true,
         look: Look::Off,
+        quality: input.quality,
     }
 }
 
@@ -780,6 +849,7 @@ mod tests {
             VideoCodec::H265,
             VideoCodec::H264,
             VideoCodec::Pyrowave,
+            VideoCodec::Mj2k,
             VideoCodec::Mjpeg,
         ]
     }
@@ -872,8 +942,30 @@ mod tests {
         assert!(offer.same_codecs(&other));
         other.bitrate_kbps = offer.bitrate_kbps + 1;
         assert!(!offer.same_codecs(&other));
+        other.bitrate_kbps = offer.bitrate_kbps;
+        other.quality = 7;
+        assert!(!offer.same_codecs(&other));
         let unknown = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\nlook crt\n").unwrap();
         assert_eq!(unknown.look, Look::Off);
+        assert_eq!(unknown.quality, 0);
+    }
+
+    #[test]
+    fn quality_round_trips_and_zero_is_the_default() {
+        let mut offer = offer(&[Video::Mjpeg], &[VideoCodec::Mjpeg]);
+        assert_eq!(offer.quality, 0);
+        assert_eq!(clamp_quality(0), DEFAULT_QUALITY);
+        assert_eq!(clamp_quality(7), 7);
+        assert_eq!(scale_budget(40_000, 7), 7_000);
+        offer.quality = 7;
+        let text = String::from_utf8(offer.encode()).unwrap();
+        assert!(text.contains("quality 7\n"), "{text}");
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert_eq!(back.quality, 7);
+        assert!(Video::Pyrowave.skip_bad_frame());
+        assert!(Video::Mjpeg.skip_bad_frame());
+        assert!(Video::Mj2k.skip_bad_frame());
+        assert!(!Video::H264Hw.skip_bad_frame());
     }
 
     #[test]
@@ -881,6 +973,10 @@ mod tests {
         let offer = offer(&Video::ALL, &all_decodes());
         let back = Offer::decode(&offer.encode()).unwrap();
         assert!(back.knows_pyrowave_cpu);
+        assert!(back.knows_dirty_rects);
+        assert!(String::from_utf8(offer.encode())
+            .unwrap()
+            .contains("knows pyrowave-cpu dirty-rects\n"));
         assert_eq!(back.video, offer.video);
         // An old host's plain pyrowave is treated as GPU.
         let old_host = HostCaps::from_text(

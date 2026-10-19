@@ -48,7 +48,10 @@ pub fn library_candidates() -> Vec<PathBuf> {
         &["libopus.so.0", "libopus.so"]
     };
     let mut dirs = Vec::new();
-    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.to_path_buf())) {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+    {
         if cfg!(target_os = "macos") {
             dirs.push(dir.join("../Frameworks"));
         }
@@ -67,7 +70,12 @@ pub fn library_candidates() -> Vec<PathBuf> {
                 dirs.extend(std::env::split_paths(&paths));
             }
         }
-        for dir in ["/run/current-system/sw/lib", "/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"] {
+        for dir in [
+            "/run/current-system/sw/lib",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+        ] {
             dirs.push(PathBuf::from(dir));
         }
     }
@@ -129,7 +137,9 @@ fn error_text(api: &Api, code: c_int) -> String {
     if text.is_null() {
         return format!("opus error {code}");
     }
-    unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned()
+    unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub struct Encoder {
@@ -151,13 +161,24 @@ impl Encoder {
         let api = api()?;
         let mut error: c_int = 0;
         let handle = unsafe {
-            (api.encoder_create)(RATE as i32, channels as c_int, APPLICATION_RESTRICTED_LOWDELAY, &mut error)
+            (api.encoder_create)(
+                RATE as i32,
+                channels as c_int,
+                APPLICATION_RESTRICTED_LOWDELAY,
+                &mut error,
+            )
         };
         if handle.is_null() || error != 0 {
             return Err(format!("opus encoder: {}", error_text(&api, error)));
         }
         unsafe { (api.encoder_ctl)(handle, SET_BITRATE_REQUEST, bitrate as c_int) };
-        Ok(Encoder { api, handle, channels: channels as usize, pending: Vec::new(), out: vec![0; 4000] })
+        Ok(Encoder {
+            api,
+            handle,
+            channels: channels as usize,
+            pending: Vec::new(),
+            out: vec![0; 4000],
+        })
     }
 
     /// Interleaved 48 kHz samples in, zero or more packets out.
@@ -214,7 +235,12 @@ impl Decoder {
             return Err(format!("opus decoder: {}", error_text(&api, error)));
         }
         // 120 ms is the longest Opus packet.
-        Ok(Decoder { api, handle, channels: channels as usize, out: vec![0; 5760 * channels as usize] })
+        Ok(Decoder {
+            api,
+            handle,
+            channels: channels as usize,
+            out: vec![0; 5760 * channels as usize],
+        })
     }
 
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>, String> {

@@ -144,6 +144,9 @@ pub struct ViewOptions {
     pub cursor: CursorMode,
     /// Painted on the host before the picture is encoded.
     pub look: etherquic::look::Look,
+    /// Picture quality 1–100. MJPEG uses this as JPEG quality. Other codecs
+    /// scale their default bitrate. 40 is the previous fixed JPEG quality.
+    pub quality: u8,
     pub pad_slots: Vec<PadSlot>,
     /// Output device by name. `None` is the default device. Read when sound starts.
     pub output_device: Option<String>,
@@ -159,6 +162,7 @@ impl Default for ViewOptions {
             send_pads: true,
             cursor: CursorMode::Native,
             look: etherquic::look::Look::Off,
+            quality: etherquic::negotiate::DEFAULT_QUALITY,
             pad_slots: Vec::new(),
             output_device: None,
         }

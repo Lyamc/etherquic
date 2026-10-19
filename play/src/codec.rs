@@ -8,6 +8,7 @@
 pub enum CodecId {
     Pyrowave,
     Mjpeg,
+    Mj2k,
     H264,
     H265,
     Av1,
@@ -16,13 +17,14 @@ pub enum CodecId {
 /// One row in the picture preference list.
 ///
 /// H.264 is two rows: hardware encode, then a CPU encode. AV1 and H.265 are
-/// hardware-only. Pyrowave and MJPEG have no second path.
+/// hardware-only. Pyrowave, MJ2K, and MJPEG have no second path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PicturePref {
     Av1Hw,
     H265Hw,
     H264Hw,
     Pyrowave,
+    Mj2k,
     Mjpeg,
     H264Sw,
     /// PyroWave on a CPU Vulkan driver (lavapipe, SwiftShader).
@@ -36,6 +38,7 @@ impl PicturePref {
             Self::H265Hw => CodecId::H265,
             Self::H264Hw | Self::H264Sw => CodecId::H264,
             Self::Pyrowave | Self::PyrowaveCpu => CodecId::Pyrowave,
+            Self::Mj2k => CodecId::Mj2k,
             Self::Mjpeg => CodecId::Mjpeg,
         }
     }
@@ -46,6 +49,7 @@ impl PicturePref {
             Self::H265Hw => "H.265 (HW)",
             Self::H264Hw => "H.264 (HW)",
             Self::Pyrowave => "PyroWave (GPU)",
+            Self::Mj2k => "MJ2K",
             Self::Mjpeg => "MJPEG",
             Self::H264Sw => "H.264 (SW)",
             Self::PyrowaveCpu => "PyroWave (CPU)",
@@ -54,12 +58,13 @@ impl PicturePref {
 
     /// Default preference order.
     /// Default preference order. CPU PyroWave is last, below MJPEG and x264.
-    pub fn order() -> [Self; 7] {
+    pub fn order() -> [Self; 8] {
         [
             Self::Av1Hw,
             Self::H265Hw,
             Self::H264Hw,
             Self::Pyrowave,
+            Self::Mj2k,
             Self::Mjpeg,
             Self::H264Sw,
             Self::PyrowaveCpu,
@@ -72,6 +77,7 @@ impl PicturePref {
             Self::H265Hw => "h265-hw",
             Self::H264Hw => "h264-hw",
             Self::Pyrowave => "pyrowave",
+            Self::Mj2k => "mj2k",
             Self::Mjpeg => "mjpeg",
             Self::H264Sw => "h264-sw",
             Self::PyrowaveCpu => "pyrowave-cpu",
@@ -151,9 +157,19 @@ const TABLE: &[CodecInfo] = &[
         hardware: "does not require dedicated encode hardware",
     },
     CodecInfo {
+        id: CodecId::Mj2k,
+        name: "MJ2K",
+        latency_rank: 2,
+        compression: "intra JPEG 2000, stronger than MJPEG",
+        hardware_encode_required: false,
+        hardware_decode_required: false,
+        gpu_compute_both_ends: false,
+        hardware: "does not require dedicated encode hardware",
+    },
+    CodecInfo {
         id: CodecId::H264,
         name: "H.264",
-        latency_rank: 2,
+        latency_rank: 3,
         compression: "compresses well",
         hardware_encode_required: false,
         hardware_decode_required: false,
@@ -163,7 +179,7 @@ const TABLE: &[CodecInfo] = &[
     CodecInfo {
         id: CodecId::H265,
         name: "H.265",
-        latency_rank: 3,
+        latency_rank: 4,
         compression: "compresses better than H.264",
         hardware_encode_required: true,
         hardware_decode_required: true,
@@ -173,7 +189,7 @@ const TABLE: &[CodecInfo] = &[
     CodecInfo {
         id: CodecId::Av1,
         name: "AV1",
-        latency_rank: 4,
+        latency_rank: 5,
         compression: "compresses best",
         hardware_encode_required: true,
         hardware_decode_required: true,
@@ -210,7 +226,7 @@ pub fn recommend(codec: CodecId, support: &CodecSupport) -> bool {
         return false;
     }
     match codec {
-        CodecId::Pyrowave | CodecId::Mjpeg => true,
+        CodecId::Pyrowave | CodecId::Mjpeg | CodecId::Mj2k => true,
         CodecId::H264 => {
             if support.very_low_latency {
                 return false;
@@ -390,7 +406,7 @@ fn codec_gate(
                 Err("no gpu compute on the receiver")
             }
         }
-        PicturePref::Mjpeg => Ok(()),
+        PicturePref::Mjpeg | PicturePref::Mj2k => Ok(()),
         PicturePref::H264Hw => {
             if encoder.hardware_encode {
                 Ok(())
@@ -508,6 +524,7 @@ pub fn this_computer() -> MachineCodecs {
             },
         ),
         (CodecId::Mjpeg, EndSupport::default()),
+        (CodecId::Mj2k, EndSupport::default()),
         (CodecId::H264, asic),
         (CodecId::H265, asic),
         (CodecId::Av1, EndSupport::default()),
@@ -554,6 +571,7 @@ mod tests {
             vec![
                 CodecId::Pyrowave,
                 CodecId::Mjpeg,
+                CodecId::Mj2k,
                 CodecId::H264,
                 CodecId::H265,
                 CodecId::Av1,
@@ -581,14 +599,15 @@ mod tests {
             .hardware
             .contains("does not require dedicated encode hardware"));
 
-        assert!(rows[2].compression.contains("compresses well"));
-        assert!(rows[3].compression.contains("better than H.264"));
-        assert!(rows[3].hardware_encode_required && rows[3].hardware_decode_required);
-        assert!(rows[3]
+        assert!(rows[2].compression.contains("JPEG 2000"));
+        assert!(rows[3].compression.contains("compresses well"));
+        assert!(rows[4].compression.contains("better than H.264"));
+        assert!(rows[4].hardware_encode_required && rows[4].hardware_decode_required);
+        assert!(rows[4]
             .hardware
             .contains("Hardware encode is the requirement that matters most"));
-        assert!(rows[4].compression.contains("compresses best"));
-        assert!(rows[4].hardware_encode_required && rows[4].hardware_decode_required);
+        assert!(rows[5].compression.contains("compresses best"));
+        assert!(rows[5].hardware_encode_required && rows[5].hardware_decode_required);
     }
 
     #[test]
@@ -649,6 +668,7 @@ mod tests {
         );
         assert!(!recommend(CodecId::H264, &h264));
         assert!(recommend(CodecId::Mjpeg, &h264));
+        assert!(recommend(CodecId::Mj2k, &h264));
     }
 
     fn machine(rows: &[(CodecId, EndSupport)]) -> MachineCodecs {

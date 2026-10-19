@@ -43,7 +43,7 @@ pub fn candidates(video: Video) -> &'static [&'static str] {
         }
         Video::Av1Hw => &["av1_nvenc", "av1_amf", "av1_qsv"],
         Video::H264Sw => &["libx264"],
-        Video::Pyrowave | Video::PyrowaveCpu | Video::Mjpeg => &[],
+        Video::Pyrowave | Video::PyrowaveCpu | Video::Mjpeg | Video::Mj2k => &[],
     }
 }
 
@@ -68,9 +68,16 @@ fn hide_window(command: &mut Command) {
 
 fn runs(path: &PathBuf) -> bool {
     let mut command = Command::new(path);
-    command.arg("-version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     hide_window(&mut command);
-    command.status().map(|status| status.success()).unwrap_or(false)
+    command
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// The ffmpeg this process uses: `ETHERQUIC_FFMPEG`, beside the program,
@@ -81,12 +88,19 @@ pub fn binary() -> Option<PathBuf> {
     BINARY
         .get_or_init(|| {
             etherquic::widen_process_path();
-            let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+            let exe = if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            };
             let mut list = Vec::new();
             if let Some(path) = std::env::var_os("ETHERQUIC_FFMPEG") {
                 list.push(PathBuf::from(path));
             }
-            if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+            if let Some(dir) = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+            {
                 list.push(dir.join(exe));
             }
             if cfg!(target_os = "macos") {
@@ -94,7 +108,8 @@ pub fn binary() -> Option<PathBuf> {
                 list.push(PathBuf::from("/usr/local/bin/ffmpeg"));
             }
             list.push(PathBuf::from(exe));
-            list.into_iter().find(|path| (!path.is_absolute() || path.is_file()) && runs(path))
+            list.into_iter()
+                .find(|path| (!path.is_absolute() || path.is_file()) && runs(path))
         })
         .clone()
 }
@@ -107,9 +122,14 @@ fn command(binary: &PathBuf) -> Command {
 }
 
 fn listing(flag: &str) -> String {
-    let Some(binary) = binary() else { return String::new() };
+    let Some(binary) = binary() else {
+        return String::new();
+    };
     let mut command = Command::new(&binary);
-    command.args(["-hide_banner", flag]).stdin(Stdio::null()).stderr(Stdio::null());
+    command
+        .args(["-hide_banner", flag])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
     hide_window(&mut command);
     command
         .output()
@@ -118,7 +138,8 @@ fn listing(flag: &str) -> String {
 }
 
 fn listed(text: &str, name: &str) -> bool {
-    text.lines().any(|line| line.split_whitespace().nth(1) == Some(name))
+    text.lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(name))
 }
 
 /// Encoder arguments after the input. `kbps` is the target rate.
@@ -128,19 +149,56 @@ fn encoder_args(name: &str, fps: u32, kbps: u32) -> Vec<String> {
     // One frame of buffer: the rate controller cannot borrow from later frames.
     let buffer = format!("{}k", (kbps / fps).max(64) * 2);
     let gop = (fps * 10).to_string();
-    let mut args: Vec<String> = vec!["-c:v".into(), name.into(), "-bf".into(), "0".into(), "-g".into(), gop];
+    let mut args: Vec<String> = vec![
+        "-c:v".into(),
+        name.into(),
+        "-bf".into(),
+        "0".into(),
+        "-g".into(),
+        gop,
+    ];
     let more: Vec<&str> = match name {
         "libx264" => vec![
-            "-preset", "ultrafast", "-tune", "zerolatency", "-x264-params", "repeat-headers=1:sliced-threads=1",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-x264-params",
+            "repeat-headers=1:sliced-threads=1",
         ],
         n if n.ends_with("_videotoolbox") => vec!["-realtime", "1", "-prio_speed", "1"],
-        n if n.ends_with("_nvenc") => vec!["-preset", "p1", "-tune", "ull", "-zerolatency", "1", "-delay", "0", "-rc", "cbr"],
+        n if n.ends_with("_nvenc") => vec![
+            "-preset",
+            "p1",
+            "-tune",
+            "ull",
+            "-zerolatency",
+            "1",
+            "-delay",
+            "0",
+            "-rc",
+            "cbr",
+        ],
         n if n.ends_with("_amf") => vec!["-usage", "ultralowlatency", "-rc", "cbr"],
-        n if n.ends_with("_qsv") => vec!["-preset", "veryfast", "-look_ahead", "0", "-async_depth", "1"],
+        n if n.ends_with("_qsv") => vec![
+            "-preset",
+            "veryfast",
+            "-look_ahead",
+            "0",
+            "-async_depth",
+            "1",
+        ],
         _ => vec![],
     };
     args.extend(more.into_iter().map(String::from));
-    args.extend(["-b:v".into(), rate.clone(), "-maxrate".into(), rate, "-bufsize".into(), buffer]);
+    args.extend([
+        "-b:v".into(),
+        rate.clone(),
+        "-maxrate".into(),
+        rate,
+        "-bufsize".into(),
+        buffer,
+    ]);
     args
 }
 
@@ -159,10 +217,21 @@ fn codec_of(name: &str) -> VideoCodec {
 pub fn probe_encoder(name: &str) -> Result<(), String> {
     let binary = binary().ok_or("no ffmpeg")?;
     let mut cmd = command(&binary);
-    cmd.args(["-f", "lavfi", "-i", "testsrc=size=320x180:rate=30", "-frames:v", "8", "-pix_fmt", "yuv420p"]);
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x180:rate=30",
+        "-frames:v",
+        "8",
+        "-pix_fmt",
+        "yuv420p",
+    ]);
     cmd.args(encoder_args(name, 30, 2000));
     cmd.args(["-f", "null", "-"]);
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| error.to_string())?;
     let started = Instant::now();
     loop {
@@ -174,7 +243,10 @@ pub fn probe_encoder(name: &str) -> Result<(), String> {
             if let Some(mut err) = child.stderr.take() {
                 let _ = err.read_to_string(&mut text);
             }
-            return Err(format!("{name}: {}", text.lines().last().unwrap_or("failed")));
+            return Err(format!(
+                "{name}: {}",
+                text.lines().last().unwrap_or("failed")
+            ));
         }
         if started.elapsed() > Duration::from_secs(15) {
             let _ = child.kill();
@@ -195,8 +267,11 @@ pub fn working_encoders() -> Vec<EncoderSpec> {
     let handles: Vec<_> = rows
         .into_iter()
         .map(|video| {
-            let names: Vec<&'static str> =
-                candidates(video).iter().copied().filter(|name| listed(&list, name)).collect();
+            let names: Vec<&'static str> = candidates(video)
+                .iter()
+                .copied()
+                .filter(|name| listed(&list, name))
+                .collect();
             std::thread::spawn(move || {
                 names
                     .into_iter()
@@ -205,7 +280,10 @@ pub fn working_encoders() -> Vec<EncoderSpec> {
             })
         })
         .collect();
-    handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+    handles
+        .into_iter()
+        .filter_map(|h| h.join().ok().flatten())
+        .collect()
 }
 
 /// Bitstreams this ffmpeg decodes, and the decoder name for each.
@@ -281,16 +359,42 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn new(spec: &EncoderSpec, width: u32, height: u32, fps: u32, kbps: u32, sink: Sink<Vec<u8>>) -> Result<Encoder, String> {
+    pub fn new(
+        spec: &EncoderSpec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        kbps: u32,
+        sink: Sink<Vec<u8>>,
+    ) -> Result<Encoder, String> {
         let binary = binary().ok_or("no ffmpeg")?;
         let codec = codec_of(spec.name);
         let mut cmd = command(&binary);
-        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{width}x{height}")]);
-        cmd.args(["-r", &fps.max(1).to_string(), "-i", "pipe:0", "-an", "-pix_fmt", "yuv420p"]);
+        cmd.args([
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{width}x{height}"),
+        ]);
+        cmd.args([
+            "-r",
+            &fps.max(1).to_string(),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
         cmd.args(encoder_args(spec.name, fps, kbps));
         cmd.args(["-flush_packets", "1", "-f", output_format(codec), "pipe:1"]);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|error| format!("{}: {error}", spec.name))?;
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|error| format!("{}: {error}", spec.name))?;
         let failure: Failure = Arc::new(Mutex::new(None));
         let mut threads = Vec::new();
         if let Some(t) = stderr_tail(&mut child, failure.clone()) {
@@ -317,7 +421,16 @@ impl Encoder {
             }
         }));
         let stdin = child.stdin.take();
-        Ok(Encoder { name: spec.name, child, stdin, threads, failure, width, height, kbps })
+        Ok(Encoder {
+            name: spec.name,
+            child,
+            stdin,
+            threads,
+            failure,
+            width,
+            height,
+            kbps,
+        })
     }
 
     pub fn name(&self) -> &'static str {
@@ -368,7 +481,12 @@ impl Decoder {
         decoder_name(codec).is_some()
     }
 
-    pub fn new(codec: VideoCodec, width: u32, height: u32, sink: Sink<Frame>) -> Result<Decoder, String> {
+    pub fn new(
+        codec: VideoCodec,
+        width: u32,
+        height: u32,
+        sink: Sink<Frame>,
+    ) -> Result<Decoder, String> {
         let binary = binary().ok_or("no ffmpeg")?;
         let name = decoder_name(codec).ok_or("ffmpeg has no decoder for this codec")?;
         if width == 0 || height == 0 {
@@ -376,15 +494,34 @@ impl Decoder {
         }
         let mut cmd = command(&binary);
         // `-fflags nobuffer` makes the h264 parser drop every picture here, so it stays off.
-        cmd.args(["-probesize", "32", "-analyzeduration", "0", "-flags", "low_delay"]);
+        cmd.args([
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-flags",
+            "low_delay",
+        ]);
         cmd.args(["-threads", "1"]);
         if cfg!(target_os = "macos") && codec != VideoCodec::Av1 {
             cmd.args(["-hwaccel", "videotoolbox"]);
         }
         cmd.args(["-c:v", name, "-f", output_format(codec), "-i", "pipe:0"]);
-        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{width}x{height}"), "pipe:1"]);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|error| format!("ffmpeg decoder: {error}"))?;
+        cmd.args([
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{width}x{height}"),
+            "pipe:1",
+        ]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|error| format!("ffmpeg decoder: {error}"))?;
         let failure: Failure = Arc::new(Mutex::new(None));
         let mut threads = Vec::new();
         if let Some(t) = stderr_tail(&mut child, failure.clone()) {
@@ -409,7 +546,12 @@ impl Decoder {
             }
         }));
         let stdin = child.stdin.take();
-        Ok(Decoder { child, stdin, threads, failure })
+        Ok(Decoder {
+            child,
+            stdin,
+            threads,
+            failure,
+        })
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -417,10 +559,13 @@ impl Decoder {
             return Err(format!("ffmpeg decoder: {reason}"));
         }
         let stdin = self.stdin.as_mut().ok_or("decoder input closed")?;
-        stdin.write_all(bytes).and_then(|_| stdin.flush()).map_err(|error| {
-            let reason = failed(&self.failure).unwrap_or_else(|| error.to_string());
-            format!("ffmpeg decoder: {reason}")
-        })
+        stdin
+            .write_all(bytes)
+            .and_then(|_| stdin.flush())
+            .map_err(|error| {
+                let reason = failed(&self.failure).unwrap_or_else(|| error.to_string());
+                format!("ffmpeg decoder: {reason}")
+            })
     }
 }
 

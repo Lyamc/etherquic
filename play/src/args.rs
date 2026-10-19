@@ -157,6 +157,14 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
             }
             "--max-width" => codecs.max_width = number(need(args, &mut i, "--max-width")?)?,
             "--bitrate" => codecs.bitrate_kbps = number(need(args, &mut i, "--bitrate")?)?,
+            "--quality" => {
+                let value: u32 = number(need(args, &mut i, "--quality")?)?;
+                if !(1..=100).contains(&value) {
+                    return Err(format!("--quality {value} is not 1-100"));
+                }
+                codecs.quality = value as u8;
+                view.quality = codecs.quality;
+            }
             other => return Err(format!("unknown arg {other}\n{}", usage())),
         }
     }
@@ -256,6 +264,7 @@ etherquic-play connect --udp IP:PORT
     [--output-device NAME] [--pad SLOT=NAME]... [--parent-pipe]
     [--video av1-hw,h265-hw,h264-hw,pyrowave,mjpeg,h264-sw] [--audio opus,pcm]
     [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--bitrate KBPS]
+    [--quality 1-100]
 
 host shares this desktop, its audio, and takes keyboard, mouse, and gamepad from one player.
 connect opens the view. The player window has to be focused to send the keyboard and the mouse. Gamepads send while that view is open.
@@ -281,6 +290,8 @@ mod tests {
             "h264-sw",
             "--bitrate",
             "9000",
+            "--quality",
+            "7",
         ];
         let Ok(Command::Connect(c)) = parse(args.iter().map(|s| s.to_string())) else {
             panic!()
@@ -301,6 +312,8 @@ mod tests {
             Some(etherquic_play::PicturePref::H264Sw)
         );
         assert_eq!(c.codecs.bitrate_kbps, 9000);
+        assert_eq!(c.codecs.quality, 7);
+        assert_eq!(c.view.quality, 7);
         let back = c.codecs.args();
         assert!(back
             .windows(2)

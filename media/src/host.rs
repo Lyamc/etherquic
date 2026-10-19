@@ -8,7 +8,7 @@
 //! encoded. That keeps inter-frame codecs (H.264, H.265, AV1) valid: every
 //! coded frame that leaves the encoder reaches the player.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,12 +16,25 @@ use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::audio::AudioEncoder;
+use crate::dirty::{self, Plan};
 use crate::negotiate::{
     choose_audio, choose_video, Audio, HostCaps, Offer, StreamConfig, Video, AUDIO2_MAGIC,
-    OFFER_MAGIC, RECORD_CURSOR, RECORD_DATA, VIDEO2_MAGIC,
+    OFFER_MAGIC, RECORD_CURSOR, RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
 };
 use crate::video::{EncodeSetup, VideoEncoder};
 use crate::{wire, yuv, Frame, Log, Pcm};
+
+static DIRTY_RECTS: AtomicBool = AtomicBool::new(false);
+
+/// When this computer hosts: skip unchanged pictures, and send MJPEG/MJ2K
+/// dirty tiles when the player said `knows dirty-rects`.
+pub fn set_dirty_rects(on: bool) {
+    DIRTY_RECTS.store(on, Ordering::Relaxed);
+}
+
+pub fn dirty_rects() -> bool {
+    DIRTY_RECTS.load(Ordering::Relaxed)
+}
 
 pub const LEGACY_VIDEO_MAGIC: &[u8; 4] = b"EVID";
 pub const LEGACY_AUDIO_MAGIC: &[u8; 4] = b"EAUD";
@@ -187,6 +200,7 @@ pub struct HostOptions {
 enum VideoOut {
     Config(Vec<u8>),
     Data(Vec<u8>),
+    Patch(Vec<u8>),
 }
 
 /// Send pictures and audio until capture stops (the slot closes and the
@@ -288,6 +302,10 @@ async fn write_out(send: &mut SendStream, v2: bool, out: VideoOut) -> Result<(),
             wire::write_typed(send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await
         }
         VideoOut::Data(bytes) => wire::write_record(send, LEGACY_VIDEO_MAGIC, &bytes).await,
+        VideoOut::Patch(bytes) if v2 => {
+            wire::write_typed(send, VIDEO2_MAGIC, RECORD_PATCH, &bytes).await
+        }
+        VideoOut::Patch(_) => Ok(()),
     }
 }
 
@@ -324,6 +342,25 @@ async fn finish(send: &mut SendStream) -> Result<(), String> {
     Ok(())
 }
 
+fn send_patches(
+    current: &Active,
+    frame: &Frame,
+    rects: &[dirty::Rect],
+    out: &mpsc::Sender<VideoOut>,
+    sent: &AtomicU64,
+) -> Result<bool, String> {
+    for rect in rects {
+        let (rect, tile) = dirty::crop(frame, *rect)?;
+        let coded = current.encoder.encode_intra(&tile)?;
+        let payload = dirty::encode_payload(rect, &coded);
+        sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        if out.blocking_send(VideoOut::Patch(payload)).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn tokens(rows: &[Video]) -> Vec<&'static str> {
     rows.iter().map(|row| row.token()).collect()
 }
@@ -332,6 +369,9 @@ struct Active {
     encoder: VideoEncoder,
     video: Video,
     size: (u32, u32),
+    /// Consecutive `push` failures. PyroWave reopens a few times before the
+    /// host excludes it for the rest of the session.
+    encode_fails: u32,
 }
 
 fn video_pump(
@@ -352,6 +392,7 @@ fn video_pump(
     let mut frames_in = 0u64;
     let mut tick = Instant::now();
     let mut tick_bytes = 0u64;
+    let mut previous: Option<(u32, u32, Vec<u8>)> = None;
     loop {
         if offer_rx.has_changed().unwrap_or(false) {
             let next = offer_rx.borrow_and_update().clone();
@@ -363,6 +404,7 @@ fn video_pump(
             offer = next;
             if !keep_encoder {
                 active = None;
+                previous = None;
                 reason = "the player sent a new offer".into();
             }
         }
@@ -388,8 +430,10 @@ fn video_pump(
             .unwrap_or(true)
         {
             // The old encoder (and an ffmpeg reader thread) ends before the
-            // next config record, so no stale bytes follow it.
+            // next config record, so no stale bytes follow it. The next
+            // picture is a full frame: the player clears its canvas on config.
             drop(active.take());
+            previous = None;
             loop {
                 let (video, encoder_name) = match &offer {
                     None => (Video::Mjpeg, "jpeg".to_string()),
@@ -404,6 +448,7 @@ fn video_pump(
                     }
                 };
                 let kbps = offer.as_ref().map(|o| o.bitrate_kbps).unwrap_or(0);
+                let quality = offer.as_ref().map(|o| o.quality).unwrap_or(0);
                 let setup = EncodeSetup {
                     video,
                     encoder: encoder_name.clone(),
@@ -411,6 +456,7 @@ fn video_pump(
                     height: frame.height,
                     fps: options.fps,
                     kbps,
+                    quality,
                 };
                 let sink_out = out.clone();
                 let sink_sent = sent.clone();
@@ -462,6 +508,7 @@ fn video_pump(
                             encoder,
                             video,
                             size: (frame.width, frame.height),
+                            encode_fails: 0,
                         });
                         break;
                     }
@@ -483,8 +530,38 @@ fn video_pump(
         let Some(current) = active.as_mut() else {
             continue;
         };
+        if dirty_rects() {
+            let prev = previous
+                .as_ref()
+                .filter(|(w, h, _)| *w == frame.width && *h == frame.height)
+                .map(|(_, _, rgb)| rgb.as_slice());
+            match dirty::plan(prev, &frame.rgb, frame.width, frame.height) {
+                Plan::Unchanged => continue,
+                Plan::Patches(rects)
+                    if v2
+                        && offer.as_ref().is_some_and(|offer| offer.knows_dirty_rects)
+                        && current.video.patch_updates() =>
+                {
+                    match send_patches(current, &frame, &rects, &out, &sent) {
+                        Ok(true) => {
+                            current.encode_fails = 0;
+                            frames_in += 1;
+                            previous = Some((frame.width, frame.height, frame.rgb.clone()));
+                            continue;
+                        }
+                        Ok(false) => return,
+                        Err(_) => {}
+                    }
+                }
+                _ => {}
+            }
+        }
         match current.encoder.push(&frame) {
-            Ok(true) => frames_in += 1,
+            Ok(true) => {
+                current.encode_fails = 0;
+                frames_in += 1;
+                previous = Some((frame.width, frame.height, frame.rgb.clone()));
+            }
             Ok(false) => return,
             Err(error) => {
                 log(&format!(
@@ -494,9 +571,22 @@ fn video_pump(
                 if current.video == Video::Mjpeg {
                     continue;
                 }
+                current.encode_fails = current.encode_fails.saturating_add(1);
+                // A short GPU hiccup should not dump PyroWave onto MJPEG.
+                if current.video.skip_bad_frame() && current.encode_fails < 8 {
+                    reason = format!(
+                        "{} encoder failed (retry {}): {error}",
+                        current.video.token(),
+                        current.encode_fails
+                    );
+                    active = None;
+                    previous = None;
+                    continue;
+                }
                 excluded.push(current.video);
                 reason = format!("{} encoder failed: {error}", current.video.token());
                 active = None;
+                previous = None;
             }
         }
         if tick.elapsed() >= Duration::from_secs(5) {

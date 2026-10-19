@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use etherquic_media::host::{self, FrameSlot, HostOptions};
-use etherquic_media::negotiate::{Audio, HostCaps, Limit, Offer, Video, VideoCodec, AUDIO2_MAGIC, VIDEO2_MAGIC};
+use etherquic_media::negotiate::{
+    Audio, HostCaps, Limit, Offer, Video, VideoCodec, AUDIO2_MAGIC, VIDEO2_MAGIC,
+};
 use etherquic_media::player::{self, PlayerEvent};
 use etherquic_media::{wire, Frame, Pcm};
 
@@ -34,7 +36,11 @@ fn frame(i: u32) -> Frame {
         px[1] = (p as u32 / 320) as u8;
         px[2] = i as u8;
     }
-    Frame { width: w, height: h, rgb }
+    Frame {
+        width: w,
+        height: h,
+        rgb,
+    }
 }
 
 struct Outcome {
@@ -72,14 +78,22 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
         let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             for _ in 0..50 {
-                let pcm = Pcm { sample_rate: 48_000, channels: 2, samples: vec![0i16; 960 * 2] };
+                let pcm = Pcm {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    samples: vec![0i16; 960 * 2],
+                };
                 if pcm_tx.send(pcm).await.is_err() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
-        let options = HostOptions { fps: 30, caps, log: Arc::new(|line: &str| eprintln!("host: {line}")) };
+        let options = HostOptions {
+            fps: 30,
+            caps,
+            log: Arc::new(|line: &str| eprintln!("host: {line}")),
+        };
         let (_cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
         let result = host::run(streams, negotiated, slot, pcm_rx, options, cursor_rx).await;
         let _ = feeder.join();
@@ -92,12 +106,20 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
         let mut tls = etherquic::tls::load_client_config(true).unwrap();
         tls.alpn_protocols = vec![etherquic::ALPN_ETHERQUIC.to_vec()];
         let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
-        endpoint.connect_with(quinn::ClientConfig::new(Arc::new(quic)), addr, "localhost").unwrap().await.unwrap()
+        endpoint
+            .connect_with(quinn::ClientConfig::new(Arc::new(quic)), addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap()
     } else {
         endpoint.connect(addr, "localhost").unwrap().await.unwrap()
     };
     let negotiates = etherquic::negotiates(&conn);
-    let mut offer_send = if negotiates { Some(player::send_offer(&conn, &offer).await.unwrap()) } else { None };
+    let mut offer_send = if negotiates {
+        Some(player::send_offer(&conn, &offer).await.unwrap())
+    } else {
+        None
+    };
     let frames = Arc::new(AtomicU64::new(0));
     let f = frames.clone();
     let sink: etherquic_media::Sink<Frame> = Arc::new(move |_| {
@@ -110,7 +132,10 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
     let pf = pcm_frames.clone();
     tokio::spawn(async move {
         while let Some(pcm) = pcm_rx.recv().await {
-            pf.fetch_add((pcm.samples.len() / pcm.channels as usize) as u64, Ordering::Relaxed);
+            pf.fetch_add(
+                (pcm.samples.len() / pcm.channels as usize) as u64,
+                Ordering::Relaxed,
+            );
         }
     });
     let mut readers = Vec::new();
@@ -120,18 +145,37 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
         if &magic == b"EVID" || &magic == VIDEO2_MAGIC {
             let v2 = &magic == VIDEO2_MAGIC;
             assert_eq!(v2, negotiates);
-            readers.push(tokio::spawn(player::read_video(recv, v2, sink.clone(), events_tx.clone())));
+            readers.push(tokio::spawn(player::read_video(
+                recv,
+                v2,
+                sink.clone(),
+                events_tx.clone(),
+            )));
         } else {
             let v2 = &magic == AUDIO2_MAGIC;
             assert_eq!(v2, negotiates);
-            readers.push(tokio::spawn(player::read_audio(recv, v2, pcm_tx.clone(), events_tx.clone())));
+            readers.push(tokio::spawn(player::read_audio(
+                recv,
+                v2,
+                pcm_tx.clone(),
+                events_tx.clone(),
+            )));
         }
     }
     drop(events_tx);
     drop(pcm_tx);
-    let mut out = Outcome { negotiates, first_video: None, videos: Vec::new(), audio: None, frames: 0, pcm_frames: 0 };
+    let mut out = Outcome {
+        negotiates,
+        first_video: None,
+        videos: Vec::new(),
+        audio: None,
+        frames: 0,
+        pcm_frames: 0,
+    };
     let mut offer = offer;
-    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(10), events_rx.recv()).await {
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_secs(10), events_rx.recv()).await
+    {
         match event {
             PlayerEvent::Video(config) => {
                 let video = config.video.unwrap();
@@ -139,7 +183,9 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
                     out.first_video = Some(video);
                     if fail_first {
                         offer.failed.push(video);
-                        player::resend_offer(offer_send.as_mut().unwrap(), &offer).await.unwrap();
+                        player::resend_offer(offer_send.as_mut().unwrap(), &offer)
+                            .await
+                            .unwrap();
                     }
                 }
                 out.videos.push(video);
@@ -172,7 +218,13 @@ fn mjpeg_only_offer(video: &[Video]) -> Offer {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn negotiated_mjpeg_and_pcm_flow() {
-    let out = session(HostCaps::baseline(), mjpeg_only_offer(&Video::ALL), false, false).await;
+    let out = session(
+        HostCaps::baseline(),
+        mjpeg_only_offer(&Video::ALL),
+        false,
+        false,
+    )
+    .await;
     assert!(out.negotiates);
     assert_eq!(out.first_video, Some(Video::Mjpeg));
     assert_eq!(out.audio, Some(Audio::Pcm));
@@ -182,7 +234,13 @@ async fn negotiated_mjpeg_and_pcm_flow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn old_player_gets_legacy_streams() {
-    let out = session(etherquic_media::caps::host_caps(), mjpeg_only_offer(&Video::ALL), true, false).await;
+    let out = session(
+        etherquic_media::caps::host_caps(),
+        mjpeg_only_offer(&Video::ALL),
+        true,
+        false,
+    )
+    .await;
     assert!(!out.negotiates);
     assert!(out.frames > 20, "frames {}", out.frames);
     assert!(out.pcm_frames > 10_000, "pcm {}", out.pcm_frames);
@@ -194,8 +252,9 @@ async fn old_player_gets_legacy_streams() {
 async fn real_codecs_and_renegotiation() {
     let probe = etherquic_media::caps::probe();
     eprintln!("{}", etherquic_media::caps::summary(probe));
-    let offer = player::offer_for(&Video::ALL, &Audio::ALL, None, None, Limit::NONE, 0);
-    let expect = etherquic_media::negotiate::choose_video(&offer, &probe.caps, &[], Some((320, 180))).row;
+    let offer = player::offer_for(&Video::ALL, &Audio::ALL, None, None, Limit::NONE, 0, 0);
+    let expect =
+        etherquic_media::negotiate::choose_video(&offer, &probe.caps, &[], Some((320, 180))).row;
     let out = session(probe.caps.clone(), offer.clone(), false, true).await;
     assert_eq!(out.first_video, Some(expect));
     let want_audio = etherquic_media::negotiate::choose_audio(&offer, &probe.caps, &[]).row;
@@ -205,5 +264,8 @@ async fn real_codecs_and_renegotiation() {
         assert_ne!(out.videos[1], expect);
     }
     assert!(out.frames > 15, "frames {}", out.frames);
-    eprintln!("videos {:?} audio {:?} frames {} pcm {}", out.videos, out.audio, out.frames, out.pcm_frames);
+    eprintln!(
+        "videos {:?} audio {:?} frames {} pcm {}",
+        out.videos, out.audio, out.frames, out.pcm_frames
+    );
 }

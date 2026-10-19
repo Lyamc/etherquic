@@ -81,7 +81,8 @@ struct Api {
     encoder_create: unsafe extern "C" fn(*const EncInfo, *mut Handle) -> c_int,
     encode_cpu: unsafe extern "C" fn(Handle, *const CpuBuffer, *const RateControl) -> c_int,
     num_packets: unsafe extern "C" fn(Handle, usize, *mut usize) -> c_int,
-    packetize: unsafe extern "C" fn(Handle, *mut Packet, usize, *mut usize, *mut c_void, usize) -> c_int,
+    packetize:
+        unsafe extern "C" fn(Handle, *mut Packet, usize, *mut usize, *mut c_void, usize) -> c_int,
     encoder_destroy: unsafe extern "C" fn(Handle),
 }
 
@@ -108,7 +109,10 @@ fn check(code: c_int, what: &str) -> Result<(), String> {
 }
 
 fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok()?.parent().map(|dir| dir.to_path_buf())
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|dir| dir.to_path_buf())
 }
 
 /// Places to look, most specific first. `ETHERQUIC_PYROWAVE_D3D11=off` disables it.
@@ -141,7 +145,11 @@ pub fn disabled() -> bool {
 
 fn load(path: &PathBuf) -> Result<Library, String> {
     use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
-    let flags = if path.is_absolute() { LOAD_WITH_ALTERED_SEARCH_PATH } else { 0 };
+    let flags = if path.is_absolute() {
+        LOAD_WITH_ALTERED_SEARCH_PATH
+    } else {
+        0
+    };
     unsafe { WinLibrary::load_with_flags(path, flags) }
         .map(Library::from)
         .map_err(|error| error.to_string())
@@ -268,7 +276,9 @@ impl Encoder {
     /// `frame_bytes` is the per-picture budget (bitrate / 8 / fps).
     pub fn new(width: u32, height: u32, frame_bytes: usize) -> Result<Encoder, String> {
         if width % 2 != 0 || height % 2 != 0 || width < 16 || height < 16 {
-            return Err(format!("pyrowave-d3d11 needs even sides of 16 or more, got {width}x{height}"));
+            return Err(format!(
+                "pyrowave-d3d11 needs even sides of 16 or more, got {width}x{height}"
+            ));
         }
         let api = open_api()?;
         let info = DeviceInfo {
@@ -289,8 +299,14 @@ impl Encoder {
             dedicated_video_memory: 0,
         };
         let adapter_name = if unsafe { (api.adapter_info)(device, &mut adapter) } == 0 {
-            let end = adapter.name.iter().position(|b| *b == 0).unwrap_or(adapter.name.len());
-            String::from_utf8_lossy(&adapter.name[..end]).trim().to_string()
+            let end = adapter
+                .name
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(adapter.name.len());
+            String::from_utf8_lossy(&adapter.name[..end])
+                .trim()
+                .to_string()
         } else {
             "D3D11".into()
         };
@@ -333,10 +349,18 @@ impl Encoder {
         }
         rgb_to_i420(frame, &mut self.planes);
         let buffer = planes_buffer(&mut self.planes);
-        let rate = RateControl { maximum_bitstream_size: self.frame_bytes };
-        check(unsafe { (self.api.encode_cpu)(self.handle, &buffer, &rate) }, "encode")?;
+        let rate = RateControl {
+            maximum_bitstream_size: self.frame_bytes,
+        };
+        check(
+            unsafe { (self.api.encode_cpu)(self.handle, &buffer, &rate) },
+            "encode",
+        )?;
         let mut count = 0usize;
-        check(unsafe { (self.api.num_packets)(self.handle, PACKET_BOUNDARY, &mut count) }, "packet count")?;
+        check(
+            unsafe { (self.api.num_packets)(self.handle, PACKET_BOUNDARY, &mut count) },
+            "packet count",
+        )?;
         if count == 0 {
             return Err("pyrowave-d3d11 produced no packets".into());
         }
@@ -374,8 +398,8 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        disabled, library_candidates, record_acceptable, Encoder, AdapterInfo, CpuBuffer, DeviceInfo,
-        EncInfo, Packet, RateControl,
+        disabled, library_candidates, record_acceptable, AdapterInfo, CpuBuffer, DeviceInfo,
+        EncInfo, Encoder, Packet, RateControl,
     };
     use crate::Frame;
 
@@ -391,7 +415,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<Packet>(), 16);
         assert_eq!(std::mem::size_of::<AdapterInfo>(), 144);
         assert_eq!(std::mem::offset_of!(AdapterInfo, vendor_id), 128);
-        assert_eq!(std::mem::offset_of!(AdapterInfo, dedicated_video_memory), 136);
+        assert_eq!(
+            std::mem::offset_of!(AdapterInfo, dedicated_video_memory),
+            136
+        );
     }
 
     /// Set ETHERQUIC_PYROWAVE_D3D11 to pyrowave_d3d11.dll. A GPU Vulkan decoder
@@ -413,7 +440,11 @@ mod tests {
         let mut encoder = Encoder::new(width, height, 32 * 1024).expect("d3d11 encoder");
         let record = encoder.encode(&frame).expect("d3d11 encode");
         assert!(encoder.adapter().len() > 0, "adapter name");
-        println!("direct-720p bytes={} packets={}", record.len(), super::packet_count(&record));
+        println!(
+            "direct-720p bytes={} packets={}",
+            record.len(),
+            super::packet_count(&record)
+        );
         record_acceptable(width, height, &record).expect("d3d11 record");
     }
 
@@ -443,30 +474,41 @@ mod tests {
             height,
             fps,
             kbps: 0,
+            quality: 0,
         };
-        let (mut encoder, kbps) = crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
+        let (mut encoder, kbps) =
+            crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
         let expect_kbps = (budget.max(16 * 1024) * 8 * fps as usize / 1000) as u32;
         assert_eq!(kbps, expect_kbps, "host default budget");
         if let crate::video::VideoEncoder::PyrowaveD3d11 { inner, .. } = &encoder {
-            println!("desktop-720p adapter={} budget={budget} kbps={kbps}", inner.adapter());
+            println!(
+                "desktop-720p adapter={} budget={budget} kbps={kbps}",
+                inner.adapter()
+            );
         }
         let dump = std::env::var("ETHERQUIC_PYROWAVE_DUMP").ok();
         let mut check_frame = |index: usize, kind: &str, frame: &crate::Frame| {
             assert!(
-                encoder.push(frame).unwrap_or_else(|error| panic!("{kind} frame={index} encode: {error}")),
+                encoder
+                    .push(frame)
+                    .unwrap_or_else(|error| panic!("{kind} frame={index} encode: {error}")),
                 "sink accepted the record"
             );
             let record = {
                 let locked = records.lock().expect("records");
                 locked.last().cloned().expect("sink stored a record")
             };
-            let count = packets_inside(&record).unwrap_or_else(|error| panic!("frame {index}: {error}"));
+            let count =
+                packets_inside(&record).unwrap_or_else(|error| panic!("frame {index}: {error}"));
             println!(
                 "{kind} frame={index} packets={count} bytes={} budget={budget}",
                 record.len()
             );
             assert!(count >= 1, "frame {index} produced no packets");
-            assert!(record.len() > 16, "frame {index} was only a sequence header");
+            assert!(
+                record.len() > 16,
+                "frame {index} was only a sequence header"
+            );
             record_acceptable(width, height, &record)
                 .unwrap_or_else(|error| panic!("frame {index}: {error}"));
             match crate::pyrowave::Decoder::new(width, height) {
@@ -485,7 +527,8 @@ mod tests {
             }
             if let Some(dir) = &dump {
                 let path = format!("{dir}/frame{index}.bin");
-                std::fs::write(&path, &record).unwrap_or_else(|error| panic!("write {path}: {error}"));
+                std::fs::write(&path, &record)
+                    .unwrap_or_else(|error| panic!("write {path}: {error}"));
             }
         };
         for generation in 0..2u32 {
@@ -525,8 +568,10 @@ mod tests {
             height,
             fps,
             kbps: 0,
+            quality: 0,
         };
-        let (mut encoder, kbps) = crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
+        let (mut encoder, kbps) =
+            crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
         let expect_kbps = (budget.max(16 * 1024) * 8 * fps as usize / 1000) as u32;
         assert_eq!(kbps, expect_kbps, "host default budget");
         let adapter = if let crate::video::VideoEncoder::PyrowaveD3d11 { inner, .. } = &encoder {
@@ -540,7 +585,9 @@ mod tests {
         let frame = desktop_frame(width, height, 0);
         for index in 0..warmup {
             assert!(
-                encoder.push(&frame).unwrap_or_else(|error| panic!("warmup frame={index} encode: {error}")),
+                encoder
+                    .push(&frame)
+                    .unwrap_or_else(|error| panic!("warmup frame={index} encode: {error}")),
                 "sink accepted the warmup record"
             );
         }
@@ -548,7 +595,9 @@ mod tests {
         let started = std::time::Instant::now();
         for index in 0..burst {
             assert!(
-                encoder.push(&frame).unwrap_or_else(|error| panic!("burst frame={index} encode: {error}")),
+                encoder
+                    .push(&frame)
+                    .unwrap_or_else(|error| panic!("burst frame={index} encode: {error}")),
                 "sink accepted the burst record"
             );
         }
@@ -562,10 +611,17 @@ mod tests {
             elapsed.as_secs_f64() * 1000.0
         );
         for (index, record) in got.iter().enumerate() {
-            let count = packets_inside(record).unwrap_or_else(|error| panic!("frame {index}: {error}"));
-            println!("burst-720p frame={index} packets={count} bytes={}", record.len());
+            let count =
+                packets_inside(record).unwrap_or_else(|error| panic!("frame {index}: {error}"));
+            println!(
+                "burst-720p frame={index} packets={count} bytes={}",
+                record.len()
+            );
             assert!(count >= 1, "frame {index} produced no packets");
-            assert!(record.len() > 16, "frame {index} was only a sequence header");
+            assert!(
+                record.len() > 16,
+                "frame {index} was only a sequence header"
+            );
         }
         assert!(
             measured >= 60.0,
@@ -643,7 +699,9 @@ mod tests {
             let size = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
             rest = &rest[4..];
             if size == 0 || rest.len() < size {
-                return Err(format!("packet {index} ({size} bytes) is outside the record"));
+                return Err(format!(
+                    "packet {index} ({size} bytes) is outside the record"
+                ));
             }
             rest = &rest[size..];
         }
@@ -682,7 +740,9 @@ pub fn record_acceptable(width: u32, height: u32, record: &[u8]) -> Result<(), S
             if packet_count(record) >= 1 {
                 Ok(())
             } else {
-                Err(format!("no vulkan decoder ({error}) and the record is empty"))
+                Err(format!(
+                    "no vulkan decoder ({error}) and the record is empty"
+                ))
             }
         }
     }
@@ -695,4 +755,3 @@ fn packet_count(record: &[u8]) -> u32 {
         u32::from_le_bytes([record[0], record[1], record[2], record[3]])
     }
 }
-

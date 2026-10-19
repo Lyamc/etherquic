@@ -118,13 +118,12 @@ pub fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|err| format!("current exe: {err}"))?;
     let exe = exe.canonicalize().unwrap_or(exe);
     let copies = collect_copies(&exe);
-    let has_cert = copies.iter().any(|(_, to)| {
-        to.file_name()
-            .is_some_and(|name| name == "cert.pem")
-    });
-    let has_key = copies.iter().any(|(_, to)| {
-        to.file_name().is_some_and(|name| name == "key.pem")
-    });
+    let has_cert = copies
+        .iter()
+        .any(|(_, to)| to.file_name().is_some_and(|name| name == "cert.pem"));
+    let has_key = copies
+        .iter()
+        .any(|(_, to)| to.file_name().is_some_and(|name| name == "key.pem"));
     if !has_cert || !has_key {
         return Err(format!(
             "missing cert.pem or key.pem next to {}",
@@ -141,7 +140,8 @@ pub fn install() -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("create {}: {err}", parent.display()))?;
         }
-        fs::copy(from, to).map_err(|err| format!("copy {} → {}: {err}", from.display(), to.display()))?;
+        fs::copy(from, to)
+            .map_err(|err| format!("copy {} → {}: {err}", from.display(), to.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -268,7 +268,10 @@ mod tests {
         assert!(body.contains("<integer>5</integer>"));
         assert!(!body.contains("etherquic-host --console"));
         assert_eq!(plist_path(), PathBuf::from(PLIST_PATH));
-        assert_eq!(program_path(), support_dir().join("MacOS").join("etherquic-host"));
+        assert_eq!(
+            program_path(),
+            support_dir().join("MacOS").join("etherquic-host")
+        );
         assert_eq!(PLIST_NAME, "dev.etherquic.host.plist");
         assert!(!plist_present() || Path::new(PLIST_PATH).is_file());
     }
@@ -300,8 +303,12 @@ mod tests {
         assert!(dests
             .iter()
             .any(|p| p.ends_with("/etherquic/MacOS/etherquic-host")));
-        assert!(dests.iter().any(|p| p.ends_with("/etherquic/MacOS/cert.pem")));
-        assert!(dests.iter().any(|p| p.ends_with("/etherquic/MacOS/key.pem")));
+        assert!(dests
+            .iter()
+            .any(|p| p.ends_with("/etherquic/MacOS/cert.pem")));
+        assert!(dests
+            .iter()
+            .any(|p| p.ends_with("/etherquic/MacOS/key.pem")));
         assert!(dests.iter().any(|p| p.ends_with("/etherquic/MacOS/cjxl")));
         assert!(dests
             .iter()
@@ -331,17 +338,18 @@ mod tests {
             .iter()
             .map(|(_, to)| to.to_string_lossy().replace('\\', "/"))
             .collect();
-        assert!(dests.iter().any(|p| p.ends_with("/etherquic/MacOS/cert.pem")));
-        assert!(dests.iter().any(|p| p.ends_with("/etherquic/MacOS/key.pem")));
+        assert!(dests
+            .iter()
+            .any(|p| p.ends_with("/etherquic/MacOS/cert.pem")));
+        assert!(dests
+            .iter()
+            .any(|p| p.ends_with("/etherquic/MacOS/key.pem")));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_lone_binary_still_takes_certs_beside_it() {
-        let dir = std::env::temp_dir().join(format!(
-            "eq-macos-lone-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("eq-macos-lone-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("etherquic-host"), b"bin").unwrap();
         fs::write(dir.join("cert.pem"), b"c").unwrap();

@@ -2,7 +2,7 @@
 //! configures, and ask for another codec when a decoder breaks.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use quinn::{Connection, RecvStream, SendStream};
@@ -10,12 +10,13 @@ use tokio::sync::mpsc;
 
 use crate::audio::AudioDecoder;
 use crate::caps;
+use crate::dirty;
 use crate::negotiate::{
     build_offer, Audio, Limit, Offer, OfferInput, StreamConfig, Video, VideoCodec, OFFER_MAGIC,
-    RECORD_CONFIG, RECORD_CURSOR, RECORD_DATA,
+    RECORD_CONFIG, RECORD_CURSOR, RECORD_DATA, RECORD_PATCH,
 };
 use crate::video::VideoDecoder;
-use crate::{wire, Frame, Pcm, Sink};
+use crate::{jpeg, jpeg2000, wire, Frame, Pcm, Sink};
 
 /// What the player decodes, from [`caps::probe`].
 pub fn decodes() -> (Vec<VideoCodec>, Vec<Audio>) {
@@ -31,6 +32,7 @@ pub fn offer_for(
     audio_pin: Option<Audio>,
     max: Limit,
     bitrate_kbps: u32,
+    quality: u8,
 ) -> Offer {
     let (video, audio) = decodes();
     build_offer(&OfferInput {
@@ -42,6 +44,7 @@ pub fn offer_for(
         audio_decodes: &audio,
         max,
         bitrate_kbps,
+        quality,
     })
 }
 
@@ -90,6 +93,7 @@ pub struct Stats {
 enum DecodeIn {
     Config(StreamConfig),
     Data(Vec<u8>),
+    Patch(Vec<u8>),
 }
 
 /// Read pictures. `v2` is an `EVI2` stream; otherwise it is the legacy `EVID`
@@ -112,10 +116,15 @@ pub async fn read_video(
     let decoder_thread = std::thread::Builder::new()
         .name("etherquic-video-decode".into())
         .spawn(move || {
+            let canvas: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
             let counted: Sink<Frame> = {
                 let frames = frames.clone();
                 let decoded = thread_decoded.clone();
+                let canvas = canvas.clone();
                 Arc::new(move |frame: Frame| {
+                    if let Ok(mut slot) = canvas.lock() {
+                        *slot = Some(frame.clone());
+                    }
                     decoded.fetch_add(1, Ordering::Relaxed);
                     frames(frame)
                 })
@@ -134,6 +143,9 @@ pub async fn read_video(
                 match input {
                     DecodeIn::Config(config) => {
                         decoder = None;
+                        if let Ok(mut slot) = canvas.lock() {
+                            *slot = None;
+                        }
                         let Some(video) = config.video else { continue };
                         match VideoDecoder::open(
                             video,
@@ -148,23 +160,46 @@ pub async fn read_video(
                             }
                         }
                     }
+                    DecodeIn::Patch(bytes) => {
+                        let Some((_, video)) = decoder.as_ref() else {
+                            continue;
+                        };
+                        let mut slot = match canvas.lock() {
+                            Ok(slot) => slot,
+                            Err(_) => continue,
+                        };
+                        match apply_patch(&mut slot, *video, &bytes) {
+                            Ok(Some(frame)) => {
+                                drop(slot);
+                                counted(frame);
+                            }
+                            Ok(None) => {}
+                            Err(reason) => {
+                                eprintln!("etherquic-play: picture patch: {reason}");
+                            }
+                        }
+                    }
                     DecodeIn::Data(bytes) => {
                         let Some((dec, video)) = decoder.as_mut() else {
                             continue;
                         };
                         if let Err(reason) = dec.push(&bytes) {
                             let video = *video;
-                            decoder = None;
-                            // MJPEG is the floor: one bad JPEG is skipped, not renegotiated.
-                            if video == Video::Mjpeg {
+                            // MJPEG, MJ2K, and PyroWave are intra: one bad
+                            // record is skipped. Falling back to MJPEG for a
+                            // short PyroWave frame is what the AN515 sessions did.
+                            if video.skip_bad_frame() {
                                 eprintln!("etherquic-play: picture: {reason}");
-                                decoder = Some((
-                                    VideoDecoder::Mjpeg {
-                                        sink: counted.clone(),
-                                    },
-                                    Video::Mjpeg,
-                                ));
+                                if video == Video::Mjpeg {
+                                    decoder = Some((
+                                        VideoDecoder::Mjpeg {
+                                            sink: counted.clone(),
+                                        },
+                                        Video::Mjpeg,
+                                    ));
+                                }
                             } else {
+                                decoder = None;
                                 let _ =
                                     thread_events.send(PlayerEvent::VideoFailed { video, reason });
                             }
@@ -207,6 +242,7 @@ pub async fn read_video(
                     }
                 },
                 Some(&RECORD_DATA) => DecodeIn::Data(record[1..].to_vec()),
+                Some(&RECORD_PATCH) => DecodeIn::Patch(record[1..].to_vec()),
                 Some(&RECORD_CURSOR) => {
                     if let Ok(update) = etherquic::cursor::CursorUpdate::decode(&record[1..]) {
                         let _ = events.send(PlayerEvent::Cursor(update));
@@ -233,6 +269,27 @@ pub async fn read_video(
     drop(tx);
     let _ = tokio::task::spawn_blocking(move || decoder_thread.join()).await;
     result
+}
+
+fn apply_patch(
+    canvas: &mut Option<Frame>,
+    video: Video,
+    bytes: &[u8],
+) -> Result<Option<Frame>, String> {
+    let (rect, coded) = dirty::decode_payload(bytes)?;
+    let tile = match video {
+        Video::Mjpeg => jpeg::decode(coded)?,
+        Video::Mj2k => jpeg2000::decode(coded)?,
+        _ => return Err("this codec does not take a tile".into()),
+    };
+    if tile.width != rect.w || tile.height != rect.h {
+        return Err("patch size does not match its rectangle".into());
+    }
+    let Some(picture) = canvas.as_mut() else {
+        return Ok(None);
+    };
+    dirty::blit(picture, &tile, rect.x, rect.y)?;
+    Ok(Some(picture.clone()))
 }
 
 /// Read audio from `EAU2` (or the legacy `EAUD` PCM stream).

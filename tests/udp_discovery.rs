@@ -104,7 +104,8 @@ fn udp_discovery_end_to_end() {
     let mut announce = b"EQDS".to_vec();
     announce.extend([1, 1]);
     announce.extend(0x0000_1234u32.to_be_bytes());
-    old.send_to(&announce, (Ipv4Addr::LOCALHOST, UDP_PORT)).unwrap();
+    old.send_to(&announce, (Ipv4Addr::LOCALHOST, UDP_PORT))
+        .unwrap();
     let mut buf = [0u8; 2048];
     let (len, _) = old.recv_from(&mut buf).expect("an answer");
     assert!(len <= UDP4_PAYLOAD_LIMIT);

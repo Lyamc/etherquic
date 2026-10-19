@@ -57,6 +57,7 @@ pub fn connect_args(c: &ChildConnect) -> Vec<String> {
     args.extend(["--scale".into(), v.scale.token().into()]);
     args.extend(["--cursor".into(), v.cursor.token().into()]);
     args.extend(["--look".into(), v.look.token().into()]);
+    args.extend(["--quality".into(), v.quality.to_string()]);
     if v.size_match.available() {
         args.extend(["--size-match".into(), v.size_match.token().into()]);
     }

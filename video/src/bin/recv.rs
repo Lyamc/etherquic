@@ -4,9 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use etherquic::{
-    install_pure_crypto, l2_server_endpoint, parse_mac, L2Net, ETHERTYPE_QUIC,
-};
+use etherquic::{install_pure_crypto, l2_server_endpoint, parse_mac, L2Net, ETHERTYPE_QUIC};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

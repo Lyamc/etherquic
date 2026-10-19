@@ -7,14 +7,14 @@ use zune_jpeg::JpegDecoder;
 
 use crate::Frame;
 
-pub const QUALITY: u8 = 40;
+pub const QUALITY: u8 = crate::negotiate::DEFAULT_QUALITY;
 
 pub fn encode(frame: &Frame, quality: u8) -> Result<Vec<u8>, String> {
     frame.check()?;
     let width = u16::try_from(frame.width).map_err(|_| "picture too wide for JPEG")?;
     let height = u16::try_from(frame.height).map_err(|_| "picture too tall for JPEG")?;
     let mut out = Vec::new();
-    Encoder::new(&mut out, quality)
+    Encoder::new(&mut out, quality.clamp(1, 100))
         .encode(&frame.rgb, width, height, ColorType::Rgb)
         .map_err(|error| error.to_string())?;
     Ok(out)

@@ -259,8 +259,7 @@ fn take_bpf_frames(buffer: &[u8], ethertype: u16, out: &mut VecDeque<Vec<u8>>) {
         if buffer.len() - p < hdr_size {
             break;
         }
-        let hdr: libc::bpf_hdr =
-            unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(p).cast()) };
+        let hdr: libc::bpf_hdr = unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(p).cast()) };
         let hdrlen = hdr.bh_hdrlen as usize;
         let caplen = hdr.bh_caplen as usize;
         if hdrlen == 0 {

@@ -682,10 +682,7 @@ mod tests {
             .name("etherquic-l2-io".into())
             .spawn(move || {
                 drive_send(rx, move |frame| {
-                    sent_thread
-                        .lock()
-                        .expect("sent")
-                        .push(frame.to_vec());
+                    sent_thread.lock().expect("sent").push(frame.to_vec());
                 });
             })
             .expect("send thread");
@@ -704,7 +701,10 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
         assert!(wrote, "send stayed behind the blocked recv");
-        assert_eq!(sent.lock().expect("sent").as_slice(), &[b"picture".to_vec()]);
+        assert_eq!(
+            sent.lock().expect("sent").as_slice(),
+            &[b"picture".to_vec()]
+        );
 
         drop(tx);
         let _ = release_tx.send(());

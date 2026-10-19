@@ -78,18 +78,10 @@ fn assemble() -> Vec<u8> {
     types.sort();
     debug_assert!(types.windows(2).all(|pair| pair[0] < pair[1]));
 
-    let string_of = |value: &str| -> u32 {
-        strings
-            .iter()
-            .position(|item| item == value)
-            .expect(value) as u32
-    };
-    let type_of = |desc: &str| -> u16 {
-        types
-            .iter()
-            .position(|item| item == desc)
-            .expect(desc) as u16
-    };
+    let string_of =
+        |value: &str| -> u32 { strings.iter().position(|item| item == value).expect(value) as u32 };
+    let type_of =
+        |desc: &str| -> u16 { types.iter().position(|item| item == desc).expect(desc) as u16 };
     let type_string_ids: Vec<u32> = types.iter().map(|desc| string_of(desc)).collect();
     debug_assert!(type_string_ids.windows(2).all(|pair| pair[0] < pair[1]));
 
@@ -239,7 +231,11 @@ fn assemble() -> Vec<u8> {
     for _ in 0..6 {
         let data = class_data_bytes(
             &[(card_idx as u32, 0), (status_idx as u32, 0)],
-            &[(init_idx as u32, ACC_PUBLIC | ACC_CONSTRUCTOR, init_off as u32)],
+            &[(
+                init_idx as u32,
+                ACC_PUBLIC | ACC_CONSTRUCTOR,
+                init_off as u32,
+            )],
             &[
                 (click_idx as u32, ACC_PUBLIC, click_off as u32),
                 (create_idx as u32, ACC_PUBLIC, create_off as u32),
@@ -345,7 +341,11 @@ fn assemble() -> Vec<u8> {
         (MAP_METHOD_ID, method_ids_size, method_ids_off as u32),
         (MAP_CLASS_DEF, class_defs_size, class_defs_off as u32),
         (MAP_MAP_LIST, 1, map_off as u32),
-        (MAP_TYPE_LIST, interned_lists.len() as u32, type_list_off as u32),
+        (
+            MAP_TYPE_LIST,
+            interned_lists.len() as u32,
+            type_list_off as u32,
+        ),
         (MAP_CLASS_DATA, 1, class_data_off as u32),
         (MAP_CODE, 3, init_off as u32),
         (MAP_STRING_DATA, string_ids_size, string_data_off as u32),
@@ -398,18 +398,54 @@ struct ProtoShape {
 }
 
 const PROTO_SHAPES: &[ProtoShape] = &[
-    ProtoShape { ret: "V", params: &[] },
-    ProtoShape { ret: "V", params: &[BUNDLE] },
-    ProtoShape { ret: "V", params: &[CONTEXT] },
-    ProtoShape { ret: "V", params: &[VIEW] },
-    ProtoShape { ret: "V", params: &[CHAR_SEQ] },
-    ProtoShape { ret: "V", params: &["I"] },
-    ProtoShape { ret: "V", params: &["I", "I", "I", "I"] },
-    ProtoShape { ret: "V", params: &[LISTENER] },
-    ProtoShape { ret: CHAR_SEQ, params: &[] },
-    ProtoShape { ret: STRING, params: &[] },
-    ProtoShape { ret: "Z", params: &[] },
-    ProtoShape { ret: "Z", params: &[STRING] },
+    ProtoShape {
+        ret: "V",
+        params: &[],
+    },
+    ProtoShape {
+        ret: "V",
+        params: &[BUNDLE],
+    },
+    ProtoShape {
+        ret: "V",
+        params: &[CONTEXT],
+    },
+    ProtoShape {
+        ret: "V",
+        params: &[VIEW],
+    },
+    ProtoShape {
+        ret: "V",
+        params: &[CHAR_SEQ],
+    },
+    ProtoShape {
+        ret: "V",
+        params: &["I"],
+    },
+    ProtoShape {
+        ret: "V",
+        params: &["I", "I", "I", "I"],
+    },
+    ProtoShape {
+        ret: "V",
+        params: &[LISTENER],
+    },
+    ProtoShape {
+        ret: CHAR_SEQ,
+        params: &[],
+    },
+    ProtoShape {
+        ret: STRING,
+        params: &[],
+    },
+    ProtoShape {
+        ret: "Z",
+        params: &[],
+    },
+    ProtoShape {
+        ret: "Z",
+        params: &[STRING],
+    },
 ];
 
 const FIELD_SHAPES: &[FieldShape] = &[
@@ -426,32 +462,162 @@ const FIELD_SHAPES: &[FieldShape] = &[
 ];
 
 const METHOD_SHAPES: &[Shape] = &[
-    Shape { class: ACTIVITY, name: "<init>", ret: "V", params: &[] },
-    Shape { class: ACTIVITY, name: "onCreate", ret: "V", params: &[BUNDLE] },
-    Shape { class: ACTIVITY, name: "setContentView", ret: "V", params: &[VIEW] },
-    Shape { class: MAIN, name: "<init>", ret: "V", params: &[] },
-    Shape { class: MAIN, name: "onCreate", ret: "V", params: &[BUNDLE] },
-    Shape { class: MAIN, name: "onClick", ret: "V", params: &[VIEW] },
-    Shape { class: LINEAR, name: "<init>", ret: "V", params: &[CONTEXT] },
-    Shape { class: LINEAR, name: "setOrientation", ret: "V", params: &["I"] },
-    Shape { class: VIEW_GROUP, name: "addView", ret: "V", params: &[VIEW] },
-    Shape { class: VIEW, name: "setPadding", ret: "V", params: &["I", "I", "I", "I"] },
-    Shape { class: VIEW, name: "setOnClickListener", ret: "V", params: &[LISTENER] },
-    Shape { class: TEXT_VIEW, name: "<init>", ret: "V", params: &[CONTEXT] },
-    Shape { class: TEXT_VIEW, name: "setText", ret: "V", params: &[CHAR_SEQ] },
-    Shape { class: TEXT_VIEW, name: "setHint", ret: "V", params: &[CHAR_SEQ] },
-    Shape { class: TEXT_VIEW, name: "setMinLines", ret: "V", params: &["I"] },
-    Shape { class: TEXT_VIEW, name: "setGravity", ret: "V", params: &["I"] },
-    Shape { class: TEXT_VIEW, name: "setInputType", ret: "V", params: &["I"] },
-    Shape { class: TEXT_VIEW, name: "setTextColor", ret: "V", params: &["I"] },
-    Shape { class: TEXT_VIEW, name: "setHintTextColor", ret: "V", params: &["I"] },
-    Shape { class: TEXT_VIEW, name: "getText", ret: CHAR_SEQ, params: &[] },
-    Shape { class: EDIT_TEXT, name: "<init>", ret: "V", params: &[CONTEXT] },
-    Shape { class: BUTTON, name: "<init>", ret: "V", params: &[CONTEXT] },
-    Shape { class: OBJECT, name: "toString", ret: STRING, params: &[] },
-    Shape { class: STRING, name: "trim", ret: STRING, params: &[] },
-    Shape { class: STRING, name: "isEmpty", ret: "Z", params: &[] },
-    Shape { class: STRING, name: "startsWith", ret: "Z", params: &[STRING] },
+    Shape {
+        class: ACTIVITY,
+        name: "<init>",
+        ret: "V",
+        params: &[],
+    },
+    Shape {
+        class: ACTIVITY,
+        name: "onCreate",
+        ret: "V",
+        params: &[BUNDLE],
+    },
+    Shape {
+        class: ACTIVITY,
+        name: "setContentView",
+        ret: "V",
+        params: &[VIEW],
+    },
+    Shape {
+        class: MAIN,
+        name: "<init>",
+        ret: "V",
+        params: &[],
+    },
+    Shape {
+        class: MAIN,
+        name: "onCreate",
+        ret: "V",
+        params: &[BUNDLE],
+    },
+    Shape {
+        class: MAIN,
+        name: "onClick",
+        ret: "V",
+        params: &[VIEW],
+    },
+    Shape {
+        class: LINEAR,
+        name: "<init>",
+        ret: "V",
+        params: &[CONTEXT],
+    },
+    Shape {
+        class: LINEAR,
+        name: "setOrientation",
+        ret: "V",
+        params: &["I"],
+    },
+    Shape {
+        class: VIEW_GROUP,
+        name: "addView",
+        ret: "V",
+        params: &[VIEW],
+    },
+    Shape {
+        class: VIEW,
+        name: "setPadding",
+        ret: "V",
+        params: &["I", "I", "I", "I"],
+    },
+    Shape {
+        class: VIEW,
+        name: "setOnClickListener",
+        ret: "V",
+        params: &[LISTENER],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "<init>",
+        ret: "V",
+        params: &[CONTEXT],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "setText",
+        ret: "V",
+        params: &[CHAR_SEQ],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "setHint",
+        ret: "V",
+        params: &[CHAR_SEQ],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "setMinLines",
+        ret: "V",
+        params: &["I"],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "setGravity",
+        ret: "V",
+        params: &["I"],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "setInputType",
+        ret: "V",
+        params: &["I"],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "setTextColor",
+        ret: "V",
+        params: &["I"],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "setHintTextColor",
+        ret: "V",
+        params: &["I"],
+    },
+    Shape {
+        class: TEXT_VIEW,
+        name: "getText",
+        ret: CHAR_SEQ,
+        params: &[],
+    },
+    Shape {
+        class: EDIT_TEXT,
+        name: "<init>",
+        ret: "V",
+        params: &[CONTEXT],
+    },
+    Shape {
+        class: BUTTON,
+        name: "<init>",
+        ret: "V",
+        params: &[CONTEXT],
+    },
+    Shape {
+        class: OBJECT,
+        name: "toString",
+        ret: STRING,
+        params: &[],
+    },
+    Shape {
+        class: STRING,
+        name: "trim",
+        ret: STRING,
+        params: &[],
+    },
+    Shape {
+        class: STRING,
+        name: "isEmpty",
+        ret: "Z",
+        params: &[],
+    },
+    Shape {
+        class: STRING,
+        name: "startsWith",
+        ret: "Z",
+        params: &[STRING],
+    },
 ];
 
 #[derive(Clone, PartialEq, Eq)]
@@ -484,18 +650,58 @@ struct Ids<'a> {
 
 enum Op {
     ReturnVoid,
-    MoveObject { dest: u8, src: u8 },
-    Const4 { dest: u8, value: i8 },
-    Const16 { dest: u8, value: i16 },
-    Const32 { dest: u8, value: u32 },
-    ConstString { dest: u8, value: &'static str },
-    New { dest: u8, ty: &'static str },
-    Invoke { kind: u8, class: &'static str, name: &'static str, ret: &'static str, params: &'static [&'static str], args: &'static [u8] },
-    MoveResultObject { dest: u8 },
-    MoveResult { dest: u8 },
-    IgetObject { dest: u8, obj: u8, name: &'static str },
-    IputObject { src: u8, obj: u8, name: &'static str },
-    IfEqz { reg: u8, label: &'static str },
+    MoveObject {
+        dest: u8,
+        src: u8,
+    },
+    Const4 {
+        dest: u8,
+        value: i8,
+    },
+    Const16 {
+        dest: u8,
+        value: i16,
+    },
+    Const32 {
+        dest: u8,
+        value: u32,
+    },
+    ConstString {
+        dest: u8,
+        value: &'static str,
+    },
+    New {
+        dest: u8,
+        ty: &'static str,
+    },
+    Invoke {
+        kind: u8,
+        class: &'static str,
+        name: &'static str,
+        ret: &'static str,
+        params: &'static [&'static str],
+        args: &'static [u8],
+    },
+    MoveResultObject {
+        dest: u8,
+    },
+    MoveResult {
+        dest: u8,
+    },
+    IgetObject {
+        dest: u8,
+        obj: u8,
+        name: &'static str,
+    },
+    IputObject {
+        src: u8,
+        obj: u8,
+        name: &'static str,
+    },
+    IfEqz {
+        reg: u8,
+        label: &'static str,
+    },
     Label(&'static str),
 }
 
@@ -510,51 +716,265 @@ fn on_create_ops() -> Vec<Op> {
     // registers=8, ins=2 → this=v6, bundle=v7. v0=this, v1=root, v3=child, v2/v4 temps.
     vec![
         Op::MoveObject { dest: 0, src: 6 },
-        invoke(OP_INVOKE_SUPER, ACTIVITY, "onCreate", "V", &[BUNDLE], &[0, 7]),
-        Op::New { dest: 1, ty: LINEAR },
+        invoke(
+            OP_INVOKE_SUPER,
+            ACTIVITY,
+            "onCreate",
+            "V",
+            &[BUNDLE],
+            &[0, 7],
+        ),
+        Op::New {
+            dest: 1,
+            ty: LINEAR,
+        },
         invoke(OP_INVOKE_DIRECT, LINEAR, "<init>", "V", &[CONTEXT], &[1, 0]),
         Op::Const4 { dest: 2, value: 1 },
-        invoke(OP_INVOKE_VIRTUAL, LINEAR, "setOrientation", "V", &["I"], &[1, 2]),
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            LINEAR,
+            "setOrientation",
+            "V",
+            &["I"],
+            &[1, 2],
+        ),
         Op::Const16 { dest: 2, value: 48 },
-        invoke(OP_INVOKE_VIRTUAL, VIEW, "setPadding", "V", &["I", "I", "I", "I"], &[1, 2, 2, 2, 2]),
-        Op::New { dest: 3, ty: TEXT_VIEW },
-        invoke(OP_INVOKE_DIRECT, TEXT_VIEW, "<init>", "V", &[CONTEXT], &[3, 0]),
-        Op::ConstString { dest: 4, value: HINT },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setText", "V", &[CHAR_SEQ], &[3, 4]),
-        Op::Const32 { dest: 4, value: 0xff22_2222 },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setTextColor", "V", &["I"], &[3, 4]),
-        invoke(OP_INVOKE_VIRTUAL, VIEW_GROUP, "addView", "V", &[VIEW], &[1, 3]),
-        Op::New { dest: 3, ty: EDIT_TEXT },
-        invoke(OP_INVOKE_DIRECT, EDIT_TEXT, "<init>", "V", &[CONTEXT], &[3, 0]),
-        Op::ConstString { dest: 4, value: CARD_HINT },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setHint", "V", &[CHAR_SEQ], &[3, 4]),
-        Op::Const32 { dest: 4, value: 0xff88_8888 },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setHintTextColor", "V", &["I"], &[3, 4]),
-        Op::Const32 { dest: 4, value: 0xff22_2222 },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setTextColor", "V", &["I"], &[3, 4]),
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            VIEW,
+            "setPadding",
+            "V",
+            &["I", "I", "I", "I"],
+            &[1, 2, 2, 2, 2],
+        ),
+        Op::New {
+            dest: 3,
+            ty: TEXT_VIEW,
+        },
+        invoke(
+            OP_INVOKE_DIRECT,
+            TEXT_VIEW,
+            "<init>",
+            "V",
+            &[CONTEXT],
+            &[3, 0],
+        ),
+        Op::ConstString {
+            dest: 4,
+            value: HINT,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setText",
+            "V",
+            &[CHAR_SEQ],
+            &[3, 4],
+        ),
+        Op::Const32 {
+            dest: 4,
+            value: 0xff22_2222,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setTextColor",
+            "V",
+            &["I"],
+            &[3, 4],
+        ),
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            VIEW_GROUP,
+            "addView",
+            "V",
+            &[VIEW],
+            &[1, 3],
+        ),
+        Op::New {
+            dest: 3,
+            ty: EDIT_TEXT,
+        },
+        invoke(
+            OP_INVOKE_DIRECT,
+            EDIT_TEXT,
+            "<init>",
+            "V",
+            &[CONTEXT],
+            &[3, 0],
+        ),
+        Op::ConstString {
+            dest: 4,
+            value: CARD_HINT,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setHint",
+            "V",
+            &[CHAR_SEQ],
+            &[3, 4],
+        ),
+        Op::Const32 {
+            dest: 4,
+            value: 0xff88_8888,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setHintTextColor",
+            "V",
+            &["I"],
+            &[3, 4],
+        ),
+        Op::Const32 {
+            dest: 4,
+            value: 0xff22_2222,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setTextColor",
+            "V",
+            &["I"],
+            &[3, 4],
+        ),
         Op::Const4 { dest: 4, value: 6 },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setMinLines", "V", &["I"], &[3, 4]),
-        Op::Const16 { dest: 4, value: 0x30 },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setGravity", "V", &["I"], &[3, 4]),
-        Op::Const32 { dest: 4, value: 0x0002_0001 },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setInputType", "V", &["I"], &[3, 4]),
-        Op::IputObject { src: 3, obj: 0, name: "card" },
-        invoke(OP_INVOKE_VIRTUAL, VIEW_GROUP, "addView", "V", &[VIEW], &[1, 3]),
-        Op::New { dest: 3, ty: BUTTON },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setMinLines",
+            "V",
+            &["I"],
+            &[3, 4],
+        ),
+        Op::Const16 {
+            dest: 4,
+            value: 0x30,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setGravity",
+            "V",
+            &["I"],
+            &[3, 4],
+        ),
+        Op::Const32 {
+            dest: 4,
+            value: 0x0002_0001,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setInputType",
+            "V",
+            &["I"],
+            &[3, 4],
+        ),
+        Op::IputObject {
+            src: 3,
+            obj: 0,
+            name: "card",
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            VIEW_GROUP,
+            "addView",
+            "V",
+            &[VIEW],
+            &[1, 3],
+        ),
+        Op::New {
+            dest: 3,
+            ty: BUTTON,
+        },
         invoke(OP_INVOKE_DIRECT, BUTTON, "<init>", "V", &[CONTEXT], &[3, 0]),
-        Op::ConstString { dest: 4, value: JOIN },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setText", "V", &[CHAR_SEQ], &[3, 4]),
-        invoke(OP_INVOKE_VIRTUAL, VIEW, "setOnClickListener", "V", &[LISTENER], &[3, 0]),
-        invoke(OP_INVOKE_VIRTUAL, VIEW_GROUP, "addView", "V", &[VIEW], &[1, 3]),
-        Op::New { dest: 3, ty: TEXT_VIEW },
-        invoke(OP_INVOKE_DIRECT, TEXT_VIEW, "<init>", "V", &[CONTEXT], &[3, 0]),
-        Op::ConstString { dest: 4, value: STATUS },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setText", "V", &[CHAR_SEQ], &[3, 4]),
-        Op::Const32 { dest: 4, value: 0xff22_2222 },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setTextColor", "V", &["I"], &[3, 4]),
-        Op::IputObject { src: 3, obj: 0, name: "status" },
-        invoke(OP_INVOKE_VIRTUAL, VIEW_GROUP, "addView", "V", &[VIEW], &[1, 3]),
-        invoke(OP_INVOKE_VIRTUAL, ACTIVITY, "setContentView", "V", &[VIEW], &[0, 1]),
+        Op::ConstString {
+            dest: 4,
+            value: JOIN,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setText",
+            "V",
+            &[CHAR_SEQ],
+            &[3, 4],
+        ),
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            VIEW,
+            "setOnClickListener",
+            "V",
+            &[LISTENER],
+            &[3, 0],
+        ),
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            VIEW_GROUP,
+            "addView",
+            "V",
+            &[VIEW],
+            &[1, 3],
+        ),
+        Op::New {
+            dest: 3,
+            ty: TEXT_VIEW,
+        },
+        invoke(
+            OP_INVOKE_DIRECT,
+            TEXT_VIEW,
+            "<init>",
+            "V",
+            &[CONTEXT],
+            &[3, 0],
+        ),
+        Op::ConstString {
+            dest: 4,
+            value: STATUS,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setText",
+            "V",
+            &[CHAR_SEQ],
+            &[3, 4],
+        ),
+        Op::Const32 {
+            dest: 4,
+            value: 0xff22_2222,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setTextColor",
+            "V",
+            &["I"],
+            &[3, 4],
+        ),
+        Op::IputObject {
+            src: 3,
+            obj: 0,
+            name: "status",
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            VIEW_GROUP,
+            "addView",
+            "V",
+            &[VIEW],
+            &[1, 3],
+        ),
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            ACTIVITY,
+            "setContentView",
+            "V",
+            &[VIEW],
+            &[0, 1],
+        ),
         Op::ReturnVoid,
     ]
 }
@@ -562,7 +982,11 @@ fn on_create_ops() -> Vec<Op> {
 fn on_click_ops() -> Vec<Op> {
     // registers=5, ins=2 → this=v3, view=v4.
     vec![
-        Op::IgetObject { dest: 0, obj: 3, name: "card" },
+        Op::IgetObject {
+            dest: 0,
+            obj: 3,
+            name: "card",
+        },
         invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "getText", CHAR_SEQ, &[], &[0]),
         Op::MoveResultObject { dest: 0 },
         invoke(OP_INVOKE_VIRTUAL, OBJECT, "toString", STRING, &[], &[0]),
@@ -571,24 +995,82 @@ fn on_click_ops() -> Vec<Op> {
         Op::MoveResultObject { dest: 0 },
         invoke(OP_INVOKE_VIRTUAL, STRING, "isEmpty", "Z", &[], &[0]),
         Op::MoveResult { dest: 1 },
-        Op::IfEqz { reg: 1, label: "has_text" },
-        Op::IgetObject { dest: 0, obj: 3, name: "status" },
-        Op::ConstString { dest: 1, value: NEED_CARD },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setText", "V", &[CHAR_SEQ], &[0, 1]),
+        Op::IfEqz {
+            reg: 1,
+            label: "has_text",
+        },
+        Op::IgetObject {
+            dest: 0,
+            obj: 3,
+            name: "status",
+        },
+        Op::ConstString {
+            dest: 1,
+            value: NEED_CARD,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setText",
+            "V",
+            &[CHAR_SEQ],
+            &[0, 1],
+        ),
         Op::ReturnVoid,
         Op::Label("has_text"),
-        Op::ConstString { dest: 1, value: HEADER },
-        invoke(OP_INVOKE_VIRTUAL, STRING, "startsWith", "Z", &[STRING], &[0, 1]),
+        Op::ConstString {
+            dest: 1,
+            value: HEADER,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            STRING,
+            "startsWith",
+            "Z",
+            &[STRING],
+            &[0, 1],
+        ),
         Op::MoveResult { dest: 1 },
-        Op::IfEqz { reg: 1, label: "bad" },
-        Op::IgetObject { dest: 1, obj: 3, name: "status" },
-        Op::ConstString { dest: 2, value: GOOD_CARD },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setText", "V", &[CHAR_SEQ], &[1, 2]),
+        Op::IfEqz {
+            reg: 1,
+            label: "bad",
+        },
+        Op::IgetObject {
+            dest: 1,
+            obj: 3,
+            name: "status",
+        },
+        Op::ConstString {
+            dest: 2,
+            value: GOOD_CARD,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setText",
+            "V",
+            &[CHAR_SEQ],
+            &[1, 2],
+        ),
         Op::ReturnVoid,
         Op::Label("bad"),
-        Op::IgetObject { dest: 1, obj: 3, name: "status" },
-        Op::ConstString { dest: 2, value: BAD_CARD },
-        invoke(OP_INVOKE_VIRTUAL, TEXT_VIEW, "setText", "V", &[CHAR_SEQ], &[1, 2]),
+        Op::IgetObject {
+            dest: 1,
+            obj: 3,
+            name: "status",
+        },
+        Op::ConstString {
+            dest: 2,
+            value: BAD_CARD,
+        },
+        invoke(
+            OP_INVOKE_VIRTUAL,
+            TEXT_VIEW,
+            "setText",
+            "V",
+            &[CHAR_SEQ],
+            &[1, 2],
+        ),
         Op::ReturnVoid,
     ]
 }
@@ -735,16 +1217,11 @@ fn encode(ops: &[Op], ids: &Ids<'_>) -> Vec<u16> {
                 let e = args.get(2).copied().unwrap_or(0);
                 let f = args.get(3).copied().unwrap_or(0);
                 units.push(Some(
-                    u16::from(*kind)
-                        | u16::from(g) << 8
-                        | (args.len() as u16) << 12,
+                    u16::from(*kind) | u16::from(g) << 8 | (args.len() as u16) << 12,
                 ));
                 units.push(Some(method));
                 units.push(Some(
-                    u16::from(c)
-                        | u16::from(d) << 4
-                        | u16::from(e) << 8
-                        | u16::from(f) << 12,
+                    u16::from(c) | u16::from(d) << 4 | u16::from(e) << 8 | u16::from(f) << 12,
                 ));
             }
             Op::MoveResultObject { dest } => {
@@ -923,7 +1400,11 @@ mod tests {
         assert!(dex
             .windows(descriptor.len())
             .any(|window| window == descriptor));
-        for needle in [b"onCreate".as_slice(), b"Join".as_slice(), b"onClick".as_slice()] {
+        for needle in [
+            b"onCreate".as_slice(),
+            b"Join".as_slice(),
+            b"onClick".as_slice(),
+        ] {
             assert!(
                 dex.windows(needle.len()).any(|window| window == needle),
                 "missing {}",

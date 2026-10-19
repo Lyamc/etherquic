@@ -78,7 +78,8 @@ struct Api {
     encoder_create: unsafe extern "C" fn(*const EncInfo, *mut Handle) -> c_int,
     encode_cpu: unsafe extern "C" fn(Handle, *const CpuBuffer, *const RateControl) -> c_int,
     num_packets: unsafe extern "C" fn(Handle, usize, *mut usize) -> c_int,
-    packetize: unsafe extern "C" fn(Handle, *mut Packet, usize, *mut usize, *mut c_void, usize) -> c_int,
+    packetize:
+        unsafe extern "C" fn(Handle, *mut Packet, usize, *mut usize, *mut c_void, usize) -> c_int,
     encoder_destroy: unsafe extern "C" fn(Handle),
     prefers_fragment: unsafe extern "C" fn(Handle) -> bool,
     decoder_create: unsafe extern "C" fn(*const DecInfo, *mut Handle) -> c_int,
@@ -116,7 +117,10 @@ fn check(code: c_int, what: &str) -> Result<(), String> {
 }
 
 fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok()?.parent().map(|dir| dir.to_path_buf())
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|dir| dir.to_path_buf())
 }
 
 /// Places to look, most specific first. `ETHERQUIC_PYROWAVE` wins.
@@ -183,7 +187,10 @@ fn prepare_vulkan() {
         if std::env::var_os("GRANITE_VULKAN_LIBRARY").is_none() {
             let bundled = exe_dir().map(|dir| dir.join("../Frameworks/libvulkan.1.dylib"));
             let brew = PathBuf::from("/opt/homebrew/lib/libvulkan.1.dylib");
-            if let Some(loader) = bundled.filter(|p| p.is_file()).or(brew.is_file().then_some(brew)) {
+            if let Some(loader) = bundled
+                .filter(|p| p.is_file())
+                .or(brew.is_file().then_some(brew))
+            {
                 std::env::set_var("GRANITE_VULKAN_LIBRARY", loader);
             }
         }
@@ -302,7 +309,10 @@ fn preload_cpu_vulkan() {
         if system.is_file() || std::env::var_os("ETHERQUIC_NO_CPU_VULKAN").is_some() {
             return;
         }
-        let dirs = [exe_dir(), Some(PathBuf::from(r"C:\Program Files\etherquic"))];
+        let dirs = [
+            exe_dir(),
+            Some(PathBuf::from(r"C:\Program Files\etherquic")),
+        ];
         let Some(dir) = dirs
             .into_iter()
             .flatten()
@@ -329,7 +339,11 @@ fn load(path: &PathBuf) -> Result<Library, String> {
     #[cfg(windows)]
     {
         use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
-        let flags = if path.is_absolute() { LOAD_WITH_ALTERED_SEARCH_PATH } else { 0 };
+        let flags = if path.is_absolute() {
+            LOAD_WITH_ALTERED_SEARCH_PATH
+        } else {
+            0
+        };
         unsafe { WinLibrary::load_with_flags(path, flags) }
             .map(Library::from)
             .map_err(|error| error.to_string())
@@ -374,18 +388,26 @@ fn open_api() -> Result<Api, String> {
             is_ready: sym!("pyrowave_decoder_decode_is_ready"),
             decode_cpu: sym!("pyrowave_decoder_decode_cpu_buffer_synchronous"),
             decoder_destroy: sym!("pyrowave_decoder_destroy"),
-            vk_handles: unsafe { lib.get(b"pyrowave_device_get_vk_device_handles\0") }.ok().map(|f| *f),
+            vk_handles: unsafe { lib.get(b"pyrowave_device_get_vk_device_handles\0") }
+                .ok()
+                .map(|f| *f),
             _lib: lib,
         };
         let (mut major, mut minor, mut patch) = (0, 0, 0);
         unsafe { (api.version)(&mut major, &mut minor, &mut patch) };
         if major != 1 {
-            errors.push(format!("{}: API {major}.{minor}.{patch}, want 1.x", path.display()));
+            errors.push(format!(
+                "{}: API {major}.{minor}.{patch}, want 1.x",
+                path.display()
+            ));
             continue;
         }
         return Ok(api);
     }
-    Err(format!("libpyrowave-shared not loaded ({})", errors.join("; ")))
+    Err(format!(
+        "libpyrowave-shared not loaded ({})",
+        errors.join("; ")
+    ))
 }
 
 fn api() -> Result<Arc<Api>, String> {
@@ -407,7 +429,10 @@ impl Device {
     fn new() -> Result<Device, String> {
         let api = api()?;
         let mut handle: Handle = std::ptr::null_mut();
-        check(unsafe { (api.create_default_device)(&mut handle) }, "device")?;
+        check(
+            unsafe { (api.create_default_device)(&mut handle) },
+            "device",
+        )?;
         if handle.is_null() {
             return Err("pyrowave device: null handle".into());
         }
@@ -428,7 +453,9 @@ const VK_PHYSICAL_DEVICE_TYPE_CPU: i32 = 4;
 /// A Vulkan device name that is a CPU driver, for drivers that do not say so.
 pub fn cpu_driver_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["llvmpipe", "lavapipe", "swiftshader", "softpipe"].iter().any(|n| name.contains(n))
+    ["llvmpipe", "lavapipe", "swiftshader", "softpipe"]
+        .iter()
+        .any(|n| name.contains(n))
 }
 
 /// Read `deviceType` and `deviceName` out of a `VkPhysicalDeviceProperties`.
@@ -443,14 +470,19 @@ fn device_from_properties(bytes: &[u8]) -> Option<VulkanDevice> {
     Some(VulkanDevice { name, cpu })
 }
 
-type GetInstanceProcAddr = unsafe extern "system" fn(Handle, *const std::os::raw::c_char) -> Option<unsafe extern "system" fn()>;
+type GetInstanceProcAddr = unsafe extern "system" fn(
+    Handle,
+    *const std::os::raw::c_char,
+) -> Option<unsafe extern "system" fn()>;
 
 /// `vkGetInstanceProcAddr` of the loader Granite already opened. Only an
 /// already-loaded module is used, so this never pairs Granite's instance with
 /// a second loader.
 fn loaded_instance_proc_addr() -> Option<GetInstanceProcAddr> {
     #[cfg(windows)]
-    let lib: Library = libloading::os::windows::Library::open_already_loaded("vulkan-1.dll").ok()?.into();
+    let lib: Library = libloading::os::windows::Library::open_already_loaded("vulkan-1.dll")
+        .ok()?
+        .into();
     #[cfg(unix)]
     let lib: Library = {
         use libloading::os::unix::{Library as UnixLibrary, RTLD_LAZY, RTLD_LOCAL};
@@ -467,7 +499,9 @@ fn loaded_instance_proc_addr() -> Option<GetInstanceProcAddr> {
         names.extend(defaults.iter().map(|n| n.into()));
         names
             .into_iter()
-            .find_map(|name| unsafe { UnixLibrary::open(Some(name), RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD) }.ok())?
+            .find_map(|name| {
+                unsafe { UnixLibrary::open(Some(name), RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD) }.ok()
+            })?
             .into()
     };
     let gipa: GetInstanceProcAddr = *unsafe { lib.get(b"vkGetInstanceProcAddr\0") }.ok()?;
@@ -479,8 +513,16 @@ fn loaded_instance_proc_addr() -> Option<GetInstanceProcAddr> {
 impl Device {
     fn vulkan_device(&self) -> Option<VulkanDevice> {
         let get = self.api.vk_handles?;
-        let (mut instance, mut physical): (Handle, Handle) = (std::ptr::null_mut(), std::ptr::null_mut());
-        unsafe { get(self.handle, &mut instance, &mut physical, std::ptr::null_mut()) };
+        let (mut instance, mut physical): (Handle, Handle) =
+            (std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe {
+            get(
+                self.handle,
+                &mut instance,
+                &mut physical,
+                std::ptr::null_mut(),
+            )
+        };
         if instance.is_null() || physical.is_null() {
             return None;
         }
@@ -536,12 +578,22 @@ impl Encoder {
     /// `frame_bytes` is the per-picture budget (bitrate / 8 / fps).
     pub fn new(width: u32, height: u32, frame_bytes: usize) -> Result<Encoder, String> {
         if width % 2 != 0 || height % 2 != 0 || width < 16 || height < 16 {
-            return Err(format!("pyrowave needs even sides of 16 or more, got {width}x{height}"));
+            return Err(format!(
+                "pyrowave needs even sides of 16 or more, got {width}x{height}"
+            ));
         }
         let device = Device::new()?;
-        let info = EncInfo { device: device.handle, width: width as c_int, height: height as c_int, chroma: CHROMA_420 };
+        let info = EncInfo {
+            device: device.handle,
+            width: width as c_int,
+            height: height as c_int,
+            chroma: CHROMA_420,
+        };
         let mut handle: Handle = std::ptr::null_mut();
-        check(unsafe { (device.api.encoder_create)(&info, &mut handle) }, "encoder")?;
+        check(
+            unsafe { (device.api.encoder_create)(&info, &mut handle) },
+            "encoder",
+        )?;
         let frame_bytes = frame_bytes.max(16 * 1024);
         Ok(Encoder {
             device,
@@ -573,10 +625,18 @@ impl Encoder {
         rgb_to_i420(frame, &mut self.planes);
         let api = &self.device.api;
         let buffer = planes_buffer(&mut self.planes);
-        let rate = RateControl { maximum_bitstream_size: self.frame_bytes };
-        check(unsafe { (api.encode_cpu)(self.handle, &buffer, &rate) }, "encode")?;
+        let rate = RateControl {
+            maximum_bitstream_size: self.frame_bytes,
+        };
+        check(
+            unsafe { (api.encode_cpu)(self.handle, &buffer, &rate) },
+            "encode",
+        )?;
         let mut count = 0usize;
-        check(unsafe { (api.num_packets)(self.handle, PACKET_BOUNDARY, &mut count) }, "packet count")?;
+        check(
+            unsafe { (api.num_packets)(self.handle, PACKET_BOUNDARY, &mut count) },
+            "packet count",
+        )?;
         self.packets.resize(count.max(1), Packet::default());
         let mut written = 0usize;
         check(
@@ -638,8 +698,15 @@ impl Decoder {
             fragment_path: fragment,
         };
         let mut handle: Handle = std::ptr::null_mut();
-        check(unsafe { (device.api.decoder_create)(&info, &mut handle) }, "decoder")?;
-        Ok(Decoder { device, handle, planes: I420::new(width as usize, height as usize) })
+        check(
+            unsafe { (device.api.decoder_create)(&info, &mut handle) },
+            "decoder",
+        )?;
+        Ok(Decoder {
+            device,
+            handle,
+            planes: I420::new(width as usize, height as usize),
+        })
     }
 
     /// The Vulkan device this decoder runs on, when the library can say.
@@ -658,10 +725,15 @@ impl Decoder {
                 return Err("pyrowave record is short".into());
             }
             let (packet, tail) = rest.split_at(size);
-            check(unsafe { (api.push_packet)(self.handle, packet.as_ptr().cast(), packet.len()) }, "push")?;
+            check(
+                unsafe { (api.push_packet)(self.handle, packet.as_ptr().cast(), packet.len()) },
+                "push",
+            )?;
             rest = tail;
         }
-        if !unsafe { (api.is_ready)(self.handle, false) } && !unsafe { (api.is_ready)(self.handle, true) } {
+        if !unsafe { (api.is_ready)(self.handle, false) }
+            && !unsafe { (api.is_ready)(self.handle, true) }
+        {
             return Err("pyrowave frame is incomplete".into());
         }
         let buffer = planes_buffer(&mut self.planes);
@@ -703,10 +775,18 @@ mod device_tests {
 
     #[test]
     fn cpu_device_type_or_driver_name_is_software() {
-        assert!(device_from_properties(&props(4, "llvmpipe (LLVM 19.1.7, 256 bits)")).unwrap().cpu);
+        assert!(
+            device_from_properties(&props(4, "llvmpipe (LLVM 19.1.7, 256 bits)"))
+                .unwrap()
+                .cpu
+        );
         assert!(device_from_properties(&props(4, "Some CPU")).unwrap().cpu);
         // A driver that reports "other" but is SwiftShader.
-        assert!(device_from_properties(&props(0, "SwiftShader Device (Subzero)")).unwrap().cpu);
+        assert!(
+            device_from_properties(&props(0, "SwiftShader Device (Subzero)"))
+                .unwrap()
+                .cpu
+        );
         let gpu = device_from_properties(&props(2, "NVIDIA GeForce RTX 4090")).unwrap();
         assert!(!gpu.cpu);
         assert_eq!(gpu.name, "NVIDIA GeForce RTX 4090");
@@ -724,6 +804,10 @@ mod device_tests {
         assert!(vulkan_loader_in_script("no loader here").is_none());
         let _ = std::fs::remove_dir_all(&dir);
         // KosmicKrisp on Metal is an integrated GPU.
-        assert!(!device_from_properties(&props(1, "Apple M2 Pro (KosmicKrisp)")).unwrap().cpu);
+        assert!(
+            !device_from_properties(&props(1, "Apple M2 Pro (KosmicKrisp)"))
+                .unwrap()
+                .cpu
+        );
     }
 }

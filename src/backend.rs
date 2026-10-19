@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::discover::{
-    AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_AV1, VIDEO_H264, VIDEO_H265, VIDEO_MJPEG,
-    VIDEO_PYROWAVE,
+    AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_AV1, VIDEO_H264, VIDEO_H265, VIDEO_MJ2K,
+    VIDEO_MJPEG, VIDEO_PYROWAVE,
 };
 
 /// A tool that can encode and decode Opus.
@@ -373,6 +373,7 @@ pub fn offer_from(
             false,
             false,
         ),
+        row(VIDEO_MJ2K, false, false, false, false, false, false, false),
         row(VIDEO_MJPEG, false, false, false, false, false, false, false),
         row(
             VIDEO_H264, nvidia, nvidia, false, false, false, false, false,

@@ -6,22 +6,22 @@
 
 #![cfg_attr(not(windows), forbid(unsafe_code))]
 
+#[cfg(feature = "ui")]
+mod badge;
 #[cfg(all(feature = "ui", target_os = "macos"))]
 mod child_view;
 #[cfg(feature = "ui")]
-mod badge;
-#[cfg(feature = "ui")]
 mod hosts;
+mod link;
 #[cfg(feature = "ui")]
 pub mod macos_service;
-mod link;
 #[cfg(feature = "ui")]
 mod place;
 #[cfg(feature = "ui")]
 mod prefs;
-pub mod scrollbar;
 #[cfg(feature = "ui")]
 mod scan;
+pub mod scrollbar;
 mod session;
 #[cfg(feature = "ui")]
 mod settings;
@@ -29,11 +29,11 @@ mod share;
 mod tabs;
 #[cfg(feature = "ui")]
 mod taskbar;
+mod thumb;
 #[cfg(feature = "ui")]
 mod tray;
 #[cfg(feature = "ui")]
 mod view;
-mod thumb;
 
 #[cfg(feature = "ui")]
 pub use hosts::{

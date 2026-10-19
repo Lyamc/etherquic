@@ -236,30 +236,38 @@ async fn write_acks(conn: Connection, mut acks: mpsc::Receiver<InputAck>) -> Res
     Ok(())
 }
 
+/// Picture look and encode quality the player can change while a session is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveOffer {
+    pub look: etherquic::look::Look,
+    pub quality: u8,
+}
+
 /// What the player asks for, and where session events go.
 pub struct PlayerMedia {
     /// Sent when the host agreed on `etherquic/2`.
     pub offer: etherquic_media::negotiate::Offer,
     pub frames: etherquic_media::Sink<etherquic_media::Frame>,
     pub events: mpsc::UnboundedSender<etherquic_media::player::PlayerEvent>,
-    /// Latest picture look. A change is written again on the offer stream.
-    pub look: tokio::sync::watch::Receiver<etherquic::look::Look>,
+    /// Latest picture look and quality. A change is written again on the offer stream.
+    pub live: tokio::sync::watch::Receiver<LiveOffer>,
 }
 
-async fn resend_look(
+async fn resend_live(
     offer: &mut etherquic_media::negotiate::Offer,
-    look: etherquic::look::Look,
+    live: LiveOffer,
     offer_send: &mut Option<SendStream>,
 ) {
-    if offer.look == look {
+    if offer.look == live.look && offer.quality == live.quality {
         return;
     }
-    offer.look = look;
+    offer.look = live.look;
+    offer.quality = live.quality;
     let Some(send) = offer_send.as_mut() else {
         return;
     };
     if let Err(error) = etherquic_media::player::resend_offer(send, offer).await {
-        eprintln!("etherquic-play: look: {error}");
+        eprintln!("etherquic-play: offer: {error}");
     }
 }
 
@@ -293,7 +301,7 @@ pub async fn play_session(
         mut offer,
         frames,
         events,
-        look,
+        live,
     } = media;
     let negotiates = etherquic::negotiates(&conn);
     let mut offer_send = if negotiates {
@@ -402,20 +410,20 @@ pub async fn play_session(
     // answers with a config record for the next codec on the same stream.
     // A picture-look change uses that same stream and leaves the encoder up.
     tokio::spawn(async move {
-        let mut look_rx = look;
-        let seen = *look_rx.borrow_and_update();
-        resend_look(&mut offer, seen, &mut offer_send).await;
-        let mut watch_look = true;
+        let mut live_rx = live;
+        let seen = *live_rx.borrow_and_update();
+        resend_live(&mut offer, seen, &mut offer_send).await;
+        let mut watch_live = true;
         loop {
-            let event = if watch_look {
+            let event = if watch_live {
                 tokio::select! {
                     event = inner_rx.recv() => event,
-                    changed = look_rx.changed() => {
+                    changed = live_rx.changed() => {
                         if changed.is_err() {
-                            watch_look = false;
+                            watch_live = false;
                         } else {
-                            let next = *look_rx.borrow_and_update();
-                            resend_look(&mut offer, next, &mut offer_send).await;
+                            let next = *live_rx.borrow_and_update();
+                            resend_live(&mut offer, next, &mut offer_send).await;
                         }
                         continue;
                     }
@@ -592,10 +600,7 @@ async fn accept_late(
     Ok(())
 }
 
-async fn read_ack_records(
-    mut recv: RecvStream,
-    acks: mpsc::Sender<InputAck>,
-) -> Result<(), Error> {
+async fn read_ack_records(mut recv: RecvStream, acks: mpsc::Sender<InputAck>) -> Result<(), Error> {
     while let Some(payload) = wire::read_record(&mut recv, ACK_MAGIC).await? {
         let ack = InputAck::decode(&payload)?;
         if acks.send(ack).await.is_err() {

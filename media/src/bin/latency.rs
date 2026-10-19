@@ -11,7 +11,10 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (w, h) = args
         .next()
-        .and_then(|s| s.split_once('x').map(|(a, b)| (a.parse().unwrap_or(1280), b.parse().unwrap_or(720))))
+        .and_then(|s| {
+            s.split_once('x')
+                .map(|(a, b)| (a.parse().unwrap_or(1280), b.parse().unwrap_or(720)))
+        })
         .unwrap_or((1280, 720));
     let count: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(90);
     let only: Option<String> = args.next();
@@ -30,7 +33,9 @@ fn main() {
             a.lock().unwrap().push(Instant::now());
             true
         });
-        let decoder = Arc::new(Mutex::new(VideoDecoder::open(video, w, h, dsink).expect("decoder")));
+        let decoder = Arc::new(Mutex::new(
+            VideoDecoder::open(video, w, h, dsink).expect("decoder"),
+        ));
         let d = decoder.clone();
         let bytes = Arc::new(Mutex::new(0usize));
         let b = bytes.clone();
@@ -38,7 +43,15 @@ fn main() {
             *b.lock().unwrap() += rec.len();
             d.lock().unwrap().push(&rec).is_ok()
         });
-        let setup = EncodeSetup { video, encoder: cap.encoder.clone(), width: w, height: h, fps: 30, kbps: 0 };
+        let setup = EncodeSetup {
+            video,
+            encoder: cap.encoder.clone(),
+            width: w,
+            height: h,
+            fps: 30,
+            kbps: 0,
+            quality: 0,
+        };
         let (mut enc, _) = VideoEncoder::open(&setup, esink).expect("encoder");
         let mut pushed = Vec::new();
         let start = Instant::now();
@@ -53,7 +66,11 @@ fn main() {
         std::thread::sleep(Duration::from_millis(1500));
         drop(enc);
         let got = arrivals.lock().unwrap().clone();
-        let mut lat: Vec<f64> = got.iter().zip(pushed.iter()).map(|(g, p)| g.duration_since(*p).as_secs_f64() * 1000.0).collect();
+        let mut lat: Vec<f64> = got
+            .iter()
+            .zip(pushed.iter())
+            .map(|(g, p)| g.duration_since(*p).as_secs_f64() * 1000.0)
+            .collect();
         let decoded = lat.len();
         lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let med = lat.get(lat.len() / 2).copied().unwrap_or(f64::NAN);
@@ -77,5 +94,9 @@ fn moving(w: u32, h: u32, i: usize) -> Frame {
             rgb[p + 2] = (((x ^ y) + i) & 255) as u8;
         }
     }
-    Frame { width: w, height: h, rgb }
+    Frame {
+        width: w,
+        height: h,
+        rgb,
+    }
 }

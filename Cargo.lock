@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "etherquic"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bytes",
  "libc",
@@ -2185,6 +2185,7 @@ dependencies = [
  "etherquic",
  "jpeg-encoder",
  "libloading",
+ "openjpeg2-pure-rs",
  "quinn",
  "tokio",
  "zune-core 0.4.12",
@@ -5335,6 +5336,12 @@ dependencies = [
  "is-wsl",
  "libc",
 ]
+
+[[package]]
+name = "openjpeg2-pure-rs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70cbec9906e23f99197f321718ce1f7e2fccd455e45c5b3f7d2bf5d7b635f192"
 
 [[package]]
 name = "openssl-probe"
