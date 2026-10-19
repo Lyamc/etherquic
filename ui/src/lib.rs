@@ -13,6 +13,8 @@ mod extra_keys;
 #[cfg(feature = "ui")]
 mod overlay;
 #[cfg(feature = "ui")]
+mod quality_preview;
+#[cfg(feature = "ui")]
 mod update;
 #[cfg(all(feature = "ui", target_os = "macos"))]
 mod child_view;
@@ -58,7 +60,7 @@ pub use prefs::{
     remote_backend_line, remote_hardware_line, resolve_fps, store_connections, store_preferences,
     swap_earlier, swap_later, top_selection, video_announce, video_hint, video_match_line, Applied,
     ConnectionOverride, ConnectionPrefs, FrameRate, Predicted, Preferences, FPS_CHOICES,
-    SOFTWARE_FPS,
+    HARDWARE_FPS, SOFTWARE_FPS,
 };
 pub use session::{
     active_layer, dial_target, format_mac, lanes, taskbar_for, DialTarget, HexMac, Lane, Layer,

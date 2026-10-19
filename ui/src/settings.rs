@@ -102,6 +102,7 @@ pub enum Field {
     Quality,
     Yuv,
     DirtyRects,
+    DebugDirtyRects,
     PadSlots,
     Overlay,
     OutputDevice,
@@ -112,7 +113,7 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 21] = [
+    pub const ALL: [Field; 22] = [
         Self::Scale,
         Self::SizeMatch,
         Self::Look,
@@ -122,6 +123,7 @@ impl Field {
         Self::Quality,
         Self::Yuv,
         Self::DirtyRects,
+        Self::DebugDirtyRects,
         Self::SendKeyboard,
         Self::SendMouse,
         Self::SendPads,
@@ -146,7 +148,7 @@ impl Field {
             | Self::DitherStrength => Section::Appearance,
             Self::Quality => Section::Codecs,
             Self::Yuv => Section::Codecs,
-            Self::DirtyRects => Section::Capture,
+            Self::DirtyRects | Self::DebugDirtyRects => Section::Capture,
             Self::SendKeyboard
             | Self::SendMouse
             | Self::SendPads
@@ -187,6 +189,8 @@ pub struct Settings {
     /// tiles. Also used when this PC hosts for a player that does not send the
     /// request. Saved as `dirty-rects=`.
     pub dirty_rects: bool,
+    /// Draw 16-pixel dirty tiles on the picture window. Saved as `debug-dirty-rects=`.
+    pub debug_dirty_rects: bool,
     /// PyroWave colour format asked of the host. Saved as `yuv=`.
     pub yuv: etherquic::negotiate::YuvFormat,
     pub pad_slots: Vec<PadSlot>,
@@ -223,6 +227,7 @@ impl Default for Settings {
             dither_strength: view.dither_strength,
             quality: view.quality,
             dirty_rects: false,
+            debug_dirty_rects: false,
             yuv: view.yuv,
             pad_slots: view.pad_slots,
             overlay: OverlayLayout::default(),
@@ -252,6 +257,7 @@ impl Settings {
             dither_strength: self.dither_strength,
             quality: self.quality,
             dirty_rects: self.dirty_rects,
+            debug_dirty_rects: self.debug_dirty_rects,
             yuv: self.yuv,
             pad_slots: self.pad_slots.clone(),
             output_device: self.output_device.clone(),
@@ -288,6 +294,7 @@ impl Settings {
             Field::Quality => self.quality == other.quality,
             Field::Yuv => self.yuv == other.yuv,
             Field::DirtyRects => self.dirty_rects == other.dirty_rects,
+            Field::DebugDirtyRects => self.debug_dirty_rects == other.debug_dirty_rects,
             Field::PadSlots => self.pad_slots == other.pad_slots,
             Field::Overlay => self.overlay == other.overlay,
             Field::OutputDevice => self.output_device == other.output_device,
@@ -317,6 +324,7 @@ impl Settings {
             Field::Quality => self.quality = from.quality,
             Field::Yuv => self.yuv = from.yuv,
             Field::DirtyRects => self.dirty_rects = from.dirty_rects,
+            Field::DebugDirtyRects => self.debug_dirty_rects = from.debug_dirty_rects,
             Field::PadSlots => self.pad_slots = from.pad_slots.clone(),
             Field::Overlay => self.overlay = from.overlay.clone(),
             Field::OutputDevice => self.output_device = from.output_device.clone(),
@@ -416,7 +424,7 @@ fn clean(text: &str) -> String {
 
 pub fn render_settings(settings: &Settings) -> String {
     let mut out = format!(
-        "scale={}\nsize-match={}\nlook={}\ndither={}\npixel-size={}\ndither-strength={}\nquality={}\nyuv={}\ndirty-rects={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nbeta-releases={}\nhost-service-prompt={}\n",
+        "scale={}\nsize-match={}\nlook={}\ndither={}\npixel-size={}\ndither-strength={}\nquality={}\nyuv={}\ndirty-rects={}\ndebug-dirty-rects={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nbeta-releases={}\nhost-service-prompt={}\n",
         settings.scale.token(),
         settings.size_match.token(),
         settings.look.token(),
@@ -426,6 +434,7 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.quality,
         settings.yuv.token(),
         flag(settings.dirty_rects),
+        flag(settings.debug_dirty_rects),
         flag(settings.send_keyboard),
         flag(settings.send_mouse),
         flag(settings.send_pads),
@@ -490,6 +499,7 @@ pub fn parse_settings(text: &str) -> Settings {
                 }
             }
             "dirty-rects" => settings.dirty_rects = value != "0",
+            "debug-dirty-rects" => settings.debug_dirty_rects = value != "0",
             "yuv" => {
                 if let Some(yuv) = etherquic::negotiate::YuvFormat::from_token(value) {
                     settings.yuv = yuv;
@@ -777,6 +787,7 @@ mod tests {
             quality: 7,
             yuv: etherquic::negotiate::YuvFormat::YUV420P10,
             dirty_rects: true,
+            debug_dirty_rects: true,
             pad_slots: vec![PadSlot {
                 name: "Pad".into(),
                 slot: 1,

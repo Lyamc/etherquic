@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1408 1408">
-  <!-- Drawn to match Downloads/image (2).jpg: orange Q, monitor, blue dots. -->
+  <!-- Idle / app mark: the orange Q on its own. -->
   <g id="q" fill="#FD6001">
     <!-- Main ring, open on the right. Center (740,680), radii 575 and 420. -->
     <path d="M1248 410
@@ -23,48 +23,5 @@
              C580 1294 360 1210 250 1064
              A611 611 0 0 1 148 454
              Z"/>
-  </g>
-  <g id="monitor">
-    <rect x="598" y="908" width="271" height="42" rx="12" fill="#1C1C1C"/>
-    <rect x="684" y="830" width="106" height="100" fill="#1C1C1C"/>
-    <rect x="457" y="443" width="551" height="412" rx="48" fill="#1C1C1C"/>
-    <rect x="488" y="473" width="489" height="322" rx="20" fill="#FFFFFF"/>
-    <path d="M568 590 L568 696 L674 643 Z" fill="#FD6001"/>
-    <rect x="725" y="548" width="13" height="186" rx="2" fill="#1C1C1C"/>
-    <g fill="#FD6001">
-      <rect x="786" y="566" width="38" height="38" rx="3"/>
-      <rect x="840" y="566" width="38" height="38" rx="3"/>
-      <rect x="894" y="566" width="38" height="38" rx="3"/>
-      <rect x="786" y="620" width="38" height="38" rx="3"/>
-      <rect x="840" y="620" width="38" height="38" rx="3"/>
-      <rect x="894" y="620" width="38" height="38" rx="3"/>
-      <rect x="786" y="674" width="38" height="38" rx="3"/>
-      <rect x="840" y="674" width="38" height="38" rx="3"/>
-      <rect x="894" y="674" width="38" height="38" rx="3"/>
-    </g>
-  </g>
-  <g id="dots" fill="#0874F0">
-    <circle cx="1114" cy="574" r="15"/>
-    <circle cx="1166" cy="558" r="16"/>
-    <circle cx="1218" cy="548" r="15"/>
-    <circle cx="1256" cy="604" r="16"/>
-    <circle cx="1208" cy="614" r="15"/>
-    <circle cx="1154" cy="622" r="16"/>
-    <circle cx="1110" cy="636" r="14"/>
-    <circle cx="1272" cy="656" r="15"/>
-    <circle cx="1222" cy="672" r="16"/>
-    <circle cx="1166" cy="680" r="15"/>
-    <circle cx="1112" cy="688" r="15"/>
-    <circle cx="1256" cy="728" r="16"/>
-    <circle cx="1206" cy="734" r="15"/>
-    <circle cx="1154" cy="740" r="16"/>
-    <circle cx="1106" cy="728" r="14"/>
-    <circle cx="1274" cy="748" r="14"/>
-    <circle cx="1226" cy="792" r="15"/>
-    <circle cx="1174" cy="786" r="16"/>
-    <circle cx="1128" cy="778" r="15"/>
-    <circle cx="1092" cy="764" r="13"/>
-    <circle cx="1246" cy="810" r="14"/>
-    <circle cx="1192" cy="804" r="15"/>
   </g>
 </svg>

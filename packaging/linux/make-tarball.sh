@@ -55,6 +55,10 @@ cp "$target/release/etherquic-play" "$stage/etherquic-play"
 # Release profile keeps debuginfo for local builds. The tarball is stripped.
 strip "$stage/etherquic" "$stage/etherquic-play"
 cp "$root/ui/assets/etherquic.svg" "$stage/etherquic.svg"
+cp "$root/ui/assets/etherquic-host.svg" "$stage/etherquic-host.svg"
+cp "$root/ui/assets/etherquic-player.svg" "$stage/etherquic-player.svg"
+cp "$here/etherquic.desktop" "$stage/etherquic.desktop"
+cp "$here/etherquic-autostart.desktop" "$stage/etherquic-autostart.desktop"
 cp "$root/certs/cert.pem" "$stage/cert.pem"
 cp "$root/certs/key.pem" "$stage/key.pem"
 if [ -f "$libdir/libpyrowave-shared.so.1.0.0" ]; then

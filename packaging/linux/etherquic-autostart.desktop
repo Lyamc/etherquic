@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=etherquic
+Comment=QUIC over Ethernet
+Exec=etherquic --tray
+Icon=etherquic
+Terminal=false
+Categories=Network;
+X-GNOME-Autostart-enabled=true

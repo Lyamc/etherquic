@@ -44,8 +44,8 @@ use winapi::um::processthreadsapi::GetCurrentThreadId;
 use winapi::um::unknwnbase::IUnknown;
 use winapi::um::winbase::SetThreadExecutionState;
 use winapi::um::wingdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDeviceCaps,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY, VREFRESH,
 };
 use winapi::um::winnt::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, HANDLE};
 use winapi::um::winuser::{
@@ -74,6 +74,20 @@ const DXGI_ERROR_WAIT_TIMEOUT: i32 = 0x887A0027u32 as i32;
 /// Primary-monitor pixels, top-down RGBA.
 pub fn capture_rgba() -> Result<(Vec<u8>, u32, u32), String> {
     unsafe { capture_rgba_gdi() }
+}
+
+/// Primary monitor refresh in whole frames per second.
+pub fn display_hz() -> Option<u32> {
+    unsafe {
+        let hdc = GetDC(ptr::null_mut());
+        if hdc.is_null() {
+            return None;
+        }
+        let hz = GetDeviceCaps(hdc, VREFRESH);
+        ReleaseDC(ptr::null_mut(), hdc);
+        let hz = hz as u32;
+        (1..=etherquic::negotiate::MAX_FPS).contains(&hz).then_some(hz)
+    }
 }
 
 /// GDI capture plus an optional duplication subscription.

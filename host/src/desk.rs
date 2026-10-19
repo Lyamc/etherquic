@@ -27,7 +27,6 @@ use crate::link::{self, Pipe};
 use crate::proto::{self, fit_rgba, AudioChunk, Message};
 
 const MAX_WIDTH: u32 = 1280;
-const FPS: u32 = proto::CAPTURE_FPS;
 
 struct Screen {
     width: AtomicU32,
@@ -146,7 +145,9 @@ fn capture_loop(
     let mut capture = desktop::ScreenCapture::open();
     let mut logged_mode = String::new();
     note_mode(&notes, &capture, &mut logged_mode);
-    let period = Duration::from_millis((1000 / u64::from(FPS.max(1))).max(1));
+    let fps = desktop::display_hz().unwrap_or(proto::CAPTURE_FPS);
+    let period = Duration::from_millis((1000 / u64::from(fps.max(1))).max(1));
+    note(&notes, format!("capture {fps} fps"));
     let mut logged: Option<(u32, u32)> = None;
     let mut logged_desktop = capture.desktop().to_string();
     let mut last_error = String::new();

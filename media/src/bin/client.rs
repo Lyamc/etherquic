@@ -90,6 +90,7 @@ async fn main() -> Result<(), String> {
         0,
         false,
         etherquic_media::negotiate::YuvFormat::YUV444P8,
+        etherquic_media::negotiate::FpsWish::Auto,
     );
     let mut offer_send = None;
     if negotiates {

@@ -90,7 +90,8 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
             }
         });
         let options = HostOptions {
-            fps: 30,
+            fps: etherquic::negotiate::FpsWish::Fixed(30),
+            display_hz: None,
             caps,
             log: Arc::new(|line: &str| eprintln!("host: {line}")),
         };
@@ -262,6 +263,7 @@ async fn real_codecs_and_renegotiation() {
         0,
         false,
         etherquic_media::negotiate::YuvFormat::YUV444P8,
+        etherquic_media::negotiate::FpsWish::Auto,
     );
     let expect =
         etherquic_media::negotiate::choose_video(&offer, &probe.caps, &[], Some((320, 180))).row;

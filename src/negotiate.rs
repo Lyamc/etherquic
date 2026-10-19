@@ -28,6 +28,81 @@ pub const VERSION: u32 = 1;
 /// `quality` or sends 0.
 pub const DEFAULT_QUALITY: u8 = 40;
 
+/// Encode rate when Auto picks a software encoder (MJPEG, CPU PyroWave, …).
+pub const SOFTWARE_FPS: u32 = 15;
+/// Encode rate when Auto picks a hardware encoder.
+pub const HARDWARE_FPS: u32 = 30;
+/// Capture rate when the display refresh cannot be read. Not an encode cap.
+pub const DEFAULT_CAPTURE_FPS: u32 = 60;
+/// Highest rate an offer or chip may ask for.
+pub const MAX_FPS: u32 = 240;
+
+/// Pictures per second the player wants, or a host default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FpsWish {
+    /// 15 fps software, 30 fps hardware. The host's own Auto uses this too.
+    #[default]
+    Auto,
+    /// The host's display refresh. Capture already follows that rate.
+    Match,
+    Fixed(u32),
+}
+
+impl FpsWish {
+    pub fn token(self) -> String {
+        match self {
+            Self::Auto => "auto".into(),
+            Self::Match => "match".into(),
+            Self::Fixed(fps) => fps.to_string(),
+        }
+    }
+
+    pub fn from_token(token: &str) -> Self {
+        let token = token.trim();
+        if token.is_empty() || token.eq_ignore_ascii_case("auto") {
+            return Self::Auto;
+        }
+        if token.eq_ignore_ascii_case("match")
+            || token.eq_ignore_ascii_case("remote")
+            || token.eq_ignore_ascii_case("display")
+        {
+            return Self::Match;
+        }
+        match token.parse::<u32>() {
+            Ok(fps) if (1..=MAX_FPS).contains(&fps) => Self::Fixed(fps),
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn resolve(self, hardware: bool, display_hz: Option<u32>) -> u32 {
+        match self {
+            Self::Auto => {
+                if hardware {
+                    HARDWARE_FPS
+                } else {
+                    SOFTWARE_FPS
+                }
+            }
+            Self::Match => display_hz
+                .map(clamp_fps)
+                .unwrap_or_else(|| Self::Auto.resolve(hardware, None)),
+            Self::Fixed(fps) => clamp_fps(fps),
+        }
+    }
+}
+
+pub fn clamp_fps(fps: u32) -> u32 {
+    fps.clamp(1, MAX_FPS)
+}
+
+/// Player Auto (or an old offer) defers to the host. A number or Match wins.
+pub fn session_fps_wish(player: Option<FpsWish>, host: FpsWish) -> FpsWish {
+    match player {
+        None | Some(FpsWish::Auto) => host,
+        Some(wish) => wish,
+    }
+}
+
 /// `quality` 0 is the default. Anything else is 1–100.
 pub fn clamp_quality(quality: u8) -> u8 {
     if quality == 0 {
@@ -612,6 +687,8 @@ pub struct Offer {
     pub want_dirty_rects: Option<bool>,
     /// PyroWave colour format. `None` is an older offer: the host keeps 4:2:0 8-bit.
     pub yuv: Option<YuvFormat>,
+    /// Pictures per second. An older offer with no `fps` line is [`FpsWish::Auto`].
+    pub fps: FpsWish,
 }
 
 /// Format the host encodes, given the player's request and whether it can
@@ -671,6 +748,7 @@ impl Offer {
         if let Some(yuv) = self.yuv {
             let _ = writeln!(out, "yuv {}", yuv.token());
         }
+        let _ = writeln!(out, "fps {}", self.fps.token());
         out.into_bytes()
     }
 
@@ -706,6 +784,7 @@ impl Offer {
             quality: 0,
             want_dirty_rects: None,
             yuv: None,
+            fps: FpsWish::Auto,
         };
         for (key, words) in &lines.rows {
             match key.as_str() {
@@ -754,6 +833,9 @@ impl Offer {
                     offer.want_dirty_rects = Some(parse_flag(words.first().copied().unwrap_or("1")))
                 }
                 "yuv" => offer.yuv = words.first().copied().and_then(YuvFormat::from_token),
+                "fps" => {
+                    offer.fps = FpsWish::from_token(words.first().copied().unwrap_or("auto"))
+                }
                 _ => {}
             }
         }
@@ -976,6 +1058,8 @@ pub struct OfferInput<'a> {
     pub want_dirty_rects: bool,
     /// PyroWave colour format. Default is 4:4:4 8-bit.
     pub yuv: YuvFormat,
+    /// Pictures per second. Default is Auto (15 software / 30 hardware).
+    pub fps: FpsWish,
 }
 
 /// Pin first, then the Settings order, then anything left over, keeping only
@@ -1020,6 +1104,7 @@ pub fn build_offer(input: &OfferInput<'_>) -> Offer {
         quality: input.quality,
         want_dirty_rects: Some(input.want_dirty_rects),
         yuv: Some(input.yuv),
+        fps: input.fps,
     }
 }
 
@@ -1355,9 +1440,37 @@ mod tests {
         assert!(!offer.same_codecs(&other));
         let old = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\n").unwrap();
         assert_eq!(old.want_dirty_rects, None);
+        assert_eq!(old.fps, FpsWish::Auto);
         assert!(!parse_flag("0"));
         assert!(parse_flag("1"));
         assert!(!parse_flag("off"));
+    }
+
+    #[test]
+    fn fps_wish_round_trips_and_restarts_the_encoder() {
+        assert_eq!(FpsWish::Auto.resolve(false, Some(144)), SOFTWARE_FPS);
+        assert_eq!(FpsWish::Auto.resolve(true, Some(144)), HARDWARE_FPS);
+        assert_eq!(FpsWish::Match.resolve(true, Some(144)), 144);
+        assert_eq!(FpsWish::Match.resolve(false, None), SOFTWARE_FPS);
+        assert_eq!(FpsWish::Fixed(60).resolve(false, None), 60);
+        assert_eq!(FpsWish::from_token("match"), FpsWish::Match);
+        assert_eq!(FpsWish::from_token("120"), FpsWish::Fixed(120));
+        assert_eq!(session_fps_wish(Some(FpsWish::Auto), FpsWish::Fixed(60)), FpsWish::Fixed(60));
+        assert_eq!(session_fps_wish(Some(FpsWish::Fixed(120)), FpsWish::Auto), FpsWish::Fixed(120));
+
+        let mut offer = offer(&[Video::Mjpeg], &[VideoCodec::Mjpeg]);
+        assert_eq!(offer.fps, FpsWish::Auto);
+        offer.fps = FpsWish::Fixed(60);
+        let text = String::from_utf8(offer.encode()).unwrap();
+        assert!(text.contains("fps 60\n"), "{text}");
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert_eq!(back.fps, FpsWish::Fixed(60));
+        assert!(offer.same_codecs(&back));
+        let mut other = offer.clone();
+        other.fps = FpsWish::Match;
+        assert!(!offer.same_codecs(&other));
+        let missing = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\n").unwrap();
+        assert_eq!(missing.fps, FpsWish::Auto);
     }
 
     #[test]

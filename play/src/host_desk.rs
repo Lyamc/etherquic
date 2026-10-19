@@ -45,7 +45,7 @@ pub struct HostSession {
     pub local_mac: [u8; 6],
     pub service_id: u16,
     pub max_width: u32,
-    pub fps: u32,
+    pub fps: etherquic::negotiate::FpsWish,
     pub cert: PathBuf,
     pub key: PathBuf,
     /// Desktop audio source by device name. `None` picks one as before.
@@ -96,7 +96,9 @@ async fn listen(
     let capture_stop = Arc::clone(&stop);
     let capture_screen = screen.clone();
     let max_width = host.max_width.max(2);
-    let fps = host.fps.max(1);
+    let display_rate = display_hz();
+    let encode_wish = host.fps;
+    let capture_fps = display_rate.unwrap_or(etherquic::negotiate::DEFAULT_CAPTURE_FPS);
     let mut capture = Some(
         thread::Builder::new()
             .name("etherquic-play-capture".into())
@@ -107,7 +109,7 @@ async fn listen(
                     video_tx,
                     cursor_tx,
                     max_width,
-                    fps,
+                    capture_fps,
                 )
             })?,
     );
@@ -240,7 +242,8 @@ async fn listen(
         crate::HostMedia {
             frames: video_rx.clone().expect("frame slot"),
             audio: audio_rx.take().expect("audio receiver"),
-            fps,
+            fps: encode_wish,
+            display_hz: display_rate,
             log,
             cursor: cursor_rx,
         },

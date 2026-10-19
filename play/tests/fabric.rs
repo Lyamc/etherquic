@@ -41,6 +41,7 @@ fn mjpeg_offer() -> Offer {
         quality: 0,
         want_dirty_rects: None,
         yuv: None,
+        fps: etherquic::negotiate::FpsWish::Auto,
     }
 }
 
@@ -120,7 +121,8 @@ fn host_media(frames: FrameSlot, audio: mpsc::Receiver<AudioChunk>) -> HostMedia
     HostMedia {
         frames,
         audio,
-        fps: 10,
+        fps: etherquic::negotiate::FpsWish::Fixed(10),
+        display_hz: None,
         log: Arc::new(|_: &str| {}),
         cursor: tokio::sync::watch::channel(None).1,
     }
@@ -144,6 +146,7 @@ fn player_media(offer: Offer, shown: std::sync::mpsc::Sender<Frame>) -> PlayerMe
             quality: 0,
             dirty_rects: false,
             yuv: etherquic::negotiate::YuvFormat::YUV444P8,
+            fps: etherquic::negotiate::FpsWish::Auto,
         })
         .1,
     }

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1408 1408">
+  <!-- Player window: the monitor from the logo, with the Q on the screen. -->
+  <!-- Monitor is the original bezel, scaled 2× and centered in the canvas. -->
+  <defs>
+    <clipPath id="screen">
+      <rect x="215" y="257" width="978" height="644" rx="40"/>
+    </clipPath>
+  </defs>
+  <g id="monitor" transform="translate(153 197) scale(2) translate(-457 -443)">
+    <rect x="598" y="908" width="271" height="42" rx="12" fill="#1C1C1C"/>
+    <rect x="684" y="830" width="106" height="100" fill="#1C1C1C"/>
+    <rect x="457" y="443" width="551" height="412" rx="48" fill="#1C1C1C"/>
+    <rect x="488" y="473" width="489" height="322" rx="20" fill="#FFFFFF"/>
+  </g>
+  <g clip-path="url(#screen)">
+    <g id="q" fill="#FD6001" transform="translate(704 579) scale(0.46) translate(-740 -680)">
+      <path d="M1248 410
+               A575 575 0 1 0 1167 1065
+               L1052 961
+               A420 420 0 1 1 1111 483
+               Z"/>
+      <path d="M1167 1065
+               C1288 1095 1372 1148 1384 1224
+               L1266 1292
+               C1124 1216 1044 1148 1052 961
+               Z"/>
+      <path d="M118 430
+               A653 653 0 0 0 205 1055
+               C340 1200 640 1336 980 1320
+               C1140 1310 1260 1268 1324 1208
+               L1236 1152
+               C1160 1228 1020 1284 840 1288
+               C580 1294 360 1210 250 1064
+               A611 611 0 0 1 148 454
+               Z"/>
+    </g>
+  </g>
+</svg>

@@ -1,41 +1,102 @@
-//! Rasterize `assets/etherquic.svg` into the Windows icon resource.
+//! Rasterize the logo faces into tray pixmaps and the Windows icon resource.
 //!
-//! The SVG is the artwork. On a Windows target, windres embeds the sizes
-//! Explorer, the taskbar, and the notification area load from the exe.
-//! The same resource file carries `resources/etherquic.manifest.xml`.
-//! GPUI imports `TaskDialogIndirect` from comctl32. System32's comctl32 is
-//! 5.82 and does not export it; the manifest binds the side-by-side 6.0 copy.
+//! `etherquic.svg` is the idle Q. `etherquic-host.svg` is Q plus the computer,
+//! used while a player is connected. On a Windows target, windres embeds both
+//! as icon resources 1 and 2. Explorer, the taskbar, and Add/Remove Programs
+//! load resource 1. The same resource file carries
+//! `resources/etherquic.manifest.xml`. GPUI imports `TaskDialogIndirect` from
+//! comctl32. System32's comctl32 is 5.82 and does not export it; the manifest
+//! binds the side-by-side 6.0 copy.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let svg_path = manifest_dir.join("assets").join("etherquic.svg");
+    let assets = manifest_dir.join("assets");
+    let idle_path = assets.join("etherquic.svg");
+    let host_path = assets.join("etherquic-host.svg");
+    let preview_path = assets.join("quality-preview.svg");
     let manifest_path = manifest_dir
         .join("resources")
         .join("etherquic.manifest.xml");
-    println!("cargo:rerun-if-changed={}", svg_path.display());
+    println!("cargo:rerun-if-changed={}", idle_path.display());
+    println!("cargo:rerun-if-changed={}", host_path.display());
+    println!("cargo:rerun-if-changed={}", preview_path.display());
     println!("cargo:rerun-if-changed={}", manifest_path.display());
 
-    let svg = std::fs::read(&svg_path).expect("read etherquic.svg");
+    let idle = std::fs::read(&idle_path).expect("read etherquic.svg");
+    let host = std::fs::read(&host_path).expect("read etherquic-host.svg");
+    let preview = std::fs::read(&preview_path).expect("read quality-preview.svg");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    // Linux StatusNotifier wants ARGB32 pixels. Windows still uses the .ico resource.
+    std::fs::write(out_dir.join("tray-32.argb"), raster_argb(&idle, 32)).expect("write tray icon");
+    std::fs::write(out_dir.join("tray-host-32.argb"), raster_argb(&host, 32))
+        .expect("write host tray icon");
+    std::fs::write(out_dir.join("idle-256.png"), raster_png(&idle, 256)).expect("write idle preview");
+    std::fs::write(out_dir.join("host-256.png"), raster_png(&host, 256)).expect("write host preview");
+    std::fs::write(out_dir.join("preview-128.rgb"), raster_rgb(&preview, 128))
+        .expect("write quality preview");
+    std::fs::write(out_dir.join("preview-128.png"), raster_png(&preview, 128))
+        .expect("write quality preview png");
+
     let target = std::env::var("TARGET").unwrap_or_default();
     if !target.contains("windows") {
         return;
     }
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let ico_path = out_dir.join("etherquic.ico");
-    let ico = raster_ico(&svg);
-    std::fs::write(&ico_path, &ico).expect("write ico");
+    let idle_ico = out_dir.join("etherquic.ico");
+    let host_ico = out_dir.join("etherquic-host.ico");
+    std::fs::write(&idle_ico, raster_ico(&idle)).expect("write ico");
+    std::fs::write(&host_ico, raster_ico(&host)).expect("write host ico");
     let preview = std::env::temp_dir().join("etherquic-icon-preview.png");
-    std::fs::write(&preview, raster_png(&svg, 512)).expect("write preview");
+    std::fs::write(&preview, raster_png(&idle, 512)).expect("write preview");
     std::fs::write(
         std::env::temp_dir().join("etherquic-icon-32.png"),
-        raster_png(&svg, 32),
+        raster_png(&idle, 32),
     )
     .expect("write 32 preview");
-    embed_icon(&ico_path, &manifest_path, &out_dir);
+    embed_icon(&idle_ico, &host_ico, &manifest_path, &out_dir);
+}
+
+fn raster_argb(svg: &[u8], px: u32) -> Vec<u8> {
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+        .expect("parse etherquic.svg");
+    let size = tree.size();
+    let mut pixmap = tiny_skia::Pixmap::new(px, px).expect("pixmap");
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(px as f32 / size.width(), px as f32 / size.height()),
+        &mut pixmap.as_mut(),
+    );
+    let mut data = pixmap.data().to_vec();
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.rotate_right(1);
+    }
+    let mut out = Vec::with_capacity(8 + data.len());
+    out.extend_from_slice(&px.to_le_bytes());
+    out.extend_from_slice(&px.to_le_bytes());
+    out.extend_from_slice(&data);
+    out
+}
+
+fn raster_rgb(svg: &[u8], px: u32) -> Vec<u8> {
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+        .expect("parse quality-preview.svg");
+    let size = tree.size();
+    let mut pixmap = tiny_skia::Pixmap::new(px, px).expect("pixmap");
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(px as f32 / size.width(), px as f32 / size.height()),
+        &mut pixmap.as_mut(),
+    );
+    let mut out = Vec::with_capacity(8 + (px as usize) * (px as usize) * 3);
+    out.extend_from_slice(&px.to_le_bytes());
+    out.extend_from_slice(&px.to_le_bytes());
+    for pixel in pixmap.data().chunks_exact(4) {
+        out.extend_from_slice(&pixel[..3]);
+    }
+    out
 }
 
 fn raster_png(svg: &[u8], px: u32) -> Vec<u8> {
@@ -80,16 +141,18 @@ fn raster_ico(svg: &[u8]) -> Vec<u8> {
     out
 }
 
-fn embed_icon(ico: &Path, manifest: &Path, out_dir: &Path) {
+fn embed_icon(idle: &Path, host: &Path, manifest: &Path, out_dir: &Path) {
     let rc_path = out_dir.join("etherquic.rc");
     let res_path = out_dir.join("etherquic.res");
     let obj_path = out_dir.join("etherquic-icon.o");
-    let ico_rc = ico.display().to_string().replace('\\', "/");
+    let idle_rc = idle.display().to_string().replace('\\', "/");
+    let host_rc = host.display().to_string().replace('\\', "/");
     let manifest_rc = manifest.display().to_string().replace('\\', "/");
     // 24 is RT_MANIFEST. Resource id 1 is the one CreateProcess reads.
+    // Resource 2 is the connected-host face (Q plus the computer).
     std::fs::write(
         &rc_path,
-        format!("1 ICON \"{ico_rc}\"\n1 24 \"{manifest_rc}\"\n"),
+        format!("1 ICON \"{idle_rc}\"\n2 ICON \"{host_rc}\"\n1 24 \"{manifest_rc}\"\n"),
     )
     .expect("write rc");
 
@@ -127,7 +190,7 @@ fn embed_icon(ico: &Path, manifest: &Path, out_dir: &Path) {
             .status()
             .unwrap_or_else(|err| panic!("run {}: {err}", windres.display()));
         if !status.success() {
-            panic!("windres failed to embed {}", ico.display());
+            panic!("windres failed to embed {}", idle.display());
         }
         println!("cargo:rustc-link-arg-bins={}", obj_path.display());
     } else {

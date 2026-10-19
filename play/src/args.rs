@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use etherquic::parse_mac;
 use etherquic_play::{
-    CursorMode, Dither, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, CLIENT_MAC, DEFAULT_FPS,
+    CursorMode, Dither, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, CLIENT_MAC,
     DEFAULT_MAX_WIDTH, HOST_MAC, PAD_SLOTS, SERVICE_ID,
 };
 
@@ -14,7 +14,7 @@ pub struct Host {
     pub local_mac: [u8; 6],
     pub service_id: u16,
     pub max_width: u32,
-    pub fps: u32,
+    pub fps: etherquic::negotiate::FpsWish,
     pub cert: PathBuf,
     pub key: PathBuf,
 }
@@ -60,7 +60,7 @@ fn parse_host(args: &[String]) -> Result<Command, String> {
     let mut local_mac = HOST_MAC;
     let mut service_id = SERVICE_ID;
     let mut max_width = DEFAULT_MAX_WIDTH;
-    let mut fps = DEFAULT_FPS;
+    let mut fps = etherquic::negotiate::FpsWish::Auto;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -70,7 +70,9 @@ fn parse_host(args: &[String]) -> Result<Command, String> {
             }
             "--service-id" => service_id = number(need(args, &mut i, "--service-id")?)?,
             "--max-width" => max_width = number(need(args, &mut i, "--max-width")?)?,
-            "--fps" => fps = number(need(args, &mut i, "--fps")?)?,
+            "--fps" => {
+                fps = etherquic::negotiate::FpsWish::Fixed(number(need(args, &mut i, "--fps")?)?)
+            }
             other => return Err(format!("unknown arg {other}\n{}", usage())),
         }
     }
@@ -188,6 +190,7 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
                 flag(&mut i, &mut codecs.dirty_rects);
                 view.dirty_rects = true;
             }
+            "--debug-dirty-rects" => flag(&mut i, &mut view.debug_dirty_rects),
             "--yuv" => {
                 let token = need(args, &mut i, "--yuv")?;
                 let yuv = etherquic::negotiate::YuvFormat::from_token(&token)
@@ -284,7 +287,7 @@ pub fn cert_paths() -> (PathBuf, PathBuf) {
 
 fn usage() -> String {
     "\
-etherquic-play host [--nic IFACE] [--local-mac MAC] [--service-id 4433] [--max-width 1280] [--fps 10]
+etherquic-play host [--nic IFACE] [--local-mac MAC] [--service-id 4433] [--max-width 1280] [--fps 15]
 etherquic-play connect --peer-mac MAC [--nic IFACE] [--local-mac MAC] [--service-id 4433]
 etherquic-play connect --udp IP:PORT
   connect also takes: [--trace-input] [--scale fit|fill|stretch|native]
@@ -295,7 +298,7 @@ etherquic-play connect --udp IP:PORT
     [--output-device NAME] [--pad SLOT=NAME]... [--parent-pipe]
     [--video av1-hw,h265-hw,h264-hw,pyrowave,jpegxs,openapv,mjpeg,h264-sw] [--audio opus,pcm]
     [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--bitrate KBPS]
-    [--quality 1-100] [--dirty-rects] [--yuv 420p8|422p8|444p8|420p10|422p10|444p10]
+    [--quality 1-100] [--dirty-rects] [--debug-dirty-rects] [--yuv 420p8|422p8|444p8|420p10|422p10|444p10]
 
 host shares this desktop, its audio, and takes keyboard, mouse, and gamepad from one player.
 connect opens the view. The player window has to be focused to send the keyboard and the mouse. Gamepads send while that view is open.

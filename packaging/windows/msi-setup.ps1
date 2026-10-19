@@ -17,8 +17,20 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'msi-setup.log'
 function Log([string]$m) { Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date -Format s), $m) }
 $setup = Join-Path $here 'etherquic-setup.exe'
+$runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+$gui = Join-Path ${env:ProgramFiles} 'etherquic-setup\etherquic.exe'
+function Set-TrayRun([bool]$on) {
+    if ($on -and (Test-Path $gui)) {
+        New-ItemProperty -Path $runKey -Name 'etherquic' -Value "`"$gui`" --tray" -PropertyType String -Force | Out-Null
+        Log "tray run $gui --tray"
+    } else {
+        Remove-ItemProperty -Path $runKey -Name 'etherquic' -ErrorAction SilentlyContinue
+        Log "tray run removed"
+    }
+}
 
 if ($Uninstall -or $Service -ne '1') {
+    Set-TrayRun $false
     $out = & $setup --uninstall 2>&1 | Out-String
     $code = $LASTEXITCODE
     $why = if ($Uninstall) { 'uninstall' } else { 'client tools only' }
@@ -66,4 +78,7 @@ $flags += @('--payload', $here)
 $out = & $setup @flags 2>&1 | Out-String
 $code = $LASTEXITCODE
 Log "etherquic-setup $($flags -join ' ') exit ${code}: $out"
+if ($code -eq 0 -or $code -eq 3010) {
+    Set-TrayRun $true
+}
 exit $code

@@ -35,6 +35,7 @@ pub fn offer_for(
     quality: u8,
     want_dirty_rects: bool,
     yuv: crate::negotiate::YuvFormat,
+    fps: crate::negotiate::FpsWish,
 ) -> Offer {
     let (video, audio) = decodes();
     build_offer(&OfferInput {
@@ -49,6 +50,7 @@ pub fn offer_for(
         quality,
         want_dirty_rects,
         yuv,
+        fps,
     })
 }
 

@@ -18,8 +18,8 @@ use tokio::sync::{mpsc, watch};
 use crate::audio::AudioEncoder;
 use crate::dirty;
 use crate::negotiate::{
-    choose_audio, choose_video, Audio, HostCaps, Offer, StreamConfig, Video, AUDIO2_MAGIC,
-    OFFER_MAGIC, RECORD_CURSOR, RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
+    choose_audio, choose_video, session_fps_wish, Audio, FpsWish, HostCaps, Offer, StreamConfig,
+    Video, AUDIO2_MAGIC, OFFER_MAGIC, RECORD_CURSOR, RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
 };
 use crate::video::{EncodeSetup, VideoEncoder};
 use crate::{wire, yuv, Frame, Log, Pcm};
@@ -214,8 +214,10 @@ pub async fn open_streams(conn: &Connection, v2: bool) -> Result<Streams, String
 /// Host settings for one session.
 #[derive(Clone)]
 pub struct HostOptions {
-    /// Capture rate, also the encoder's nominal rate.
-    pub fps: u32,
+    /// Encode rate when the player sends Auto or no fps line.
+    pub fps: FpsWish,
+    /// Host display refresh. Used for Match, and as capture's natural ceiling.
+    pub display_hz: Option<u32>,
     pub caps: HostCaps,
     pub log: Log,
 }
@@ -416,6 +418,7 @@ fn video_pump(
     let mut tick = Instant::now();
     let mut tick_bytes = 0u64;
     let mut previous: Option<(u32, u32, Vec<u8>)> = None;
+    let mut last_encode: Option<Instant> = None;
     loop {
         if offer_rx.has_changed().unwrap_or(false) {
             let next = offer_rx.borrow_and_update().clone();
@@ -440,6 +443,14 @@ fn video_pump(
             Wait::Timeout => continue,
             Wait::Closed => break,
         };
+        if let Some(active) = active.as_ref() {
+            let wish = session_fps_wish(offer.as_ref().map(|o| o.fps), options.fps);
+            if let Some(period) = encode_period(wish, active.video.hardware(), options.display_hz) {
+                if last_encode.is_some_and(|last| last.elapsed() < period) {
+                    continue;
+                }
+            }
+        }
         let (max_w, max_h) = offer
             .as_ref()
             .map(|o| (o.max.width, o.max.height))
@@ -483,12 +494,18 @@ fn video_pump(
                 let want_dirty = offer_wants_dirty_rects(offer.as_ref());
                 let knows_patches =
                     v2 && offer.as_ref().is_some_and(|offer| offer.knows_dirty_rects);
+                let fps = encode_fps(
+                    offer.as_ref(),
+                    options.fps,
+                    video.hardware(),
+                    options.display_hz,
+                );
                 let setup = EncodeSetup {
                     video,
                     encoder: encoder_name.clone(),
                     width: frame.width,
                     height: frame.height,
-                    fps: options.fps,
+                    fps,
                     kbps,
                     quality,
                     yuv,
@@ -507,7 +524,7 @@ fn video_pump(
                             &encoder_name,
                             frame.width,
                             frame.height,
-                            options.fps,
+                            fps,
                         );
                         config.bitrate_kbps = kbps;
                         config.yuv = yuv.bitstream();
@@ -523,7 +540,7 @@ fn video_pump(
                             encoder_name,
                             frame.width,
                             frame.height,
-                            options.fps,
+                            fps,
                             if kbps > 0 {
                                 format!(" {kbps} kbit/s")
                             } else {
@@ -582,12 +599,16 @@ fn video_pump(
             frame.width,
             frame.height,
         ) {
-            dirty::Action::Skip => continue,
+            dirty::Action::Skip => {
+                last_encode = Some(Instant::now());
+                continue;
+            }
             dirty::Action::Patches(rects) => {
                 match send_patches(current, &frame, &rects, &out, &sent) {
                     Ok(true) => {
                         current.encode_fails = 0;
                         frames_in += 1;
+                        last_encode = Some(Instant::now());
                         previous = Some((frame.width, frame.height, frame.rgb.clone()));
                         continue;
                     }
@@ -601,6 +622,7 @@ fn video_pump(
             Ok(true) => {
                 current.encode_fails = 0;
                 frames_in += 1;
+                last_encode = Some(Instant::now());
                 previous = Some((frame.width, frame.height, frame.rgb.clone()));
             }
             Ok(false) => return,
@@ -646,6 +668,25 @@ fn video_pump(
             tick = Instant::now();
             tick_bytes = total;
             frames_in = 0;
+        }
+    }
+}
+
+fn encode_fps(
+    offer: Option<&Offer>,
+    host: FpsWish,
+    hardware: bool,
+    display_hz: Option<u32>,
+) -> u32 {
+    session_fps_wish(offer.map(|o| o.fps), host).resolve(hardware, display_hz)
+}
+
+fn encode_period(wish: FpsWish, hardware: bool, display_hz: Option<u32>) -> Option<Duration> {
+    match wish {
+        FpsWish::Match if display_hz.is_none() => None,
+        wish => {
+            let fps = wish.resolve(hardware, display_hz).max(1);
+            Some(Duration::from_millis((1000 / u64::from(fps)).max(1)))
         }
     }
 }

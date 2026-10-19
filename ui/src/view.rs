@@ -4,8 +4,9 @@
 //! the service, and the port. The taskbar button is applied from a deferred
 //! callback so the Win32 call is not inside the render borrow. It runs only
 //! when the desired state changes. Alt-Tab still lists the window. On Windows
-//! the notification area keeps an icon from `assets/etherquic.svg` on the
-//! taskbar. Closing the window hides it there.
+//! the notification area keeps the Q from `assets/etherquic.svg` on the
+//! taskbar, and swaps to the computer-in-the-Q mark while a player is
+//! connected. Closing the window hides it there.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -21,7 +22,8 @@ use crate::{
     remote_backend_line, remote_hardware_line, store_connections, store_preferences, swap_earlier,
     swap_later, this_pc, top_selection, video_hint, video_match_line, Applied, ConnectionOverride,
     ConnectionPrefs, ConnectionTabs, DialTarget, FrameRate, HexMac, Layer, Link, NicChoice,
-    Preferences, QrGrid, Role, Share, CLIENT_MAC, FPS_CHOICES, HOST_MAC, SOFTWARE_FPS,
+    Preferences, QrGrid, Role, Share, CLIENT_MAC, FPS_CHOICES, HARDWARE_FPS, HOST_MAC,
+    SOFTWARE_FPS,
 };
 use crate::{
     ago, caps_details, caps_summary, decode_thumbnail, load_hosts, matches_filter, scrollbar,
@@ -37,7 +39,7 @@ use etherquic::discover::Found;
 use etherquic::negotiate::{YuvChroma, YuvDepth};
 use etherquic::{BackendProbe, MediaBackend};
 use etherquic_play::{
-    display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
+    choose_codec, display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
 };
 use etherquic_play::{CursorMode, Dither, Look, ScaleMode, SizeMatch, PAD_SLOTS};
 
@@ -85,13 +87,14 @@ const STATUS_H: f32 = 40.0;
 const DEVICES_SHOWN: usize = 4;
 
 const USAGE: &str = "\
-etherquic [--console]
+etherquic [--console] [--tray]
 etherquic host [--nic IFACE] [--console]
 etherquic connect --peer-mac MAC [--nic IFACE] [--console]
 etherquic connect --udp IP:PORT [--console]
 
 host shares this machine. connect joins one.
 --console opens a console. A launch from a terminal uses that terminal.
+--tray keeps the window in the notification area at launch.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,17 +111,32 @@ struct Launch {
     nic: Option<String>,
     /// `connect --udp IP:PORT` dials L3 instead of the L2 peer.
     udp: Option<std::net::SocketAddr>,
+    /// Start with the window hidden; the notification-area icon stays.
+    tray: bool,
 }
 
 impl Launch {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let args: Vec<String> = args.filter(|arg| arg != "--console").collect();
+        let mut tray = false;
+        let args: Vec<String> = args
+            .filter(|arg| {
+                if arg == "--console" {
+                    false
+                } else if arg == "--tray" {
+                    tray = true;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         if args.is_empty() {
             return Ok(Self {
                 command: Command::Window,
                 peer: HexMac::from_bytes(HOST_MAC),
                 nic: None,
                 udp: None,
+                tray,
             });
         }
         if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
@@ -168,6 +186,7 @@ impl Launch {
             peer: peer.unwrap_or_else(|| HexMac::from_bytes(HOST_MAC)),
             nic,
             udp,
+            tray,
         })
     }
 }
@@ -183,16 +202,17 @@ fn mac_from_text(text: &str) -> Result<HexMac, String> {
     Ok(mac)
 }
 
-/// Put the window in the notification area once it has an HWND.
+/// Put the window in the notification area once the platform can host an icon.
 fn install_tray(window: &mut Window, cx: &mut Context<Desk>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Relaxed) {
         return;
     }
-    let Some(hwnd) = crate::taskbar::hwnd_of(window) else {
+    let hwnd = crate::taskbar::hwnd_of(window).unwrap_or(0);
+    if cfg!(windows) && hwnd == 0 {
         return;
-    };
+    }
     if !crate::tray::install(hwnd) {
         DONE.store(true, Ordering::Relaxed);
         return;
@@ -206,6 +226,8 @@ fn install_tray(window: &mut Window, cx: &mut Context<Desk>) {
             false
         }
     });
+    // A minimized window may stop drawing, so Open/Quit cannot wait on render.
+    let handle = window.window_handle();
     cx.spawn(async move |_desk, cx| loop {
         gpui::Timer::after(Duration::from_millis(80)).await;
         if crate::tray::take_quit() {
@@ -214,6 +236,20 @@ fn install_tray(window: &mut Window, cx: &mut Context<Desk>) {
                 break;
             }
             break;
+        }
+        if crate::tray::take_show() {
+            let _ = cx.update(|app| {
+                let _ = handle.update(app, |_view, window, _app| {
+                    window.activate_window();
+                });
+            });
+        }
+        if crate::tray::take_hide() {
+            let _ = cx.update(|app| {
+                let _ = handle.update(app, |_view, window, _app| {
+                    window.minimize_window();
+                });
+            });
         }
     })
     .detach();
@@ -338,6 +374,8 @@ struct Desk {
     connections: ConnectionPrefs,
     /// Packet capture. Not written to the preferences file.
     capturing: bool,
+    /// Hide the window once the notification-area icon is up (`--tray`).
+    start_in_tray: bool,
     /// macOS: hide the host-service prompt for this session only.
     host_service_hidden: bool,
     /// Collapsible sections. All start closed.
@@ -407,6 +445,11 @@ struct Desk {
     scroll_to_settings: u8,
     /// Left edge and width of the quality slider while the pointer is down.
     quality_drag: Option<(f32, f32)>,
+    /// Last quality-preview encode. Rebuilt when quality, colour, codec, or rate changes.
+    preview_key: Option<crate::quality_preview::Key>,
+    preview_image: Option<Arc<RenderImage>>,
+    preview_line: String,
+    preview_rates: Vec<(String, String)>,
     /// Phone IME is requested open. Extra-keys sit above it while connected.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     ime_open: bool,
@@ -457,6 +500,7 @@ impl Desk {
             display_hz: display_hz(),
             connections: load_connections(),
             capturing: etherquic::capture_active(),
+            start_in_tray: launch.tray,
             host_service_hidden: false,
             open: Panels::default(),
             page_scroll: ScrollHandle::new(),
@@ -502,6 +546,10 @@ impl Desk {
             settings_y: Rc::new(Cell::new(0.)),
             scroll_to_settings: 0,
             quality_drag: None,
+            preview_key: None,
+            preview_image: None,
+            preview_line: String::new(),
+            preview_rates: Vec::new(),
             ime_open: false,
             extra_mods: ExtraMods::default(),
             overlay_run: OverlayRuntime::default(),
@@ -520,7 +568,7 @@ impl Desk {
         }
         desk.message = match launch.command {
             Command::Host => {
-                let fps = desk.capture_fps();
+                let fps = desk.fps.wish();
                 desk.link.host(launch.nic, desk.backend, fps).err()
             }
             Command::Connect => match (launch.udp, desk.peer.parse()) {
@@ -628,6 +676,19 @@ impl Desk {
         self.taskbar_on = want;
         window.set_window_title(if want { "etherquic host" } else { "etherquic" });
         cx.defer(move |_cx| crate::taskbar::apply(hwnd, want));
+    }
+
+    fn host_peer_connected(&self) -> bool {
+        let live = |link: &Link| link.role() == Role::Host && link.peers() > 0;
+        live(&self.link) || self.parked.values().any(live)
+    }
+
+    fn sync_icons(&self) {
+        crate::tray::set_face(if self.host_peer_connected() {
+            crate::tray::Face::Hosting
+        } else {
+            crate::tray::Face::Idle
+        });
     }
 
     fn reap_links(&mut self) {
@@ -751,7 +812,7 @@ impl Desk {
         let id = self.begin_tab("This computer".into());
         match self
             .link
-            .host(self.nic.clone(), self.backend, self.capture_fps())
+            .host(self.nic.clone(), self.backend, self.fps.wish())
         {
             Ok(()) => self.message = None,
             Err(err) => {
@@ -1682,6 +1743,7 @@ impl Desk {
             .child(muted_line(
                 "PyroWave colour. 4:4:4 keeps every chroma sample. 4:2:2 and 4:2:0 subsample. 10-bit feeds the encoder finer YUV. MJPEG and the other codecs ignore this.".into(),
             ))
+            .child(self.quality_preview_row())
             .child(toggle_row(
                 "connect-dirty-rects",
                 "Send only changed tiles",
@@ -3074,6 +3136,124 @@ impl Desk {
             )
     }
 
+    fn preview_picture_pref(&self) -> PicturePref {
+        if let Some(mac) = self.peer.parse() {
+            if let Some(predicted) = self.predicted(mac) {
+                return predicted.video;
+            }
+            if let Some(pin) = self.session_video.or_else(|| {
+                self.connections
+                    .get(&mac_key(mac))
+                    .and_then(|over| over.video)
+            }) {
+                return pin;
+            }
+        }
+        let encodes = self.link.role() == Role::Host;
+        choose_codec(
+            &self.video_pref,
+            &self.local_video,
+            &self.local_video,
+            encodes,
+            self.skip_without_hw,
+        )
+        .0
+        .unwrap_or(PicturePref::Mjpeg)
+    }
+
+    fn preview_fps(&self) -> u32 {
+        self.capture_fps()
+    }
+
+    fn quality_preview_row(&mut self) -> impl IntoElement {
+        let key = crate::quality_preview::Key {
+            pref: self.preview_picture_pref(),
+            quality: self.settings.quality.clamp(1, 100),
+            yuv: self.settings.yuv,
+            fps: self.preview_fps(),
+        };
+        if self.preview_key != Some(key) {
+            let sample = crate::quality_preview::simulate(key);
+            self.preview_image = preview_render_image(&sample.rgb, sample.width, sample.height);
+            self.preview_line = sample.line;
+            self.preview_rates = sample
+                .rates
+                .iter()
+                .map(|(w, h, kbps)| {
+                    (
+                        format!("{w}×{h}"),
+                        crate::quality_preview::format_kbps(*kbps),
+                    )
+                })
+                .collect();
+            self.preview_key = Some(key);
+        }
+        let picture = self.preview_image.clone();
+        let line = self.preview_line.clone();
+        let rates = self.preview_rates.clone();
+        div()
+            .flex()
+            .flex_row()
+            .gap_3()
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(128.))
+                    .h(px(128.))
+                    .rounded_sm()
+                    .overflow_hidden()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(CARD_EDGE))
+                    .when_some(picture, |slot, picture| {
+                        slot.child(
+                            img(ImageSource::Render(picture))
+                                .w(px(128.))
+                                .h(px(128.))
+                                .object_fit(ObjectFit::Fill),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_color(rgb(TEXT))
+                            .font_weight(FontWeight::BOLD)
+                            .child(line),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_x_4()
+                            .gap_y_0()
+                            .children(rates.into_iter().map(|(size, rate)| {
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .w(px(168.))
+                                    .justify_between()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT))
+                                    .child(div().text_color(rgb(MUTED)).child(size))
+                                    .child(rate)
+                            })),
+                    )
+                    .child(muted_line(
+                        "128×128 crop of a default start menu. MJPEG, MJ2K, and PyroWave round-trip the crop; other codecs show colour plus JPEG compression. Bitrate is estimated at seven sizes; anything in between interpolates by pixel area.".into(),
+                    )),
+            )
+    }
+
     fn on_drag_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
         if self.overlay_run.stick.is_some() {
             self.overlay_stick_drag(ev, cx);
@@ -3199,6 +3379,17 @@ impl Desk {
                 cx.notify();
             }),
         ));
+        row = row.child(choice_chip(
+            SharedString::from(format!("{id_prefix}-match")),
+            "Match remote",
+            selected == FrameRate::Match,
+            140.,
+            cx.listener(|desk, _, _, cx| {
+                desk.fps = FrameRate::Match;
+                desk.persist();
+                cx.notify();
+            }),
+        ));
         for fps in FPS_CHOICES {
             let on = selected == FrameRate::Fixed(fps);
             row = row.child(choice_chip(
@@ -3292,6 +3483,7 @@ impl Desk {
             .child(muted_line(
                 "PyroWave colour asked of this host. 4:2:2 is sent as 4:4:4 after a horizontal chroma upsample.".into(),
             ))
+            .child(self.quality_preview_row())
             .child(toggle_row(
                 "conn-dirty-rects",
                 "Send only changed tiles",
@@ -3310,7 +3502,7 @@ impl Desk {
             .child(section_label("Rate"))
             .child(rate)
             .child(muted_line(format!(
-                "Auto uses this computer's rate when the picture is hardware-encoded. Without that, Auto is {SOFTWARE_FPS} fps. A host that does not read a rate still sends its own."
+                "Auto is {SOFTWARE_FPS} fps for software encode and {HARDWARE_FPS} fps for hardware. Match remote follows the host display. 60 and 120 are always available; the host captures at its display rate with no 30 fps cap."
             )))
             .child(
                 div()
@@ -3471,6 +3663,16 @@ impl Desk {
             96.,
             cx.listener(move |desk, _, _, cx| {
                 desk.edit_connection(mac, |over| over.fps = Some(FrameRate::Auto));
+                cx.notify();
+            }),
+        ));
+        row = row.child(choice_chip(
+            "conn-fps-match",
+            "Match remote",
+            pin == Some(FrameRate::Match),
+            140.,
+            cx.listener(move |desk, _, _, cx| {
+                desk.edit_connection(mac, |over| over.fps = Some(FrameRate::Match));
                 cx.notify();
             }),
         ));
@@ -4700,6 +4902,8 @@ impl Desk {
         let rates = self.global_fps_row("pref-fps", cx);
         let dirty_rects = self.settings.dirty_rects;
         let dirty_head = self.field_head("Dirty rectangles", &[Field::DirtyRects], cx);
+        let debug_dirty = self.settings.debug_dirty_rects;
+        let debug_head = self.field_head("Show dirty tiles", &[Field::DebugDirtyRects], cx);
         let capture_body = div()
             .flex()
             .flex_col()
@@ -4709,7 +4913,7 @@ impl Desk {
             .child(section_label("Rate"))
             .child(rates)
             .child(muted_line(format!(
-                "This PC captures its primary monitor at {capture} fps. Auto uses the display rate when the picture this PC sends has a hardware encoder. Without one, or when the display rate cannot be read, Auto is {SOFTWARE_FPS} fps."
+                "This PC captures at the display refresh (or 60 fps if that rate cannot be read). Encode Auto is {SOFTWARE_FPS} fps software / {HARDWARE_FPS} fps hardware. Match remote encodes every captured frame. The current encode estimate is {capture} fps."
             )))
             .child(dirty_head)
             .child(toggle_row(
@@ -4723,6 +4927,22 @@ impl Desk {
             ))
             .child(muted_line(
                 "The same control as on the Connect card. When you view a host, it is sent in the offer. A host that supports it skips an unchanged picture. With MJPEG or MJ2K, only the changed tiles are encoded. Inter-frame codecs still encode a full picture when anything moved. When this PC hosts, it also applies for a player that does not send the request. Off by default.".into(),
+            ))
+            .child(section_label("Advanced"))
+            .child(debug_head)
+            .child(toggle_row(
+                "debug-dirty-rects",
+                "Show dirty tiles in the viewer",
+                debug_dirty,
+                cx.listener(|desk, _, _, cx| {
+                    desk.edit_settings(|settings| {
+                        settings.debug_dirty_rects = !settings.debug_dirty_rects
+                    });
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "Draws a square on each 16-pixel tile that changed in the last picture. Turn on Send only changed tiles, then watch the viewer: a small cursor move lights a few tiles; a codec that always sends a full picture lights most of them.".into(),
             ));
         let capture_section =
             self.section(Section::Capture, Some(capture_backends), capture_body, cx);
@@ -5028,7 +5248,8 @@ impl Desk {
             .child(self.yuv_pick_row("settings-yuv", cx))
             .child(muted_line(
                 "4:4:4 keeps every chroma sample. 4:2:2 is sent as 4:4:4 after a horizontal upsample. 10-bit feeds the encoder finer YUV. Older players stay on 4:2:0 8-bit.".into(),
-            ));
+            ))
+            .child(self.quality_preview_row());
         let codecs = self.section(Section::Codecs, None, codecs_body, cx);
 
         // Input
@@ -5496,7 +5717,19 @@ impl Render for Desk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reap_links();
         install_tray(window, cx);
+        if crate::tray::take_hide() {
+            window.minimize_window();
+        }
+        if crate::tray::take_show() {
+            window.activate_window();
+        }
+        if self.start_in_tray && crate::tray::installed() {
+            self.start_in_tray = false;
+            crate::tray::hide_main();
+            window.minimize_window();
+        }
         self.sync_taskbar(window, cx);
+        self.sync_icons();
         self.track_hosts();
         self.settle_scrollbars(window);
         let status = self.status_line();
@@ -6547,6 +6780,15 @@ fn thumb_slot(picture: Option<Arc<RenderImage>>) -> AnyElement {
             .into_any_element(),
         None => slot.into_any_element(),
     }
+}
+
+fn preview_render_image(rgb: &[u8], width: u32, height: u32) -> Option<Arc<RenderImage>> {
+    let mut bgra = Vec::with_capacity(rgb.len() / 3 * 4);
+    for px in rgb.chunks_exact(3) {
+        bgra.extend_from_slice(&[px[2], px[1], px[0], 255]);
+    }
+    let buffer = image::RgbaImage::from_raw(width, height, bgra)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
 /// RGBA from the decoder into the BGRA frame the renderer takes.

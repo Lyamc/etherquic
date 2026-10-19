@@ -24,14 +24,15 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
-use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
+use winit::window::{CursorIcon, CustomCursor, Icon, Window, WindowId};
 
 use crate::ack::TraceClock;
 use crate::desk_io::{self, NoteSide};
 use crate::outbox::Gate;
 use crate::picture_hub::{self, PictureSeat};
 use crate::{
-    blit_rgb, format_mac, play_session, resample, session_end_status, AudioChunk, Picture, Status,
+    blit_rgb, format_mac, play_session, resample, session_end_status, stroke_rgb, AudioChunk,
+    Picture, Status,
 };
 
 /// Keystroke strings waiting for the picture window. Drained on the window
@@ -189,6 +190,9 @@ fn run_view(event_loop: &mut EventLoop<()>, request: ViewRequest) {
             context: None,
             surface: None,
             picture: None,
+            debug_prev: None,
+            debug_tiles: Vec::new(),
+            debug_on: false,
             buttons: 0,
             focused: false,
             trace: request.trace,
@@ -653,6 +657,7 @@ async fn connect_player(
         quality: offer.quality,
         dirty_rects: offer.want_dirty_rects.unwrap_or(false),
         yuv: offer.yuv.unwrap_or_default(),
+        fps: offer.fps,
     });
     tokio::spawn(async move {
         loop {
@@ -667,6 +672,7 @@ async fn connect_player(
                     quality: snap.quality,
                     dirty_rects: snap.dirty_rects,
                     yuv: snap.yuv,
+                    fps: offer.fps,
                 })
                 .is_err()
             {
@@ -924,6 +930,10 @@ struct App {
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     picture: Option<Picture>,
+    /// Previous picture RGB, for the dirty-tile overlay.
+    debug_prev: Option<(u32, u32, Vec<u8>)>,
+    debug_tiles: Vec<etherquic_media::dirty::Rect>,
+    debug_on: bool,
     buttons: u8,
     focused: bool,
     trace: bool,
@@ -1193,6 +1203,23 @@ impl ApplicationHandler for App {
     }
 }
 
+fn player_icon() -> Option<Icon> {
+    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/player-256.rgba"));
+    if bytes.len() < 8 {
+        return None;
+    }
+    let width = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let height = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let rgba = bytes[8..].to_vec();
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    Icon::from_rgba(rgba, width, height).ok()
+}
+
 impl App {
     fn for_hub() -> Self {
         Self {
@@ -1203,6 +1230,9 @@ impl App {
             context: None,
             surface: None,
             picture: None,
+            debug_prev: None,
+            debug_tiles: Vec::new(),
+            debug_on: false,
             buttons: 0,
             focused: false,
             trace: false,
@@ -1243,6 +1273,9 @@ impl App {
         self.cursor_icon = None;
         self.cursor_image = 0;
         self.picture = None;
+        self.debug_prev = None;
+        self.debug_tiles.clear();
+        self.debug_on = false;
         self.buttons = 0;
     }
 
@@ -1297,7 +1330,8 @@ impl App {
                     Window::default_attributes()
                         .with_title("etherquic-play")
                         .with_active(true)
-                        .with_inner_size(PhysicalSize::new(1280, 720)),
+                        .with_inner_size(PhysicalSize::new(1280, 720))
+                        .with_window_icon(player_icon()),
                 )
                 .expect("window"),
         );
@@ -1427,6 +1461,22 @@ impl App {
             self.letterbox = place;
             let mut view = vec![0u32; (place.view_w as usize) * (place.view_h as usize)];
             blit_rgb(picture, &mut view, place.view_w, place.view_h);
+            if crate::snapshot(&self.view).debug_dirty_rects {
+                let color = 0x00FF40;
+                let src_w = picture.width.max(1);
+                let src_h = picture.height.max(1);
+                for rect in &self.debug_tiles {
+                    let x0 = (u64::from(rect.x) * u64::from(place.view_w) / u64::from(src_w)) as u32;
+                    let y0 = (u64::from(rect.y) * u64::from(place.view_h) / u64::from(src_h)) as u32;
+                    let x1 = (u64::from(rect.x.saturating_add(rect.w)) * u64::from(place.view_w)
+                        / u64::from(src_w)) as u32;
+                    let y1 = (u64::from(rect.y.saturating_add(rect.h)) * u64::from(place.view_h)
+                        / u64::from(src_h)) as u32;
+                    let w = x1.saturating_sub(x0).max(1);
+                    let h = y1.saturating_sub(y0).max(1);
+                    stroke_rgb(&mut view, place.view_w, place.view_h, x0, y0, w, h, color);
+                }
+            }
             for y in 0..place.h {
                 let row = ((place.crop_y + y) * place.view_w + place.crop_x) as usize;
                 for x in 0..place.w {
@@ -1589,12 +1639,40 @@ impl App {
     }
 
     fn take_frame(&mut self) {
+        let options = crate::snapshot(&self.view);
+        if options.debug_dirty_rects != self.debug_on {
+            self.debug_on = options.debug_dirty_rects;
+            if self.debug_on {
+                if let Some(picture) = &self.picture {
+                    self.debug_prev = Some((picture.width, picture.height, picture.rgb.clone()));
+                }
+            } else {
+                self.debug_prev = None;
+                self.debug_tiles.clear();
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
         let next = self.frames.lock().ok().and_then(|mut slot| slot.take());
         if let Some(picture) = next {
+            if self.debug_on {
+                self.debug_tiles = match &self.debug_prev {
+                    Some((w, h, prev)) if *w == picture.width && *h == picture.height => {
+                        etherquic_media::dirty::changed_tiles(
+                            prev,
+                            &picture.rgb,
+                            picture.width,
+                            picture.height,
+                        )
+                    }
+                    _ => Vec::new(),
+                };
+                self.debug_prev = Some((picture.width, picture.height, picture.rgb.clone()));
+            }
             let size = (picture.width, picture.height);
             self.picture = Some(picture);
             if let Some(window) = &self.window {
-                let options = crate::snapshot(&self.view);
                 if options.size_match == crate::SizeMatch::WindowToHost && size != self.fitted {
                     self.fitted = size;
                     let _ = window.request_inner_size(PhysicalSize::new(size.0, size.1));
@@ -1603,11 +1681,10 @@ impl App {
             }
         } else if let Some(window) = &self.window {
             // A scale change made in the console shows without a new frame.
-            let scale = crate::snapshot(&self.view).scale;
             if let Some(picture) = &self.picture {
                 let size = window.inner_size();
                 let place = crate::place(
-                    scale,
+                    options.scale,
                     picture.width,
                     picture.height,
                     size.width,

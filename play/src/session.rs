@@ -111,7 +111,8 @@ pub fn resample(chunk: &AudioChunk, out_channels: u16, out_rate: u32) -> Result<
 pub struct HostMedia {
     pub frames: etherquic_media::host::FrameSlot,
     pub audio: mpsc::Receiver<AudioChunk>,
-    pub fps: u32,
+    pub fps: etherquic::negotiate::FpsWish,
+    pub display_hz: Option<u32>,
     pub log: etherquic_media::Log,
     /// Latest host cursor record. `None` until the host has sampled one.
     pub cursor: tokio::sync::watch::Receiver<Option<Vec<u8>>>,
@@ -194,7 +195,8 @@ pub async fn serve_session(
         }
     });
     let options = host::HostOptions {
-        fps: media.fps.max(1),
+        fps: media.fps,
+        display_hz: media.display_hz,
         caps: etherquic_media::caps::host_caps(),
         log: media.log,
     };
@@ -247,6 +249,7 @@ pub struct LiveOffer {
     pub quality: u8,
     pub dirty_rects: bool,
     pub yuv: etherquic::negotiate::YuvFormat,
+    pub fps: etherquic::negotiate::FpsWish,
 }
 
 /// What the player asks for, and where session events go.
@@ -272,6 +275,7 @@ async fn resend_live(
         && offer.quality == live.quality
         && offer.want_dirty_rects == Some(live.dirty_rects)
         && offer.yuv == Some(live.yuv)
+        && offer.fps == live.fps
     {
         return;
     }
@@ -282,6 +286,7 @@ async fn resend_live(
     offer.quality = live.quality;
     offer.want_dirty_rects = Some(live.dirty_rects);
     offer.yuv = Some(live.yuv);
+    offer.fps = live.fps;
     let Some(send) = offer_send.as_mut() else {
         return;
     };

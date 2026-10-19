@@ -4,9 +4,9 @@
 //! that computer can run is the match. AV1 (HW) and H.265 (HW) need hardware
 //! decode on that computer, so they fall through when the offer has no decode bit.
 //! A connection can pin its own picture, audio, rate, and switches. That pin
-//! is stored by address and does not rewrite the default order. Auto uses the
-//! server rate when the sender has a hardware encoder, and the software rate
-//! otherwise.
+//! is stored by address and does not rewrite the default order. Auto is 15 fps
+//! for software encode and 30 fps for hardware. Match remote follows the host
+//! display.
 
 use std::path::{Path, PathBuf};
 
@@ -424,6 +424,7 @@ pub fn codec_choice_for(
         quality,
         dirty_rects,
         yuv,
+        fps: applied.fps.wish(),
     }
 }
 
@@ -466,24 +467,24 @@ pub fn audio_match_line(
 }
 
 /// Pictures per second a sender without a hardware encoder is held to.
-pub const SOFTWARE_FPS: u32 = etherquic_play::DEFAULT_FPS;
+pub const SOFTWARE_FPS: u32 = etherquic::negotiate::SOFTWARE_FPS;
+/// Pictures per second Auto uses with a hardware encoder.
+pub const HARDWARE_FPS: u32 = etherquic::negotiate::HARDWARE_FPS;
 
-/// Rates the window offers beside Auto.
-pub const FPS_CHOICES: [u32; 4] = [10, 15, 30, 60];
+/// Rates the window offers beside Auto and Match remote.
+pub const FPS_CHOICES: [u32; 4] = [15, 30, 60, 120];
 
-/// Auto follows the server. A fixed rate is the number the user picked.
+/// Auto is 15/30. Match remote follows the host display. A fixed rate is the number picked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameRate {
     Auto,
+    Match,
     Fixed(u32),
 }
 
 impl FrameRate {
     pub fn token(self) -> String {
-        match self {
-            Self::Auto => "auto".to_string(),
-            Self::Fixed(fps) => fps.to_string(),
-        }
+        self.wish().token()
     }
 
     pub fn from_token(token: &str) -> Option<Self> {
@@ -491,13 +492,29 @@ impl FrameRate {
         if token.eq_ignore_ascii_case("auto") {
             return Some(Self::Auto);
         }
+        if token.eq_ignore_ascii_case("match")
+            || token.eq_ignore_ascii_case("remote")
+            || token.eq_ignore_ascii_case("display")
+        {
+            return Some(Self::Match);
+        }
         let fps: u32 = token.parse().ok()?;
-        (1..=240).contains(&fps).then_some(Self::Fixed(fps))
+        (1..=etherquic::negotiate::MAX_FPS)
+            .contains(&fps)
+            .then_some(Self::Fixed(fps))
+    }
+
+    pub fn wish(self) -> etherquic::negotiate::FpsWish {
+        match self {
+            Self::Auto => etherquic::negotiate::FpsWish::Auto,
+            Self::Match => etherquic::negotiate::FpsWish::Match,
+            Self::Fixed(fps) => etherquic::negotiate::FpsWish::Fixed(fps),
+        }
     }
 }
 
 fn clamp_fps(fps: u32) -> u32 {
-    fps.clamp(1, 240)
+    etherquic::negotiate::clamp_fps(fps)
 }
 
 /// Hardware-encode rows. GPU PyroWave counts. CPU PyroWave, MJPEG, and
@@ -511,45 +528,28 @@ pub fn sender_hardware_encode(pref: Option<PicturePref>) -> bool {
     )
 }
 
-/// Auto uses `server_fps` when the sender has a hardware encoder.
-///
-/// Without that encoder, Auto stays at [`SOFTWARE_FPS`] or lower when the
-/// server is already slower. An unknown server rate cannot be followed, so
-/// Auto is [`SOFTWARE_FPS`]. An explicit rate is the number the user picked.
+/// Auto is 15 fps software / 30 fps hardware. Match remote uses `server_fps`
+/// (the host display). An explicit rate is the number the user picked.
 pub fn resolve_fps(choice: FrameRate, server_fps: Option<u32>, hardware_encode: bool) -> u32 {
-    match choice {
-        FrameRate::Fixed(fps) => clamp_fps(fps),
-        FrameRate::Auto => {
-            let Some(server) = server_fps.map(clamp_fps) else {
-                return SOFTWARE_FPS;
-            };
-            if hardware_encode {
-                server
-            } else {
-                server.min(SOFTWARE_FPS)
-            }
-        }
-    }
+    choice.wish().resolve(hardware_encode, server_fps)
 }
 
 /// Short rate for a connection headline.
-///
-/// Auto with a hardware encoder and a known server rate names that rate.
-/// Auto with a hardware encoder and no announced rate stays "Auto". Auto
-/// without a hardware encoder names the software cap.
 pub fn fps_headline(choice: FrameRate, server_fps: Option<u32>, hardware_encode: bool) -> String {
     match choice {
         FrameRate::Fixed(fps) => format!("{} fps", clamp_fps(fps)),
-        FrameRate::Auto => match (hardware_encode, server_fps.map(clamp_fps)) {
-            (true, Some(fps)) => format!("{fps} fps"),
-            (true, None) => "Auto".to_string(),
-            (false, _) => format!("{} fps", resolve_fps(choice, server_fps, false)),
+        FrameRate::Match => match server_fps.map(clamp_fps) {
+            Some(fps) => format!("{fps} fps"),
+            None => "Match remote".to_string(),
         },
+        FrameRate::Auto => format!(
+            "{} fps",
+            resolve_fps(choice, server_fps, hardware_encode)
+        ),
     }
 }
 
-/// Rate this PC captures at. The display rate is the server rate, and it is
-/// used only when the codec this PC would send has a hardware encoder.
+/// Rate this PC would encode at. Capture itself follows the display refresh.
 pub fn capture_rate(
     video: &[PicturePref],
     local: &MachineCodecs,
@@ -1180,7 +1180,7 @@ mod tests {
             FrameRate::Auto,
             Some(60),
         );
-        assert_eq!(line, "MJPEG · PCM · 10 fps");
+        assert_eq!(line, "MJPEG · PCM · 15 fps");
     }
 
     #[test]
@@ -1304,19 +1304,28 @@ mod tests {
     }
 
     #[test]
-    fn auto_follows_the_server_rate_only_with_a_hardware_encoder() {
-        assert_eq!(resolve_fps(FrameRate::Auto, Some(60), true), 60);
+    fn auto_is_fifteen_software_and_thirty_hardware() {
+        assert_eq!(resolve_fps(FrameRate::Auto, Some(60), true), HARDWARE_FPS);
         assert_eq!(resolve_fps(FrameRate::Auto, Some(60), false), SOFTWARE_FPS);
-        assert_eq!(resolve_fps(FrameRate::Auto, Some(8), false), 8);
-        assert_eq!(resolve_fps(FrameRate::Auto, None, true), SOFTWARE_FPS);
+        assert_eq!(resolve_fps(FrameRate::Auto, Some(8), false), SOFTWARE_FPS);
+        assert_eq!(resolve_fps(FrameRate::Auto, None, true), HARDWARE_FPS);
+        assert_eq!(resolve_fps(FrameRate::Match, Some(144), true), 144);
+        assert_eq!(resolve_fps(FrameRate::Match, None, false), SOFTWARE_FPS);
         assert_eq!(resolve_fps(FrameRate::Fixed(30), Some(60), false), 30);
         assert_eq!(resolve_fps(FrameRate::Fixed(500), None, false), 240);
-        assert_eq!(fps_headline(FrameRate::Auto, None, true), "Auto");
-        assert_eq!(fps_headline(FrameRate::Auto, Some(60), true), "60 fps");
+        assert_eq!(
+            fps_headline(FrameRate::Auto, None, true),
+            format!("{HARDWARE_FPS} fps")
+        );
+        assert_eq!(
+            fps_headline(FrameRate::Auto, Some(60), true),
+            format!("{HARDWARE_FPS} fps")
+        );
         assert_eq!(
             fps_headline(FrameRate::Auto, Some(60), false),
             format!("{SOFTWARE_FPS} fps")
         );
+        assert_eq!(fps_headline(FrameRate::Match, None, true), "Match remote");
         assert!(sender_hardware_encode(Some(PicturePref::H264Hw)));
         assert!(!sender_hardware_encode(Some(PicturePref::Mjpeg)));
         assert!(sender_hardware_encode(Some(PicturePref::Pyrowave)));

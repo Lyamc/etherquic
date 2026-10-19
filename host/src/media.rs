@@ -65,7 +65,8 @@ pub async fn serve(
         .await
         .map_err(|error| error.to_string())?;
     let options = host::HostOptions {
-        fps: proto::CAPTURE_FPS,
+        fps: etherquic::negotiate::FpsWish::Auto,
+        display_hz: None,
         caps,
         log,
     };

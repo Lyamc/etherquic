@@ -9,7 +9,7 @@ use crate::negotiate::{Video, RECORD_PATCH};
 use crate::Frame;
 
 /// Tile edge in pixels. Even, so a JPEG crop stays even.
-const TILE: u32 = 16;
+pub const TILE: u32 = 16;
 /// More than this many merged rects, or this fraction of the picture, is a
 /// full frame.
 const MAX_PATCHES: usize = 12;
@@ -66,6 +66,34 @@ pub fn action(
         Plan::Patches(rects) if can_patch && video.patch_updates() => Action::Patches(rects),
         _ => Action::Full,
     }
+}
+
+/// 16-pixel tiles that differ between two packed RGB pictures. Same test the
+/// host uses before it merges patches. Empty when the buffers do not match
+/// the size, or when nothing moved.
+pub fn changed_tiles(prev: &[u8], next: &[u8], width: u32, height: u32) -> Vec<Rect> {
+    let n = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(3);
+    if prev.len() != n || next.len() != n || width == 0 || height == 0 {
+        return Vec::new();
+    }
+    dirty_tiles(prev, next, width, height)
+        .into_iter()
+        .map(|(tx, ty)| {
+            clamp(
+                Rect {
+                    x: tx * TILE,
+                    y: ty * TILE,
+                    w: TILE,
+                    h: TILE,
+                },
+                width,
+                height,
+            )
+        })
+        .filter(|rect| rect.w > 0 && rect.h > 0)
+        .collect()
 }
 
 /// Compare `next` to the last encoded picture. `prev` is `None` on the first
@@ -280,6 +308,25 @@ mod tests {
         let prev = solid(64, 48, [10, 20, 30]);
         assert_eq!(plan(Some(&prev), &prev, 64, 48), Plan::Unchanged);
         assert_eq!(plan(None, &prev, 64, 48), Plan::Full);
+    }
+
+    #[test]
+    fn a_small_dot_is_one_sixteen_pixel_tile() {
+        let prev = solid(64, 48, [0, 0, 0]);
+        let mut next = prev.clone();
+        paint(&mut next, 64, 20, 18, 4, 4, [255, 0, 0]);
+        let tiles = changed_tiles(&prev, &next, 64, 48);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(
+            tiles[0],
+            Rect {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 16
+            }
+        );
+        assert!(changed_tiles(&prev, &prev, 64, 48).is_empty());
     }
 
     #[test]

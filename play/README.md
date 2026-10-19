@@ -10,7 +10,7 @@ Service **4433** on Ethernet. Host MAC `02:00:00:00:00:01`, player MAC `02:00:00
 | audio | `EAUD` | 10 | host to player |
 | video | `EVID` | 0 | host to player |
 
-Each record is a little-endian `u32` length, then the payload. The live path negotiates PyroWave, MJPEG, or H.264. H.265 and AV1 hardware are in the same preference list, ahead of those three, and CPU PyroWave is last. The picture is scaled to `--max-width` (default 1280, both sides even) at `--fps` (default 10). The original `EVID` payload is still a JPEG or an `EINT` intra frame. When both ends agree on `etherquic/2`, the picture stream is `EVI2` and audio is `EAU2`. Original `EAUD` is interleaved `i16` PCM with a rate and a channel count. Input is an EQIN document, the same bytes as [`etherquic-input`](../input/README.md).
+Each record is a little-endian `u32` length, then the payload. The live path negotiates PyroWave, MJPEG, or H.264. H.265 and AV1 hardware are in the same preference list, ahead of those three, and CPU PyroWave is last. The picture is scaled to `--max-width` (default 1280, both sides even). Capture follows the display refresh. Encode Auto is 15 fps software / 30 fps hardware; `--fps` sets a fixed encode rate. The original `EVID` payload is still a JPEG or an `EINT` intra frame. When both ends agree on `etherquic/2`, the picture stream is `EVI2` and audio is `EAU2`. Original `EAUD` is interleaved `i16` PCM with a rate and a channel count. Input is an EQIN document, the same bytes as [`etherquic-input`](../input/README.md).
 
 ```bash
 cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- host --nic IFACE

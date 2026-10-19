@@ -58,8 +58,8 @@ pub use pad::{
     xinput_stick_y, PadAxis, PadButton, PadReport,
 };
 pub use picture::{
-    blit_rgb, decode_jpeg, decode_picture, encode_jpeg, encode_picture, fit_rgba, Picture,
-    PictureCodec,
+    blit_rgb, decode_jpeg, decode_picture, encode_jpeg, encode_picture, fit_rgba, stroke_rgb,
+    Picture, PictureCodec,
 };
 pub use picture_hub::{
     close_picture, hold_picture, open_picture, shown_picture, switch_picture, PictureSeat,
@@ -89,7 +89,7 @@ pub const CLIENT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 /// Widest picture the host encodes unless the caller asks otherwise.
 pub const DEFAULT_MAX_WIDTH: u32 = 1280;
 /// Pictures per second unless the caller asks otherwise.
-pub const DEFAULT_FPS: u32 = 10;
+pub const DEFAULT_FPS: u32 = etherquic::negotiate::SOFTWARE_FPS;
 
 /// What the player should show when the session stops for a reason other than
 /// the local Stop button.

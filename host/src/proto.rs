@@ -13,9 +13,10 @@ pub const VIDEO_MAGIC: &[u8; 4] = b"EVID";
 pub const AUDIO_MAGIC: &[u8; 4] = b"EAUD";
 pub const INPUT_MAGIC: &[u8; 4] = b"EINP";
 
-/// Desk helper capture rate. The service encodes; at 30 fps a 1280-wide
-/// frame is about 83 MB/s on the pipe.
-pub const CAPTURE_FPS: u32 = 30;
+/// Desk helper capture rate when the display refresh cannot be read.
+/// Encode defaults are 15 fps software / 30 fps hardware; the player can ask
+/// for 60 or Match (the display rate). There is no 30 fps cap.
+pub const CAPTURE_FPS: u32 = etherquic::negotiate::DEFAULT_CAPTURE_FPS;
 
 pub const KIND_JPEG: u8 = 1;
 pub const KIND_PCM: u8 = 2;

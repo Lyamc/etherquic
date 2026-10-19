@@ -22,6 +22,8 @@ pub struct CodecChoice {
     pub dirty_rects: bool,
     /// PyroWave colour format. Default is 4:4:4 8-bit.
     pub yuv: etherquic::negotiate::YuvFormat,
+    /// Pictures per second. Auto is 15 software / 30 hardware on the host.
+    pub fps: etherquic::negotiate::FpsWish,
 }
 
 pub fn video_row(pref: PicturePref) -> Video {
@@ -65,6 +67,7 @@ impl CodecChoice {
             self.quality,
             self.dirty_rects,
             self.yuv,
+            self.fps,
         )
     }
 

@@ -104,7 +104,7 @@ impl Link {
         &mut self,
         nic: Option<String>,
         backend: etherquic::MediaBackend,
-        fps: u32,
+        fps: etherquic::negotiate::FpsWish,
     ) -> Result<(), String> {
         self.reap();
         if self.thread.is_some() {
@@ -300,7 +300,7 @@ fn host_thread(
     key: PathBuf,
     nic: Option<String>,
     backend: etherquic::MediaBackend,
-    fps: u32,
+    fps: etherquic::negotiate::FpsWish,
     stop: Arc<AtomicBool>,
     up: Arc<AtomicBool>,
     peers: Arc<AtomicUsize>,
@@ -373,7 +373,7 @@ fn host_thread(
             local_mac: HOST_MAC,
             service_id: PLAY_SERVICE_ID,
             max_width: etherquic_play::DEFAULT_MAX_WIDTH,
-            fps: fps.max(1),
+            fps,
             cert,
             key,
             audio_device: host_audio_device(),
@@ -761,6 +761,7 @@ fn android_join(
         quality: offer.quality,
         dirty_rects: offer.want_dirty_rects.unwrap_or(false),
         yuv: offer.yuv.unwrap_or_default(),
+        fps: offer.fps,
     });
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<etherquic_play::AudioChunk>(8);
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(32);

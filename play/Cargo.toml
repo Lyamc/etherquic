@@ -79,6 +79,10 @@ optional = true
 version = "0.6"
 optional = true
 
+[build-dependencies]
+resvg = "0.45"
+tiny-skia = "0.11"
+
 [[bin]]
 name = "etherquic-play"
 path = "src/main.rs"

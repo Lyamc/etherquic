@@ -34,6 +34,7 @@ etherquic-play = { path = "../play", default-features = false, optional = true, 
 # The Windows backend is built in. Linux needs a window system, and this machine is Wayland.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true, features = ["wayland"] }
+ksni = { version = "0.3", default-features = false, features = ["blocking", "tokio"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6.1", features = ["native-activity"] }

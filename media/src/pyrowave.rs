@@ -681,6 +681,15 @@ impl Encoder {
         (self.width, self.height)
     }
 
+    /// Per-picture budget used on the next [`Self::encode`]. Quality preview
+    /// reuses one encoder and only changes this.
+    pub fn set_frame_bytes(&mut self, frame_bytes: usize) {
+        self.frame_bytes = frame_bytes.max(16 * 1024);
+        if self.bitstream.len() < self.frame_bytes + 64 * 1024 {
+            self.bitstream.resize(self.frame_bytes + 64 * 1024, 0);
+        }
+    }
+
     /// The Vulkan device this encoder runs on, when the library can say.
     pub fn vulkan_device(&self) -> Option<VulkanDevice> {
         self.device.vulkan_device()

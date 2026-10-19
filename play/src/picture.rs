@@ -221,6 +221,32 @@ pub fn blit_rgb(picture: &Picture, dst: &mut [u32], dst_w: u32, dst_h: u32) {
     }
 }
 
+/// Outline a rectangle in a packed `0x00RRGGBB` buffer. One pixel thick.
+pub fn stroke_rgb(dst: &mut [u32], dst_w: u32, dst_h: u32, x: u32, y: u32, w: u32, h: u32, color: u32) {
+    if dst_w == 0 || dst_h == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let x1 = x.saturating_add(w).min(dst_w);
+    let y1 = y.saturating_add(h).min(dst_h);
+    let x0 = x.min(dst_w);
+    let y0 = y.min(dst_h);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let need = (dst_w as usize).saturating_mul(dst_h as usize);
+    if dst.len() < need {
+        return;
+    }
+    for col in x0..x1 {
+        dst[(y0 * dst_w + col) as usize] = color;
+        dst[((y1 - 1) * dst_w + col) as usize] = color;
+    }
+    for row in y0..y1 {
+        dst[(row * dst_w + x0) as usize] = color;
+        dst[(row * dst_w + (x1 - 1)) as usize] = color;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +307,16 @@ mod tests {
         let mut dst = [0u32; 4];
         blit_rgb(&picture, &mut dst, 2, 2);
         assert_eq!(dst[0], (1 << 16) | (2 << 8) | 3);
+    }
+
+    #[test]
+    fn stroke_outlines_a_two_by_two() {
+        let mut dst = [0u32; 16];
+        stroke_rgb(&mut dst, 4, 4, 1, 1, 2, 2, 0x00FF40);
+        assert_eq!(dst[1 * 4 + 1], 0x00FF40);
+        assert_eq!(dst[1 * 4 + 2], 0x00FF40);
+        assert_eq!(dst[2 * 4 + 1], 0x00FF40);
+        assert_eq!(dst[2 * 4 + 2], 0x00FF40);
+        assert_eq!(dst[0], 0);
     }
 }

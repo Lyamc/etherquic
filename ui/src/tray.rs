@@ -1,9 +1,20 @@
 //! Notification-area icon for the etherquic window.
 //!
-//! The artwork is `assets/etherquic.svg`, rasterized into icon resource 1
-//! by `build.rs`. Idle and player mode take the taskbar button away, so this
-//! icon is how the window is found again. Closing the window hides it here.
-//! Quit is on the icon's menu.
+//! Idle uses the Q from `assets/etherquic.svg` (Windows resource 1). A host
+//! with a player connected swaps to `assets/etherquic-host.svg` (resource 2).
+//! Idle and player mode take the taskbar button away, so this icon is how
+//! the window is found again. Closing the window hides it here. Quit is on
+//! the icon's menu.
+
+/// Which mark the notification area (and the Windows window) should show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Face {
+    /// The Q on its own. No player is sitting at this host.
+    Idle = 0,
+    /// Q with the computer in the middle. A player is connected.
+    Hosting = 1,
+}
 
 #[cfg(windows)]
 mod win {
@@ -13,7 +24,7 @@ mod win {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-        NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+        NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
@@ -55,8 +66,11 @@ mod win {
     static TRAY: AtomicIsize = AtomicIsize::new(0);
     static QUIT: AtomicBool = AtomicBool::new(false);
     static INSTALLED: AtomicBool = AtomicBool::new(false);
-    static SMALL_ICON: AtomicIsize = AtomicIsize::new(0);
-    static BIG_ICON: AtomicIsize = AtomicIsize::new(0);
+    static FACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    static SMALL_IDLE: AtomicIsize = AtomicIsize::new(0);
+    static BIG_IDLE: AtomicIsize = AtomicIsize::new(0);
+    static SMALL_HOST: AtomicIsize = AtomicIsize::new(0);
+    static BIG_HOST: AtomicIsize = AtomicIsize::new(0);
 
     pub fn install(main: isize) -> bool {
         MAIN.store(main, Ordering::SeqCst);
@@ -65,10 +79,13 @@ mod win {
             None => return false,
         };
         TRAY.store(hwnd as isize, Ordering::SeqCst);
-        let small = load_icon(metric(SM_CXSMICON, 16));
-        let big = load_icon(metric(SM_CXICON, 32));
-        SMALL_ICON.store(small as isize, Ordering::SeqCst);
-        BIG_ICON.store(big as isize, Ordering::SeqCst);
+        let sm = metric(SM_CXSMICON, 16);
+        let lg = metric(SM_CXICON, 32);
+        SMALL_IDLE.store(load_icon(1, sm) as isize, Ordering::SeqCst);
+        BIG_IDLE.store(load_icon(1, lg) as isize, Ordering::SeqCst);
+        SMALL_HOST.store(load_icon(2, sm) as isize, Ordering::SeqCst);
+        BIG_HOST.store(load_icon(2, lg) as isize, Ordering::SeqCst);
+        let (small, big) = icon_pair(current_face());
         apply_window_icons(main as HWND, small, big);
         if !add_icon(hwnd, small) {
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -88,6 +105,14 @@ mod win {
         }
         INSTALLED.store(true, Ordering::SeqCst);
         true
+    }
+
+    pub fn take_hide() -> bool {
+        false
+    }
+
+    pub fn take_show() -> bool {
+        false
     }
 
     pub fn installed() -> bool {
@@ -121,8 +146,10 @@ mod win {
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &data);
             DestroyWindow(hwnd);
-            destroy_icon(&SMALL_ICON);
-            destroy_icon(&BIG_ICON);
+            destroy_icon(&SMALL_IDLE);
+            destroy_icon(&BIG_IDLE);
+            destroy_icon(&SMALL_HOST);
+            destroy_icon(&BIG_HOST);
         }
         INSTALLED.store(false, Ordering::SeqCst);
     }
@@ -136,10 +163,64 @@ mod win {
         }
     }
 
-    fn load_icon(edge: i32) -> HICON {
+    fn load_icon(id: u16, edge: i32) -> HICON {
         unsafe {
             let module = GetModuleHandleW(std::ptr::null());
-            LoadImageW(module, 1 as *const u16, IMAGE_ICON, edge, edge, 0)
+            LoadImageW(module, id as *const u16, IMAGE_ICON, edge, edge, 0)
+        }
+    }
+
+    fn current_face() -> super::Face {
+        if FACE.load(Ordering::SeqCst) == super::Face::Hosting as u8 {
+            super::Face::Hosting
+        } else {
+            super::Face::Idle
+        }
+    }
+
+    fn icon_pair(face: super::Face) -> (HICON, HICON) {
+        let hosting = matches!(face, super::Face::Hosting);
+        let mut small = if hosting {
+            SMALL_HOST.load(Ordering::SeqCst)
+        } else {
+            SMALL_IDLE.load(Ordering::SeqCst)
+        } as HICON;
+        let mut big = if hosting {
+            BIG_HOST.load(Ordering::SeqCst)
+        } else {
+            BIG_IDLE.load(Ordering::SeqCst)
+        } as HICON;
+        if small.is_null() {
+            small = SMALL_IDLE.load(Ordering::SeqCst) as HICON;
+        }
+        if big.is_null() {
+            big = BIG_IDLE.load(Ordering::SeqCst) as HICON;
+        }
+        (small, big)
+    }
+
+    pub fn set_face(face: super::Face) {
+        let next = face as u8;
+        if FACE.swap(next, Ordering::SeqCst) == next {
+            return;
+        }
+        if !INSTALLED.load(Ordering::SeqCst) {
+            return;
+        }
+        let (small, big) = icon_pair(face);
+        let main = MAIN.load(Ordering::SeqCst) as HWND;
+        if !main.is_null() {
+            apply_window_icons(main, small, big);
+        }
+        let tray = TRAY.load(Ordering::SeqCst) as HWND;
+        if tray.is_null() {
+            return;
+        }
+        let mut data = blank(tray);
+        data.uFlags = NIF_ICON;
+        data.hIcon = small;
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &data);
         }
     }
 
@@ -460,30 +541,225 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{hide_main, install, installed, quit_requested, remove, take_quit};
+pub use win::{hide_main, install, installed, quit_requested, remove, take_hide, take_quit, take_show};
 
-#[cfg(not(windows))]
+#[cfg(windows)]
+pub fn set_face(face: Face) {
+    win::set_face(face);
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    use ksni::blocking::{Handle, TrayMethods};
+    use ksni::menu::StandardItem;
+    use ksni::{Icon, Tray};
+
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static QUIT: AtomicBool = AtomicBool::new(false);
+    static HIDE: AtomicBool = AtomicBool::new(false);
+    static SHOW: AtomicBool = AtomicBool::new(false);
+    static FACE: AtomicU8 = AtomicU8::new(0);
+    static HANDLE: Mutex<Option<Handle<Item>>> = Mutex::new(None);
+
+    struct Item {
+        icon: Icon,
+    }
+
+    impl Tray for Item {
+        fn id(&self) -> String {
+            "etherquic".into()
+        }
+
+        fn title(&self) -> String {
+            "etherquic".into()
+        }
+
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip {
+                title: "etherquic".into(),
+                ..Default::default()
+            }
+        }
+
+        fn icon_name(&self) -> String {
+            // Empty so StatusNotifier uses the pixmap. A themed name would
+            // keep the idle Q while a player is connected.
+            String::new()
+        }
+
+        fn icon_pixmap(&self) -> Vec<Icon> {
+            vec![self.icon.clone()]
+        }
+
+        fn activate(&mut self, _x: i32, _y: i32) {
+            SHOW.store(true, Ordering::SeqCst);
+        }
+
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            vec![
+                StandardItem {
+                    label: "Open".into(),
+                    activate: Box::new(|_| SHOW.store(true, Ordering::SeqCst)),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Quit".into(),
+                    activate: Box::new(|_| QUIT.store(true, Ordering::SeqCst)),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+        }
+    }
+
+    fn tray_icon(face: super::Face) -> Option<Icon> {
+        let bytes: &[u8] = match face {
+            super::Face::Idle => include_bytes!(concat!(env!("OUT_DIR"), "/tray-32.argb")),
+            super::Face::Hosting => include_bytes!(concat!(env!("OUT_DIR"), "/tray-host-32.argb")),
+        };
+        if bytes.len() < 8 {
+            return None;
+        }
+        let width = i32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let height = i32::from_le_bytes(bytes[4..8].try_into().ok()?);
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let data = bytes[8..].to_vec();
+        if data.len() != (width as usize) * (height as usize) * 4 {
+            return None;
+        }
+        Some(Icon {
+            width,
+            height,
+            data,
+        })
+    }
+
+    fn current_face() -> super::Face {
+        if FACE.load(Ordering::SeqCst) == super::Face::Hosting as u8 {
+            super::Face::Hosting
+        } else {
+            super::Face::Idle
+        }
+    }
+
+    pub fn set_face(face: super::Face) {
+        let next = face as u8;
+        if FACE.swap(next, Ordering::SeqCst) == next {
+            return;
+        }
+        let Some(icon) = tray_icon(face) else {
+            return;
+        };
+        let guard = HANDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = guard.as_ref() else {
+            return;
+        };
+        let _ = handle.update(|item| item.icon = icon);
+    }
+
+    pub fn install(_main: isize) -> bool {
+        if INSTALLED.load(Ordering::SeqCst) {
+            return true;
+        }
+        let Some(icon) = tray_icon(current_face()) else {
+            return false;
+        };
+        // Login autostart can beat Plasma's watcher. assume_sni_available
+        // keeps the item registered until the session bus is ready.
+        match (Item { icon }).assume_sni_available(true).spawn() {
+            Ok(handle) => {
+                *HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                INSTALLED.store(true, Ordering::SeqCst);
+                true
+            }
+            Err(err) => {
+                eprintln!("etherquic: notification area: {err}");
+                false
+            }
+        }
+    }
+
+    pub fn installed() -> bool {
+        INSTALLED.load(Ordering::SeqCst)
+    }
+
+    pub fn quit_requested() -> bool {
+        QUIT.load(Ordering::SeqCst)
+    }
+
+    pub fn take_quit() -> bool {
+        QUIT.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn take_hide() -> bool {
+        HIDE.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn take_show() -> bool {
+        SHOW.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn hide_main() {
+        HIDE.store(true, Ordering::SeqCst);
+    }
+
+    pub fn remove() {
+        INSTALLED.store(false, Ordering::SeqCst);
+        if let Some(handle) = HANDLE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = handle.shutdown();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::{hide_main, install, installed, quit_requested, remove, take_hide, take_quit, take_show};
+
+#[cfg(target_os = "linux")]
+pub fn set_face(face: Face) {
+    linux::set_face(face);
+}
+
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub fn install(_main: isize) -> bool {
     false
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub fn installed() -> bool {
     false
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub fn quit_requested() -> bool {
     false
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub fn take_quit() -> bool {
     false
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "macos", target_os = "android"))]
+pub fn take_hide() -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "android"))]
+pub fn take_show() -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub fn hide_main() {}
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub fn remove() {}
+
+#[cfg(any(target_os = "macos", target_os = "android"))]
+pub fn set_face(_face: Face) {}

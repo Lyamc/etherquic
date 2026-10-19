@@ -154,6 +154,8 @@ pub struct ViewOptions {
     pub quality: u8,
     /// Ask the host to skip unchanged pictures and send MJPEG/MJ2K dirty tiles.
     pub dirty_rects: bool,
+    /// Outline 16-pixel tiles that changed in the last picture.
+    pub debug_dirty_rects: bool,
     /// PyroWave colour format asked of the host.
     pub yuv: etherquic::negotiate::YuvFormat,
     pub pad_slots: Vec<PadSlot>,
@@ -176,6 +178,7 @@ impl Default for ViewOptions {
             dither_strength: 60,
             quality: etherquic::negotiate::DEFAULT_QUALITY,
             dirty_rects: false,
+            debug_dirty_rects: false,
             yuv: etherquic::negotiate::YuvFormat::YUV444P8,
             pad_slots: Vec::new(),
             output_device: None,

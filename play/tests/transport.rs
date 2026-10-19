@@ -154,7 +154,8 @@ async fn exchange(
         let media = HostMedia {
             frames: host_frames,
             audio: audio_rx,
-            fps: 10,
+            fps: etherquic::negotiate::FpsWish::Fixed(10),
+            display_hz: None,
             log: Arc::new(|_: &str| {}),
             cursor: tokio::sync::watch::channel(None).1,
         };
@@ -185,6 +186,7 @@ async fn exchange(
                 quality: 0,
                 want_dirty_rects: None,
                 yuv: None,
+                fps: etherquic::negotiate::FpsWish::Auto,
             },
             frames: sink,
             events,
@@ -196,6 +198,7 @@ async fn exchange(
                 quality: 0,
                 dirty_rects: false,
                 yuv: etherquic::negotiate::YuvFormat::YUV444P8,
+                fps: etherquic::negotiate::FpsWish::Auto,
             })
             .1,
         };
