@@ -80,7 +80,17 @@ async fn main() -> Result<(), String> {
         "connected {addr}, alpn {:?}, negotiates {negotiates}",
         etherquic::agreed_alpn(&conn).map(|a| String::from_utf8_lossy(&a).into_owned())
     );
-    let offer = player::offer_for(&video_order, &audio_order, None, None, Limit::NONE, 0, 0);
+    let offer = player::offer_for(
+        &video_order,
+        &audio_order,
+        None,
+        None,
+        Limit::NONE,
+        0,
+        0,
+        false,
+        etherquic_media::negotiate::YuvFormat::YUV444P8,
+    );
     let mut offer_send = None;
     if negotiates {
         eprintln!(

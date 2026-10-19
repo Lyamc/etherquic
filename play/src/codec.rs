@@ -9,6 +9,8 @@ pub enum CodecId {
     Pyrowave,
     Mjpeg,
     Mj2k,
+    JpegXs,
+    OpenApv,
     H264,
     H265,
     Av1,
@@ -17,13 +19,16 @@ pub enum CodecId {
 /// One row in the picture preference list.
 ///
 /// H.264 is two rows: hardware encode, then a CPU encode. AV1 and H.265 are
-/// hardware-only. Pyrowave, MJ2K, and MJPEG have no second path.
+/// hardware-only. Pyrowave, JPEG XS, OpenAPV, MJ2K, and MJPEG have no second
+/// path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PicturePref {
     Av1Hw,
     H265Hw,
     H264Hw,
     Pyrowave,
+    JpegXs,
+    OpenApv,
     Mj2k,
     Mjpeg,
     H264Sw,
@@ -38,6 +43,8 @@ impl PicturePref {
             Self::H265Hw => CodecId::H265,
             Self::H264Hw | Self::H264Sw => CodecId::H264,
             Self::Pyrowave | Self::PyrowaveCpu => CodecId::Pyrowave,
+            Self::JpegXs => CodecId::JpegXs,
+            Self::OpenApv => CodecId::OpenApv,
             Self::Mj2k => CodecId::Mj2k,
             Self::Mjpeg => CodecId::Mjpeg,
         }
@@ -49,6 +56,8 @@ impl PicturePref {
             Self::H265Hw => "H.265 (HW)",
             Self::H264Hw => "H.264 (HW)",
             Self::Pyrowave => "PyroWave (GPU)",
+            Self::JpegXs => "JPEG XS",
+            Self::OpenApv => "OpenAPV",
             Self::Mj2k => "MJ2K",
             Self::Mjpeg => "MJPEG",
             Self::H264Sw => "H.264 (SW)",
@@ -58,12 +67,14 @@ impl PicturePref {
 
     /// Default preference order.
     /// Default preference order. CPU PyroWave is last, below MJPEG and x264.
-    pub fn order() -> [Self; 8] {
+    pub fn order() -> [Self; 10] {
         [
             Self::Av1Hw,
             Self::H265Hw,
             Self::H264Hw,
             Self::Pyrowave,
+            Self::JpegXs,
+            Self::OpenApv,
             Self::Mj2k,
             Self::Mjpeg,
             Self::H264Sw,
@@ -77,6 +88,8 @@ impl PicturePref {
             Self::H265Hw => "h265-hw",
             Self::H264Hw => "h264-hw",
             Self::Pyrowave => "pyrowave",
+            Self::JpegXs => "jpegxs",
+            Self::OpenApv => "openapv",
             Self::Mj2k => "mj2k",
             Self::Mjpeg => "mjpeg",
             Self::H264Sw => "h264-sw",
@@ -157,9 +170,29 @@ const TABLE: &[CodecInfo] = &[
         hardware: "does not require dedicated encode hardware",
     },
     CodecInfo {
+        id: CodecId::JpegXs,
+        name: "JPEG XS",
+        latency_rank: 2,
+        compression: "intra JPEG XS, visually lossless at modest ratios",
+        hardware_encode_required: false,
+        hardware_decode_required: false,
+        gpu_compute_both_ends: false,
+        hardware: "does not require dedicated encode hardware",
+    },
+    CodecInfo {
+        id: CodecId::OpenApv,
+        name: "OpenAPV",
+        latency_rank: 3,
+        compression: "intra APV through ffmpeg liboapv",
+        hardware_encode_required: false,
+        hardware_decode_required: false,
+        gpu_compute_both_ends: false,
+        hardware: "does not require dedicated encode hardware",
+    },
+    CodecInfo {
         id: CodecId::Mj2k,
         name: "MJ2K",
-        latency_rank: 2,
+        latency_rank: 4,
         compression: "intra JPEG 2000, stronger than MJPEG",
         hardware_encode_required: false,
         hardware_decode_required: false,
@@ -169,7 +202,7 @@ const TABLE: &[CodecInfo] = &[
     CodecInfo {
         id: CodecId::H264,
         name: "H.264",
-        latency_rank: 3,
+        latency_rank: 5,
         compression: "compresses well",
         hardware_encode_required: false,
         hardware_decode_required: false,
@@ -179,7 +212,7 @@ const TABLE: &[CodecInfo] = &[
     CodecInfo {
         id: CodecId::H265,
         name: "H.265",
-        latency_rank: 4,
+        latency_rank: 6,
         compression: "compresses better than H.264",
         hardware_encode_required: true,
         hardware_decode_required: true,
@@ -189,7 +222,7 @@ const TABLE: &[CodecInfo] = &[
     CodecInfo {
         id: CodecId::Av1,
         name: "AV1",
-        latency_rank: 5,
+        latency_rank: 7,
         compression: "compresses best",
         hardware_encode_required: true,
         hardware_decode_required: true,
@@ -226,7 +259,9 @@ pub fn recommend(codec: CodecId, support: &CodecSupport) -> bool {
         return false;
     }
     match codec {
-        CodecId::Pyrowave | CodecId::Mjpeg | CodecId::Mj2k => true,
+        CodecId::Pyrowave | CodecId::Mjpeg | CodecId::Mj2k | CodecId::JpegXs | CodecId::OpenApv => {
+            true
+        }
         CodecId::H264 => {
             if support.very_low_latency {
                 return false;
@@ -406,7 +441,9 @@ fn codec_gate(
                 Err("no gpu compute on the receiver")
             }
         }
-        PicturePref::Mjpeg | PicturePref::Mj2k => Ok(()),
+        PicturePref::Mjpeg | PicturePref::Mj2k | PicturePref::JpegXs | PicturePref::OpenApv => {
+            Ok(())
+        }
         PicturePref::H264Hw => {
             if encoder.hardware_encode {
                 Ok(())
@@ -525,6 +562,8 @@ pub fn this_computer() -> MachineCodecs {
         ),
         (CodecId::Mjpeg, EndSupport::default()),
         (CodecId::Mj2k, EndSupport::default()),
+        (CodecId::JpegXs, EndSupport::default()),
+        (CodecId::OpenApv, EndSupport::default()),
         (CodecId::H264, asic),
         (CodecId::H265, asic),
         (CodecId::Av1, EndSupport::default()),
@@ -571,6 +610,8 @@ mod tests {
             vec![
                 CodecId::Pyrowave,
                 CodecId::Mjpeg,
+                CodecId::JpegXs,
+                CodecId::OpenApv,
                 CodecId::Mj2k,
                 CodecId::H264,
                 CodecId::H265,
@@ -599,15 +640,23 @@ mod tests {
             .hardware
             .contains("does not require dedicated encode hardware"));
 
-        assert!(rows[2].compression.contains("JPEG 2000"));
-        assert!(rows[3].compression.contains("compresses well"));
-        assert!(rows[4].compression.contains("better than H.264"));
-        assert!(rows[4].hardware_encode_required && rows[4].hardware_decode_required);
-        assert!(rows[4]
+        let jpegxs = rows.iter().find(|row| row.id == CodecId::JpegXs).unwrap();
+        assert!(jpegxs.compression.contains("JPEG XS"));
+        let apv = rows.iter().find(|row| row.id == CodecId::OpenApv).unwrap();
+        assert!(apv.compression.contains("APV"));
+        let mj2k = rows.iter().find(|row| row.id == CodecId::Mj2k).unwrap();
+        assert!(mj2k.compression.contains("JPEG 2000"));
+        let h264 = rows.iter().find(|row| row.id == CodecId::H264).unwrap();
+        assert!(h264.compression.contains("compresses well"));
+        let h265 = rows.iter().find(|row| row.id == CodecId::H265).unwrap();
+        assert!(h265.compression.contains("better than H.264"));
+        assert!(h265.hardware_encode_required && h265.hardware_decode_required);
+        assert!(h265
             .hardware
             .contains("Hardware encode is the requirement that matters most"));
-        assert!(rows[5].compression.contains("compresses best"));
-        assert!(rows[5].hardware_encode_required && rows[5].hardware_decode_required);
+        let av1 = rows.iter().find(|row| row.id == CodecId::Av1).unwrap();
+        assert!(av1.compression.contains("compresses best"));
+        assert!(av1.hardware_encode_required && av1.hardware_decode_required);
     }
 
     #[test]
@@ -858,5 +907,31 @@ mod tests {
         assert!(!mjpeg.hardware_encode && !mjpeg.hardware_decode);
         let av1 = machine.get(CodecId::Av1);
         assert!(!av1.hardware_encode && !av1.hardware_decode);
+    }
+
+    #[test]
+    fn jpegxs_and_openapv_stay_when_skipping_software() {
+        let local = MachineCodecs::default();
+        let remote = MachineCodecs::default();
+        let (chosen, skipped) = choose_codec(
+            &[
+                PicturePref::JpegXs,
+                PicturePref::OpenApv,
+                PicturePref::Mjpeg,
+            ],
+            &local,
+            &remote,
+            true,
+            true,
+        );
+        assert_eq!(chosen, Some(PicturePref::JpegXs));
+        assert!(skipped.is_empty());
+        assert_eq!(PicturePref::from_token("jpegxs"), Some(PicturePref::JpegXs));
+        assert_eq!(
+            PicturePref::from_token("openapv"),
+            Some(PicturePref::OpenApv)
+        );
+        assert!(recommend(CodecId::JpegXs, &support()));
+        assert!(recommend(CodecId::OpenApv, &support()));
     }
 }

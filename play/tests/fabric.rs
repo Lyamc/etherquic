@@ -33,8 +33,14 @@ fn mjpeg_offer() -> Offer {
         failed: Vec::new(),
         knows_pyrowave_cpu: true,
         knows_dirty_rects: true,
+        knows_yuv_444: true,
         look: etherquic::look::Look::Off,
+        dither: None,
+        pixel_size: None,
+        dither_strength: None,
         quality: 0,
+        want_dirty_rects: None,
+        yuv: None,
     }
 }
 
@@ -132,7 +138,12 @@ fn player_media(offer: Offer, shown: std::sync::mpsc::Sender<Frame>) -> PlayerMe
         events,
         live: tokio::sync::watch::channel(etherquic_play::LiveOffer {
             look: etherquic::look::Look::Off,
+            dither: etherquic::look::Dither::Bayer4,
+            pixel_size: 2,
+            dither_strength: 60,
             quality: 0,
+            dirty_rects: false,
+            yuv: etherquic::negotiate::YuvFormat::YUV444P8,
         })
         .1,
     }

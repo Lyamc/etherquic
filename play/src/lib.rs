@@ -47,7 +47,7 @@ pub use desk_io::{
     queue_chat, queue_clipboard, queue_file, send_text_paste, set_desk_roster, take_host_mail,
     take_player_mail, DeskMail, NoteSide,
 };
-pub use etherquic::look::Look;
+pub use etherquic::look::{Dither, Look, Style};
 pub use etherquic_media;
 pub use join::{join_udp, parse_share, udp_peer};
 pub use keystrokes::{focus_sends_keyboard, keystroke_events, paste_chord, submit_keystrokes};

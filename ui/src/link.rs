@@ -564,6 +564,78 @@ fn host_audio_device() -> Option<String> {
     }
 }
 
+#[cfg(feature = "ui")]
+static PLAYER_INPUT: Mutex<Option<tokio::sync::mpsc::Sender<Vec<etherquic_input::Event>>>> =
+    Mutex::new(None);
+
+#[cfg(feature = "ui")]
+fn attach_player_input(tx: tokio::sync::mpsc::Sender<Vec<etherquic_input::Event>>) {
+    match PLAYER_INPUT.lock() {
+        Ok(mut guard) => *guard = Some(tx),
+        Err(poisoned) => *poisoned.into_inner() = Some(tx),
+    }
+}
+
+#[cfg(feature = "ui")]
+fn detach_player_input() {
+    match PLAYER_INPUT.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+}
+
+/// Queue EQIN key events on the open Android player session.
+#[cfg(feature = "ui")]
+pub fn send_player_keys(presses: &[(bool, u32)]) -> bool {
+    if presses.is_empty() {
+        return true;
+    }
+    let events: Vec<etherquic_input::Event> = presses
+        .iter()
+        .map(|&(down, code)| etherquic_input::Event {
+            time_us: 0,
+            body: etherquic_input::Body::Key {
+                down,
+                source: etherquic_input::KeySource::Keysym,
+                code,
+            },
+        })
+        .collect();
+    send_player_events(events)
+}
+
+/// Queue EQIN events (keys, pad, mouse) on the open Android player session.
+#[cfg(feature = "ui")]
+pub fn send_player_events(events: Vec<etherquic_input::Event>) -> bool {
+    if events.is_empty() {
+        return true;
+    }
+    let tx = match PLAYER_INPUT.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let Some(tx) = tx else {
+        return false;
+    };
+    tx.try_send(events).is_ok()
+}
+
+/// Show or hide the phone IME. No-op off Android.
+#[cfg(feature = "ui")]
+pub fn set_soft_keyboard(show: bool) {
+    #[cfg(target_os = "android")]
+    gpui::set_android_ime(show);
+    let _ = show;
+}
+
+/// Real pointer down/move/up instead of pan-as-scroll. Needed for analog sticks.
+#[cfg(feature = "ui")]
+pub fn set_touch_pointer(on: bool) {
+    #[cfg(target_os = "android")]
+    gpui::set_android_touch_pointer(on);
+    let _ = on;
+}
+
 fn client_thread(
     net: Option<Arc<L2Net>>,
     nic: Option<String>,
@@ -683,10 +755,16 @@ fn android_join(
     let offer = codecs.offer();
     let (_live_tx, live_rx) = tokio::sync::watch::channel(etherquic_play::LiveOffer {
         look: offer.look,
+        dither: offer.dither.unwrap_or_default(),
+        pixel_size: offer.pixel_size.unwrap_or(2),
+        dither_strength: offer.dither_strength.unwrap_or(60),
         quality: offer.quality,
+        dirty_rects: offer.want_dirty_rects.unwrap_or(false),
+        yuv: offer.yuv.unwrap_or_default(),
     });
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<etherquic_play::AudioChunk>(8);
-    let (_input_tx, input_rx) = tokio::sync::mpsc::channel(8);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(32);
+    attach_player_input(input_tx);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let frames: etherquic_play::etherquic_media::Sink<etherquic_play::etherquic_media::Frame> =
         std::sync::Arc::new(|_| true);
@@ -702,6 +780,7 @@ fn android_join(
         tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
         etherquic_play::join_udp(addr, media, audio_tx, input_rx, stop_flag).await
     });
+    detach_player_input();
     match outcome {
         Ok(()) => {
             if !stop.load(Ordering::SeqCst) {
@@ -948,6 +1027,31 @@ mod tests {
         assert!(!link.shows_taskbar());
         assert_eq!(link.peers(), 0);
         assert!(link.status().contains("Idle"));
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn player_keys_reach_the_join_channel() {
+        assert!(!send_player_keys(&[(true, 0xff1b)]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        attach_player_input(tx);
+        assert!(send_player_keys(&[(true, 0xff1b), (false, 0xff1b)]));
+        let events = rx.try_recv().expect("queued extra key");
+        assert_eq!(events.len(), 2);
+        match &events[0].body {
+            etherquic_input::Body::Key {
+                down,
+                code,
+                source,
+            } => {
+                assert!(*down);
+                assert_eq!(*code, 0xff1b);
+                assert_eq!(*source, etherquic_input::KeySource::Keysym);
+            }
+            other => panic!("{other:?}"),
+        }
+        detach_player_input();
+        assert!(!send_player_keys(&[(true, 0xff1b)]));
     }
 
     /// Two player sessions, the same acquire and release the window uses.

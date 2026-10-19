@@ -18,6 +18,10 @@ pub struct EncodeSetup {
     pub kbps: u32,
     /// 1–100 picture quality. Zero is [`crate::negotiate::DEFAULT_QUALITY`].
     pub quality: u8,
+    /// PyroWave colour format. Other codecs ignore this.
+    pub yuv: crate::negotiate::YuvFormat,
+    /// Open temporal ffmpeg with a long GOP and skip-unchanged on the host.
+    pub dirty_rects: bool,
 }
 
 pub enum VideoEncoder {
@@ -74,8 +78,12 @@ impl VideoEncoder {
                 if setup.encoder == "pyrowave-d3d11" {
                     #[cfg(windows)]
                     {
-                        let inner =
-                            pyrowave_d3d11::Encoder::new(setup.width, setup.height, frame_bytes)?;
+                        let inner = pyrowave_d3d11::Encoder::new(
+                            setup.width,
+                            setup.height,
+                            frame_bytes,
+                            setup.yuv,
+                        )?;
                         return Ok((VideoEncoder::PyrowaveD3d11 { inner, sink }, kbps));
                     }
                     #[cfg(not(windows))]
@@ -83,7 +91,8 @@ impl VideoEncoder {
                         return Err("pyrowave-d3d11 is only built for Windows".into());
                     }
                 }
-                let inner = pyrowave::Encoder::new(setup.width, setup.height, frame_bytes)?;
+                let inner =
+                    pyrowave::Encoder::new(setup.width, setup.height, frame_bytes, setup.yuv)?;
                 Ok((VideoEncoder::Pyrowave { inner, sink }, kbps))
             }
             video => {
@@ -101,8 +110,15 @@ impl VideoEncoder {
                     )
                 };
                 let spec = ffmpeg::EncoderSpec { video, name };
-                let inner =
-                    ffmpeg::Encoder::new(&spec, setup.width, setup.height, setup.fps, kbps, sink)?;
+                let inner = ffmpeg::Encoder::new(
+                    &spec,
+                    setup.width,
+                    setup.height,
+                    setup.fps,
+                    kbps,
+                    setup.dirty_rects,
+                    sink,
+                )?;
                 Ok((VideoEncoder::Ffmpeg(inner), kbps))
             }
         }
@@ -149,12 +165,13 @@ impl VideoDecoder {
         width: u32,
         height: u32,
         sink: Sink<Frame>,
+        yuv: crate::negotiate::YuvFormat,
     ) -> Result<VideoDecoder, String> {
         match video.codec() {
             VideoCodec::Mjpeg => Ok(VideoDecoder::Mjpeg { sink }),
             VideoCodec::Mj2k => Ok(VideoDecoder::Mj2k { sink }),
             VideoCodec::Pyrowave => Ok(VideoDecoder::Pyrowave {
-                inner: pyrowave::Decoder::new(width, height)?,
+                inner: pyrowave::Decoder::new(width, height, yuv)?,
                 sink,
             }),
             codec => Ok(VideoDecoder::Ffmpeg(ffmpeg::Decoder::new(

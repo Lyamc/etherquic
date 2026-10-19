@@ -71,7 +71,11 @@ endif()'
   ];
 
   postInstall = ''
-    test -f "$out/lib/libpyrowave-shared.so.1"
+    libdir="$out/lib"
+    if [ ! -e "$libdir/libpyrowave-shared.so" ] && [ ! -e "$libdir/libpyrowave-shared.so.1" ]; then
+      libdir="$out/lib64"
+    fi
+    test -e "$libdir/libpyrowave-shared.so" || test -e "$libdir/libpyrowave-shared.so.1"
     install -Dm644 "$src/LICENSE" "$out/share/pyrowave/LICENSE-pyrowave.txt"
     cp "$out/share/pyrowave/LICENSE-pyrowave.txt" "$out/lib/LICENSE-pyrowave.txt"
   '';

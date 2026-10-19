@@ -49,10 +49,12 @@ fn run_probe() -> Probe {
     };
     // PyroWave: a real encode and decode of one small picture.
     // The row says where it ran: a CPU Vulkan device is `pyrowave-cpu`.
-    let encoded = pyrowave::Encoder::new(256, 144, 32 * 1024).and_then(|mut enc| {
-        let record = enc.encode(&test_frame(256, 144))?;
-        Ok((record, enc.vulkan_device()))
-    });
+    let encoded =
+        pyrowave::Encoder::new(256, 144, 32 * 1024, crate::negotiate::YuvFormat::YUV420P8)
+            .and_then(|mut enc| {
+                let record = enc.encode(&test_frame(256, 144))?;
+                Ok((record, enc.vulkan_device()))
+            });
     // Hardware Vulkan wins. D3D11 is only for a failed encode or a CPU device.
     // An unknown device type is counted as a GPU, same as the row above.
     let try_d3d11 = match &encoded {
@@ -85,14 +87,16 @@ fn run_probe() -> Probe {
                     fps: 0,
                 },
             });
-            match pyrowave::Decoder::new(256, 144).and_then(|mut dec| dec.decode(&record)) {
+            match pyrowave::Decoder::new(256, 144, crate::negotiate::YuvFormat::YUV420P8)
+                .and_then(|mut dec| dec.decode(&record))
+            {
                 Ok(_) => probe.decodes.push(VideoCodec::Pyrowave),
                 Err(error) => probe.notes.push(format!("pyrowave decode: {error}")),
             }
         }
         Err(error) => {
             probe.notes.push(format!("pyrowave encode: {error}"));
-            match pyrowave::Decoder::new(256, 144) {
+            match pyrowave::Decoder::new(256, 144, crate::negotiate::YuvFormat::YUV420P8) {
                 Ok(_) => probe.decodes.push(VideoCodec::Pyrowave),
                 Err(error) => probe.notes.push(format!("pyrowave decode: {error}")),
             }
@@ -106,7 +110,13 @@ fn run_probe() -> Probe {
         // 64x64 stays inside the 32 KiB probe budget. A 256x144 high-frequency
         // frame does not: the packet walk then rejects it and the GPU row is
         // dropped even though the HD 6670 encoded it.
-        let d3d11 = crate::pyrowave_d3d11::Encoder::new(64, 64, 32 * 1024).and_then(|mut enc| {
+        let d3d11 = crate::pyrowave_d3d11::Encoder::new(
+            64,
+            64,
+            32 * 1024,
+            crate::negotiate::YuvFormat::YUV420P8,
+        )
+        .and_then(|mut enc| {
             let record = enc.encode(&test_frame(64, 64))?;
             let adapter = enc.adapter().to_string();
             crate::pyrowave_d3d11::record_acceptable(64, 64, &record)?;
@@ -125,7 +135,8 @@ fn run_probe() -> Probe {
                     },
                 });
                 if !probe.decodes.contains(&VideoCodec::Pyrowave)
-                    && pyrowave::Decoder::new(256, 144).is_ok()
+                    && pyrowave::Decoder::new(256, 144, crate::negotiate::YuvFormat::YUV420P8)
+                        .is_ok()
                 {
                     probe.decodes.push(VideoCodec::Pyrowave);
                 }

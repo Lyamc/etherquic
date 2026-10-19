@@ -252,7 +252,17 @@ async fn old_player_gets_legacy_streams() {
 async fn real_codecs_and_renegotiation() {
     let probe = etherquic_media::caps::probe();
     eprintln!("{}", etherquic_media::caps::summary(probe));
-    let offer = player::offer_for(&Video::ALL, &Audio::ALL, None, None, Limit::NONE, 0, 0);
+    let offer = player::offer_for(
+        &Video::ALL,
+        &Audio::ALL,
+        None,
+        None,
+        Limit::NONE,
+        0,
+        0,
+        false,
+        etherquic_media::negotiate::YuvFormat::YUV444P8,
+    );
     let expect =
         etherquic_media::negotiate::choose_video(&offer, &probe.caps, &[], Some((320, 180))).row;
     let out = session(probe.caps.clone(), offer.clone(), false, true).await;

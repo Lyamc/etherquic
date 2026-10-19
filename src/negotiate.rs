@@ -18,7 +18,7 @@
 
 use std::fmt::Write as _;
 
-use crate::look::Look;
+use crate::look::{Dither, Look};
 
 /// ALPN of a session that negotiates codecs.
 pub const ALPN_NEGOTIATE: &[u8] = b"etherquic/2";
@@ -42,6 +42,173 @@ pub fn scale_budget(default: u32, quality: u8) -> u32 {
     let q = u64::from(clamp_quality(quality));
     let scaled = u64::from(default) * q / u64::from(DEFAULT_QUALITY);
     scaled.clamp(1, u64::from(u32::MAX)) as u32
+}
+
+/// Chroma siting for PyroWave. The bitstream has 4:2:0 and 4:4:4; 4:2:2 is
+/// encoded as 4:4:4 after a horizontal chroma upsample.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YuvChroma {
+    Yuv420,
+    Yuv422,
+    #[default]
+    Yuv444,
+}
+
+impl YuvChroma {
+    pub const ALL: [YuvChroma; 3] = [Self::Yuv420, Self::Yuv422, Self::Yuv444];
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Yuv420 => "420",
+            Self::Yuv422 => "422",
+            Self::Yuv444 => "444",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|item| item.token() == token)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Yuv420 => "4:2:0",
+            Self::Yuv422 => "4:2:2",
+            Self::Yuv444 => "4:4:4",
+        }
+    }
+
+    /// Layout the PyroWave sequence header carries (1 bit: 420 or 444).
+    pub fn bitstream(self) -> Self {
+        match self {
+            Self::Yuv420 => Self::Yuv420,
+            Self::Yuv422 | Self::Yuv444 => Self::Yuv444,
+        }
+    }
+}
+
+/// Sample depth for PyroWave planes. The bitstream is float; this is the
+/// CPU buffer the encoder feeds and the decoder writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YuvDepth {
+    #[default]
+    Depth8,
+    Depth10,
+}
+
+impl YuvDepth {
+    pub const ALL: [YuvDepth; 2] = [Self::Depth8, Self::Depth10];
+
+    pub fn bits(self) -> u8 {
+        match self {
+            Self::Depth8 => 8,
+            Self::Depth10 => 10,
+        }
+    }
+
+    pub fn max_value(self) -> u16 {
+        match self {
+            Self::Depth8 => 255,
+            Self::Depth10 => 1023,
+        }
+    }
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Depth8 => "8",
+            Self::Depth10 => "10",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|item| item.token() == token)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Depth8 => "8-bit",
+            Self::Depth10 => "10-bit",
+        }
+    }
+}
+
+/// One PyroWave colour format: chroma × depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YuvFormat {
+    pub chroma: YuvChroma,
+    pub depth: YuvDepth,
+}
+
+impl YuvFormat {
+    pub const YUV420P8: Self = Self {
+        chroma: YuvChroma::Yuv420,
+        depth: YuvDepth::Depth8,
+    };
+    pub const YUV422P8: Self = Self {
+        chroma: YuvChroma::Yuv422,
+        depth: YuvDepth::Depth8,
+    };
+    pub const YUV444P8: Self = Self {
+        chroma: YuvChroma::Yuv444,
+        depth: YuvDepth::Depth8,
+    };
+    pub const YUV420P10: Self = Self {
+        chroma: YuvChroma::Yuv420,
+        depth: YuvDepth::Depth10,
+    };
+    pub const YUV422P10: Self = Self {
+        chroma: YuvChroma::Yuv422,
+        depth: YuvDepth::Depth10,
+    };
+    pub const YUV444P10: Self = Self {
+        chroma: YuvChroma::Yuv444,
+        depth: YuvDepth::Depth10,
+    };
+
+    pub const ALL: [YuvFormat; 6] = [
+        Self::YUV420P8,
+        Self::YUV422P8,
+        Self::YUV444P8,
+        Self::YUV420P10,
+        Self::YUV422P10,
+        Self::YUV444P10,
+    ];
+
+    pub fn token(self) -> &'static str {
+        match (self.chroma, self.depth) {
+            (YuvChroma::Yuv420, YuvDepth::Depth8) => "420p8",
+            (YuvChroma::Yuv422, YuvDepth::Depth8) => "422p8",
+            (YuvChroma::Yuv444, YuvDepth::Depth8) => "444p8",
+            (YuvChroma::Yuv420, YuvDepth::Depth10) => "420p10",
+            (YuvChroma::Yuv422, YuvDepth::Depth10) => "422p10",
+            (YuvChroma::Yuv444, YuvDepth::Depth10) => "444p10",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|item| item.token() == token)
+    }
+
+    pub fn label(self) -> String {
+        format!("{} {}", self.chroma.label(), self.depth.label())
+    }
+
+    /// Sequence-header chroma the decoder must be created with.
+    pub fn bitstream(self) -> Self {
+        Self {
+            chroma: self.chroma.bitstream(),
+            depth: self.depth,
+        }
+    }
+
+    pub fn needs_444_decoder(self) -> bool {
+        self.chroma.bitstream() == YuvChroma::Yuv444
+    }
+}
+
+impl Default for YuvFormat {
+    fn default() -> Self {
+        Self::YUV444P8
+    }
 }
 /// Player to host, one stream, offers.
 pub const OFFER_MAGIC: &[u8; 4] = b"ENEG";
@@ -74,6 +241,8 @@ pub enum Video {
     H265Hw,
     H264Hw,
     Pyrowave,
+    JpegXs,
+    OpenApv,
     Mj2k,
     Mjpeg,
     H264Sw,
@@ -87,6 +256,8 @@ pub enum VideoCodec {
     H265,
     H264,
     Pyrowave,
+    JpegXs,
+    OpenApv,
     Mj2k,
     Mjpeg,
 }
@@ -94,11 +265,15 @@ pub enum VideoCodec {
 impl Video {
     /// Default order. PyroWave on a CPU is last: it works, but takes many
     /// cores and about 40 Mbit/s, so Auto prefers MJ2K, MJPEG, and x264.
-    pub const ALL: [Video; 8] = [
+    /// JPEG XS and OpenAPV sit after GPU PyroWave: intra ffmpeg rows, no
+    /// encode ASIC.
+    pub const ALL: [Video; 10] = [
         Video::Av1Hw,
         Video::H265Hw,
         Video::H264Hw,
         Video::Pyrowave,
+        Video::JpegXs,
+        Video::OpenApv,
         Video::Mj2k,
         Video::Mjpeg,
         Video::H264Sw,
@@ -111,6 +286,8 @@ impl Video {
             Video::H265Hw => "h265-hw",
             Video::H264Hw => "h264-hw",
             Video::Pyrowave => "pyrowave",
+            Video::JpegXs => "jpegxs",
+            Video::OpenApv => "openapv",
             Video::Mj2k => "mj2k",
             Video::Mjpeg => "mjpeg",
             Video::H264Sw => "h264-sw",
@@ -128,6 +305,8 @@ impl Video {
             Video::H265Hw => "H.265 (HW)",
             Video::H264Hw => "H.264 (HW)",
             Video::Pyrowave => "PyroWave (GPU)",
+            Video::JpegXs => "JPEG XS",
+            Video::OpenApv => "OpenAPV",
             Video::Mj2k => "MJ2K",
             Video::Mjpeg => "MJPEG",
             Video::H264Sw => "H.264 (SW)",
@@ -141,6 +320,8 @@ impl Video {
             Video::H265Hw => VideoCodec::H265,
             Video::H264Hw | Video::H264Sw => VideoCodec::H264,
             Video::Pyrowave | Video::PyrowaveCpu => VideoCodec::Pyrowave,
+            Video::JpegXs => VideoCodec::JpegXs,
+            Video::OpenApv => VideoCodec::OpenApv,
             Video::Mj2k => VideoCodec::Mj2k,
             Video::Mjpeg => VideoCodec::Mjpeg,
         }
@@ -162,13 +343,71 @@ impl Video {
     pub fn skip_bad_frame(self) -> bool {
         matches!(
             self,
-            Video::Mjpeg | Video::Mj2k | Video::Pyrowave | Video::PyrowaveCpu
+            Video::Mjpeg
+                | Video::Mj2k
+                | Video::JpegXs
+                | Video::OpenApv
+                | Video::Pyrowave
+                | Video::PyrowaveCpu
         )
     }
 
     /// A dirty tile can be coded on its own. The player composites it.
     pub fn patch_updates(self) -> bool {
         matches!(self, Video::Mjpeg | Video::Mj2k)
+    }
+
+    /// What [`StreamConfig`] echoes for this row when the player asked for
+    /// dirty rectangles. `knows_patches` is the player listing `knows dirty-rects`.
+    pub fn dirty_rects_mode(self, want: bool, knows_patches: bool) -> DirtyRectsMode {
+        if !want {
+            DirtyRectsMode::Off
+        } else if self.patch_updates() && knows_patches {
+            DirtyRectsMode::Patches
+        } else {
+            DirtyRectsMode::Pskip
+        }
+    }
+}
+
+/// What the host is doing with dirty rectangles. Written on [`StreamConfig`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DirtyRectsMode {
+    /// Every captured picture is a full `D`.
+    #[default]
+    Off,
+    /// Intra row: type-`R` tiles when the dirty plan is small.
+    Patches,
+    /// Skip unchanged pictures; a dirty picture is a full `D`. Temporal
+    /// encoders also open a long GOP.
+    Pskip,
+}
+
+impl DirtyRectsMode {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Patches => "patches",
+            Self::Pskip => "pskip",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "off" => Some(Self::Off),
+            "patches" => Some(Self::Patches),
+            "pskip" => Some(Self::Pskip),
+            _ => None,
+        }
+    }
+
+    /// Shown on the session status when the host is skipping unchanged pictures.
+    pub fn status_token(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Patches => Some("patches"),
+            Self::Pskip => Some("pskip"),
+        }
     }
 }
 
@@ -350,13 +589,43 @@ pub struct Offer {
     pub knows_pyrowave_cpu: bool,
     /// The player composites [`RECORD_PATCH`] tiles (`knows dirty-rects`).
     pub knows_dirty_rects: bool,
+    /// The player can open a 4:4:4 PyroWave decoder (`knows yuv-444`).
+    pub knows_yuv_444: bool,
     /// Picture look the host paints before it encodes. An offer without the
     /// line is [`Look::Off`].
     pub look: Look,
+    /// Ordered or error-diffusion pattern. `None` is an older offer: the host
+    /// uses Bayer 4×4.
+    pub dither: Option<Dither>,
+    /// Source pixels per output pixel, 1–32. `None` is an older offer: the host
+    /// uses the look's default block size.
+    pub pixel_size: Option<u8>,
+    /// Dither strength 0–100. `None` is an older offer: the host uses 60.
+    pub dither_strength: Option<u8>,
     /// Picture quality, 1–100. Zero lets the host use [`DEFAULT_QUALITY`].
     /// MJPEG uses this as JPEG quality. MJ2K maps it to a JPEG 2000 byte
     /// budget. Other codecs scale their default bitrate.
     pub quality: u8,
+    /// The player asks the host to skip unchanged pictures and, with MJPEG or
+    /// MJ2K, send dirty tiles. `None` is an older offer with no `dirty-rects`
+    /// line: the host keeps its own setting.
+    pub want_dirty_rects: Option<bool>,
+    /// PyroWave colour format. `None` is an older offer: the host keeps 4:2:0 8-bit.
+    pub yuv: Option<YuvFormat>,
+}
+
+/// Format the host encodes, given the player's request and whether it can
+/// open a 4:4:4 decoder. An older offer with no `yuv` line stays 4:2:0 8-bit.
+pub fn pick_pyrowave_yuv(offer: &Offer) -> YuvFormat {
+    let want = offer.yuv.unwrap_or(YuvFormat::YUV420P8);
+    if want.needs_444_decoder() && !offer.knows_yuv_444 {
+        YuvFormat {
+            chroma: YuvChroma::Yuv420,
+            depth: want.depth,
+        }
+    } else {
+        want
+    }
 }
 
 impl Offer {
@@ -379,19 +648,42 @@ impl Offer {
         if self.knows_dirty_rects {
             knows.push("dirty-rects");
         }
+        if self.knows_yuv_444 {
+            knows.push("yuv-444");
+        }
         if !knows.is_empty() {
             let _ = writeln!(out, "knows {}", knows.join(" "));
         }
         let _ = writeln!(out, "look {}", self.look.token());
+        if let Some(dither) = self.dither {
+            let _ = writeln!(out, "dither {}", dither.token());
+        }
+        if let Some(pixel_size) = self.pixel_size {
+            let _ = writeln!(out, "pixel-size {pixel_size}");
+        }
+        if let Some(strength) = self.dither_strength {
+            let _ = writeln!(out, "dither-strength {strength}");
+        }
         let _ = writeln!(out, "quality {}", self.quality);
+        if let Some(want) = self.want_dirty_rects {
+            let _ = writeln!(out, "dirty-rects {}", if want { 1 } else { 0 });
+        }
+        if let Some(yuv) = self.yuv {
+            let _ = writeln!(out, "yuv {}", yuv.token());
+        }
         out.into_bytes()
     }
 
-    /// Codec lists, limits, and failures match. The picture look may differ,
-    /// so the host can keep the encoder it already opened.
+    /// Codec lists, limits, and failures match. Picture look, dither, and
+    /// pixel size may differ so the host can keep the encoder it already
+    /// opened. Quality and the dirty-rect request reopen it: GOP and
+    /// skip-unchanged follow those flags.
     pub fn same_codecs(&self, other: &Offer) -> bool {
         let mut other = other.clone();
         other.look = self.look;
+        other.dither = self.dither;
+        other.pixel_size = self.pixel_size;
+        other.dither_strength = self.dither_strength;
         *self == other
     }
 
@@ -406,8 +698,14 @@ impl Offer {
             failed: Vec::new(),
             knows_pyrowave_cpu: false,
             knows_dirty_rects: false,
+            knows_yuv_444: false,
             look: Look::Off,
+            dither: None,
+            pixel_size: None,
+            dither_strength: None,
             quality: 0,
+            want_dirty_rects: None,
+            yuv: None,
         };
         for (key, words) in &lines.rows {
             match key.as_str() {
@@ -426,6 +724,7 @@ impl Offer {
                 "knows" => {
                     offer.knows_pyrowave_cpu |= words.contains(&"pyrowave-cpu");
                     offer.knows_dirty_rects |= words.contains(&"dirty-rects");
+                    offer.knows_yuv_444 |= words.contains(&"yuv-444");
                 }
                 "look" => {
                     offer.look = words
@@ -433,9 +732,28 @@ impl Offer {
                         .and_then(|word| Look::from_token(word))
                         .unwrap_or(Look::Off);
                 }
+                "dither" => {
+                    offer.dither = words.first().and_then(|word| Dither::from_token(word));
+                }
+                "pixel-size" => {
+                    offer.pixel_size = words
+                        .first()
+                        .and_then(|w| w.parse().ok())
+                        .and_then(|n| (1..=32).contains(&n).then_some(n));
+                }
+                "dither-strength" => {
+                    offer.dither_strength = words
+                        .first()
+                        .and_then(|w| w.parse().ok())
+                        .filter(|n: &u8| *n <= 100);
+                }
                 "quality" => {
                     offer.quality = words.first().and_then(|w| w.parse().ok()).unwrap_or(0)
                 }
+                "dirty-rects" => {
+                    offer.want_dirty_rects = Some(parse_flag(words.first().copied().unwrap_or("1")))
+                }
+                "yuv" => offer.yuv = words.first().copied().and_then(YuvFormat::from_token),
                 _ => {}
             }
         }
@@ -461,6 +779,11 @@ pub struct StreamConfig {
     /// Why the codec changed, when it did.
     pub reason: String,
     pub host: HostCaps,
+    /// PyroWave colour format. Missing on an older config is 4:2:0 8-bit.
+    pub yuv: YuvFormat,
+    /// How the host handles unchanged pictures. Missing on an older config is
+    /// [`DirtyRectsMode::Off`].
+    pub dirty_rects: DirtyRectsMode,
 }
 
 impl StreamConfig {
@@ -478,6 +801,8 @@ impl StreamConfig {
             channels: 0,
             reason: String::new(),
             host: HostCaps::default(),
+            yuv: YuvFormat::YUV420P8,
+            dirty_rects: DirtyRectsMode::Off,
         }
     }
 
@@ -495,6 +820,8 @@ impl StreamConfig {
             channels,
             reason: String::new(),
             host: HostCaps::default(),
+            yuv: YuvFormat::YUV420P8,
+            dirty_rects: DirtyRectsMode::Off,
         }
     }
 
@@ -513,6 +840,12 @@ impl StreamConfig {
         }
         let _ = writeln!(out, "encoder {}", self.encoder);
         let _ = writeln!(out, "bitrate {}", self.bitrate_kbps);
+        if self.video.is_some() && self.yuv != YuvFormat::YUV420P8 {
+            let _ = writeln!(out, "yuv {}", self.yuv.bitstream().token());
+        }
+        if self.video.is_some() {
+            let _ = writeln!(out, "dirty-rects {}", self.dirty_rects.token());
+        }
         if !self.reason.is_empty() {
             let _ = writeln!(out, "reason {}", self.reason.replace('\n', " "));
         }
@@ -544,6 +877,8 @@ impl StreamConfig {
             channels: 0,
             reason: String::new(),
             host: HostCaps::default(),
+            yuv: YuvFormat::YUV420P8,
+            dirty_rects: DirtyRectsMode::Off,
         };
         for (key, words) in &lines.rows {
             let first = words.first().copied().unwrap_or("");
@@ -562,6 +897,16 @@ impl StreamConfig {
                 "encoder" => config.encoder = first.to_string(),
                 "bitrate" => config.bitrate_kbps = first.parse().unwrap_or(0),
                 "reason" => config.reason = words.join(" "),
+                "yuv" => {
+                    if let Some(yuv) = YuvFormat::from_token(first) {
+                        config.yuv = yuv.bitstream();
+                    }
+                }
+                "dirty-rects" => {
+                    if let Some(mode) = DirtyRectsMode::from_token(first) {
+                        config.dirty_rects = mode;
+                    }
+                }
                 other => config.host.read_line(other, words),
             }
         }
@@ -626,6 +971,11 @@ pub struct OfferInput<'a> {
     pub max: Limit,
     pub bitrate_kbps: u32,
     pub quality: u8,
+    /// Skip unchanged pictures and send MJPEG/MJ2K dirty tiles when the host
+    /// can. Written as `dirty-rects 0` or `dirty-rects 1`.
+    pub want_dirty_rects: bool,
+    /// PyroWave colour format. Default is 4:4:4 8-bit.
+    pub yuv: YuvFormat,
 }
 
 /// Pin first, then the Settings order, then anything left over, keeping only
@@ -662,9 +1012,19 @@ pub fn build_offer(input: &OfferInput<'_>) -> Offer {
         failed: Vec::new(),
         knows_pyrowave_cpu: true,
         knows_dirty_rects: true,
+        knows_yuv_444: true,
         look: Look::Off,
+        dither: None,
+        pixel_size: None,
+        dither_strength: None,
         quality: input.quality,
+        want_dirty_rects: Some(input.want_dirty_rects),
+        yuv: Some(input.yuv),
     }
+}
+
+fn parse_flag(word: &str) -> bool {
+    !matches!(word, "0" | "off" | "false" | "no")
 }
 
 /// A row that was passed over, and why.
@@ -849,6 +1209,8 @@ mod tests {
             VideoCodec::H265,
             VideoCodec::H264,
             VideoCodec::Pyrowave,
+            VideoCodec::JpegXs,
+            VideoCodec::OpenApv,
             VideoCodec::Mj2k,
             VideoCodec::Mjpeg,
         ]
@@ -947,7 +1309,109 @@ mod tests {
         assert!(!offer.same_codecs(&other));
         let unknown = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\nlook crt\n").unwrap();
         assert_eq!(unknown.look, Look::Off);
+        assert_eq!(unknown.dither, None);
+        assert_eq!(unknown.pixel_size, None);
+        assert_eq!(unknown.dither_strength, None);
         assert_eq!(unknown.quality, 0);
+        assert_eq!(unknown.want_dirty_rects, None);
+    }
+
+    #[test]
+    fn dither_and_pixel_size_round_trip_and_leave_the_encoder() {
+        let mut offer = offer(&[Video::Mjpeg], &[VideoCodec::Mjpeg]);
+        offer.look = Look::Pico8;
+        offer.dither = Some(Dither::BlueNoise);
+        offer.pixel_size = Some(8);
+        offer.dither_strength = Some(70);
+        let text = String::from_utf8(offer.encode()).unwrap();
+        assert!(text.contains("dither bluenoise\n"), "{text}");
+        assert!(text.contains("pixel-size 8\n"), "{text}");
+        assert!(text.contains("dither-strength 70\n"), "{text}");
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert_eq!(back.dither, Some(Dither::BlueNoise));
+        assert_eq!(back.pixel_size, Some(8));
+        assert_eq!(back.dither_strength, Some(70));
+        assert!(offer.same_codecs(&back));
+        let mut other = offer.clone();
+        other.dither = Some(Dither::FloydSteinberg);
+        other.pixel_size = Some(4);
+        assert!(offer.same_codecs(&other));
+    }
+
+    #[test]
+    fn dirty_rects_request_round_trips_and_restarts_the_encoder() {
+        let mut offer = offer(&[Video::Mjpeg], &[VideoCodec::Mjpeg]);
+        assert_eq!(offer.want_dirty_rects, Some(false));
+        offer.want_dirty_rects = Some(true);
+        let text = String::from_utf8(offer.encode()).unwrap();
+        assert!(text.contains("dirty-rects 1\n"), "{text}");
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert_eq!(back.want_dirty_rects, Some(true));
+        assert!(offer.same_codecs(&back));
+        let mut other = offer.clone();
+        other.want_dirty_rects = Some(false);
+        assert!(!offer.same_codecs(&other));
+        other.want_dirty_rects = None;
+        assert!(!offer.same_codecs(&other));
+        let old = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\n").unwrap();
+        assert_eq!(old.want_dirty_rects, None);
+        assert!(!parse_flag("0"));
+        assert!(parse_flag("1"));
+        assert!(!parse_flag("off"));
+    }
+
+    #[test]
+    fn stream_config_echoes_dirty_rects_mode() {
+        for mode in [
+            DirtyRectsMode::Patches,
+            DirtyRectsMode::Pskip,
+            DirtyRectsMode::Off,
+        ] {
+            let mut config = StreamConfig::video(Video::Mjpeg, "jpeg", 64, 48, 30);
+            config.dirty_rects = mode;
+            let text = String::from_utf8(config.encode()[1..].to_vec()).unwrap();
+            assert!(
+                text.contains(&format!("dirty-rects {}\n", mode.token())),
+                "{text}"
+            );
+            let back = StreamConfig::decode(&config.encode()).unwrap();
+            assert_eq!(back.dirty_rects, mode);
+        }
+        let missing = StreamConfig::decode(
+            b"Ceqneg 1\nvideo mjpeg\nencoder jpeg\nsize 64x48\nfps 30\nbitrate 0\n",
+        )
+        .unwrap();
+        assert_eq!(missing.dirty_rects, DirtyRectsMode::Off);
+        let future = StreamConfig::decode(
+            b"Ceqneg 1\nvideo mjpeg\nencoder jpeg\nsize 64x48\nfps 30\nbitrate 0\ndirty-rects future\n",
+        )
+        .unwrap();
+        assert_eq!(future.video, Some(Video::Mjpeg));
+        assert_eq!(future.dirty_rects, DirtyRectsMode::Off);
+        assert_eq!(
+            Video::Mjpeg.dirty_rects_mode(true, true),
+            DirtyRectsMode::Patches
+        );
+        assert_eq!(
+            Video::Mj2k.dirty_rects_mode(true, true),
+            DirtyRectsMode::Patches
+        );
+        assert_eq!(
+            Video::H264Sw.dirty_rects_mode(true, true),
+            DirtyRectsMode::Pskip
+        );
+        assert_eq!(
+            Video::Pyrowave.dirty_rects_mode(true, true),
+            DirtyRectsMode::Pskip
+        );
+        assert_eq!(
+            Video::Mjpeg.dirty_rects_mode(true, false),
+            DirtyRectsMode::Pskip
+        );
+        assert_eq!(
+            Video::Mjpeg.dirty_rects_mode(false, true),
+            DirtyRectsMode::Off
+        );
     }
 
     #[test]
@@ -962,10 +1426,25 @@ mod tests {
         assert!(text.contains("quality 7\n"), "{text}");
         let back = Offer::decode(&offer.encode()).unwrap();
         assert_eq!(back.quality, 7);
+        assert_eq!(back.want_dirty_rects, Some(false));
         assert!(Video::Pyrowave.skip_bad_frame());
         assert!(Video::Mjpeg.skip_bad_frame());
         assert!(Video::Mj2k.skip_bad_frame());
+        assert!(Video::JpegXs.skip_bad_frame());
+        assert!(Video::OpenApv.skip_bad_frame());
         assert!(!Video::H264Hw.skip_bad_frame());
+        assert!(!Video::JpegXs.patch_updates());
+        assert!(!Video::OpenApv.patch_updates());
+        assert_eq!(
+            Video::JpegXs.dirty_rects_mode(true, true),
+            DirtyRectsMode::Pskip
+        );
+        assert_eq!(
+            Video::OpenApv.dirty_rects_mode(true, true),
+            DirtyRectsMode::Pskip
+        );
+        assert_eq!(Video::from_token("jpegxs"), Some(Video::JpegXs));
+        assert_eq!(Video::from_token("openapv"), Some(Video::OpenApv));
     }
 
     #[test]
@@ -974,9 +1453,17 @@ mod tests {
         let back = Offer::decode(&offer.encode()).unwrap();
         assert!(back.knows_pyrowave_cpu);
         assert!(back.knows_dirty_rects);
+        assert!(back.knows_yuv_444);
+        assert_eq!(back.yuv, Some(YuvFormat::YUV444P8));
         assert!(String::from_utf8(offer.encode())
             .unwrap()
-            .contains("knows pyrowave-cpu dirty-rects\n"));
+            .contains("knows pyrowave-cpu dirty-rects yuv-444\n"));
+        assert!(String::from_utf8(offer.encode())
+            .unwrap()
+            .contains("yuv 444p8\n"));
+        assert!(String::from_utf8(offer.encode())
+            .unwrap()
+            .contains("dirty-rects 0\n"));
         assert_eq!(back.video, offer.video);
         // An old host's plain pyrowave is treated as GPU.
         let old_host = HostCaps::from_text(
@@ -1176,6 +1663,35 @@ mod tests {
         assert_eq!(StreamConfig::decode(&bytes).unwrap(), config);
         let audio = StreamConfig::audio(Audio::Opus, "libopus", 48_000, 2);
         assert_eq!(StreamConfig::decode(&audio.encode()).unwrap(), audio);
+    }
+
+    #[test]
+    fn yuv_request_round_trips_and_old_players_stay_420() {
+        let mut offer = offer(&[Video::Pyrowave, Video::Mjpeg], &all_decodes());
+        assert_eq!(offer.yuv, Some(YuvFormat::YUV444P8));
+        assert!(offer.knows_yuv_444);
+        offer.yuv = Some(YuvFormat::YUV422P10);
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert_eq!(back.yuv, Some(YuvFormat::YUV422P10));
+        assert_eq!(pick_pyrowave_yuv(&back), YuvFormat::YUV422P10);
+        assert_eq!(pick_pyrowave_yuv(&back).bitstream(), YuvFormat::YUV444P10);
+        let old =
+            Offer::decode(b"eqneg 1\nvideo pyrowave mjpeg\naudio pcm\nmax 0x0@0\nbitrate 0\n")
+                .unwrap();
+        assert_eq!(old.yuv, None);
+        assert!(!old.knows_yuv_444);
+        assert_eq!(pick_pyrowave_yuv(&old), YuvFormat::YUV420P8);
+        let mut no_444 = back.clone();
+        no_444.knows_yuv_444 = false;
+        assert_eq!(pick_pyrowave_yuv(&no_444), YuvFormat::YUV420P10);
+        let mut other = back.clone();
+        other.yuv = Some(YuvFormat::YUV420P8);
+        assert!(!back.same_codecs(&other));
+        let mut config = StreamConfig::video(Video::Pyrowave, "pyrowave", 64, 64, 30);
+        config.yuv = YuvFormat::YUV444P10;
+        let decoded = StreamConfig::decode(&config.encode()).unwrap();
+        assert_eq!(decoded.yuv, YuvFormat::YUV444P10);
+        assert!(YuvFormat::from_token("nope").is_none());
     }
 
     #[test]

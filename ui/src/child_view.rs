@@ -57,7 +57,14 @@ pub fn connect_args(c: &ChildConnect) -> Vec<String> {
     args.extend(["--scale".into(), v.scale.token().into()]);
     args.extend(["--cursor".into(), v.cursor.token().into()]);
     args.extend(["--look".into(), v.look.token().into()]);
+    args.extend(["--dither".into(), v.dither.token().into()]);
+    args.extend(["--pixel-size".into(), v.pixel_size.to_string()]);
+    args.extend(["--dither-strength".into(), v.dither_strength.to_string()]);
     args.extend(["--quality".into(), v.quality.to_string()]);
+    if v.dirty_rects {
+        args.push("--dirty-rects".into());
+    }
+    args.extend(["--yuv".into(), v.yuv.token().into()]);
     if v.size_match.available() {
         args.extend(["--size-match".into(), v.size_match.token().into()]);
     }
@@ -316,6 +323,7 @@ mod tests {
         c.nic = Some("en0".into());
         c.trace_input = true;
         c.view.scale = ScaleMode::Fill;
+        c.view.dirty_rects = true;
         c.view.send_mouse = false;
         c.view.output_device = Some("Speakers".into());
         c.view.pad_slots = vec![PadSlot {
@@ -331,6 +339,7 @@ mod tests {
             "--scale fill",
             "--cursor native",
             "--look off",
+            "--dirty-rects",
             "--no-mouse",
             "--output-device Speakers",
             "--pad 2=Pad",

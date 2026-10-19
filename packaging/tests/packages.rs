@@ -63,6 +63,18 @@ fn built_packages_share_one_identity_and_the_second_version_is_higher() {
         high_app.version_code,
         high_app.version_name
     );
+    let apk_bytes = fs::read(&android_high).expect("read higher android package");
+    for so in [
+        "lib/arm64-v8a/libetherquic_android.so",
+        "lib/arm64-v8a/libopus.so",
+        "lib/arm64-v8a/libpyrowave-shared.so",
+        "lib/arm64-v8a/libffmpeg.so",
+    ] {
+        println!(
+            "android native {so} present={}",
+            zip_has_stored(&apk_bytes, so)
+        );
+    }
 
     assert_eq!(
         guid(&low.upgrade_code),
@@ -428,6 +440,25 @@ fn assert_classes_dex(path: &Path, apk: &[u8]) {
         "android dex package={} strings={strings:?} map={map_types:?} invoke={invoke_class}.{invoke_name} direct={direct_class}.{direct_name}",
         path.display()
     );
+}
+
+fn zip_has_stored(archive: &[u8], name: &str) -> bool {
+    let mut offset = 0usize;
+    while offset + 30 <= archive.len() && &archive[offset..offset + 4] == b"PK\x03\x04" {
+        let size = u32_at(archive, offset + 18) as usize;
+        let name_len = u16_at(archive, offset + 26) as usize;
+        let extra_len = u16_at(archive, offset + 28) as usize;
+        let name_at = offset + 30;
+        if name_at + name_len > archive.len() {
+            break;
+        }
+        let entry_name = std::str::from_utf8(&archive[name_at..name_at + name_len]).unwrap_or("");
+        if entry_name == name {
+            return true;
+        }
+        offset = name_at + name_len + extra_len + size;
+    }
+    false
 }
 
 fn stored_entry(archive: &[u8], name: &str) -> Vec<u8> {

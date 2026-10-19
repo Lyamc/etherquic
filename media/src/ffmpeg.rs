@@ -1,11 +1,14 @@
-//! H.264, H.265 and AV1 through an `ffmpeg` child process.
+//! H.264, H.265, AV1, OpenAPV, and JPEG XS through an `ffmpeg` child process.
 //!
-//! The encoder reads raw RGB frames on stdin and writes an Annex-B (or OBU)
-//! elementary stream on stdout with every packet flushed; the host forwards
-//! those bytes as `EVI2` data records. The player's decoder is the mirror:
-//! the elementary stream in, raw RGB frames of the configured size out. Both
-//! run with B-frames off and a single decode thread, so a picture is not
-//! held back for reordering or frame threads.
+//! The encoder reads raw RGB frames on stdin and writes a framed bitstream on
+//! stdout with every packet flushed; the host forwards those bytes as `EVI2`
+//! data records. H.264/H.265/AV1 use NUT. OpenAPV uses the raw `apv` mux
+//! (NUT has no APV tag). JPEG XS uses NUT with codec tag `jxs` (ffmpeg has
+//! no `jpegxs` muxer, and a raw `image2pipe` stream does not frame pictures
+//! for the live decoder). The player's decoder is the mirror: the
+//! elementary stream in, raw RGB frames of the configured size out. Temporal
+//! rows run with B-frames off and a single decode thread, so a picture is
+//! not held back for reordering or frame threads.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -43,16 +46,36 @@ pub fn candidates(video: Video) -> &'static [&'static str] {
         }
         Video::Av1Hw => &["av1_nvenc", "av1_amf", "av1_qsv"],
         Video::H264Sw => &["libx264"],
+        Video::OpenApv => &["liboapv"],
+        Video::JpegXs => &["libsvtjpegxs"],
         Video::Pyrowave | Video::PyrowaveCpu | Video::Mjpeg | Video::Mj2k => &[],
     }
 }
 
-fn output_format(codec: VideoCodec) -> &'static str {
+fn encoder_format(codec: VideoCodec) -> &'static str {
     // NUT frames each packet, so the decoder's demuxer hands a picture on as
     // soon as it arrives. A raw elementary stream waits for the next picture's
-    // start code first, one frame of extra delay.
-    let _ = codec;
-    "nut"
+    // start code first, one frame of extra delay. APV has a raw muxer. JPEG
+    // XS has no NUT tag of its own; encode sets `-tag:v jxs`.
+    match codec {
+        VideoCodec::OpenApv => "apv",
+        _ => "nut",
+    }
+}
+
+fn decoder_format(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::OpenApv => "apv",
+        _ => "nut",
+    }
+}
+
+fn encoder_pix_fmt(name: &str) -> &'static str {
+    match name {
+        "liboapv" => "yuv422p10le",
+        n if n.contains("jpegxs") => "yuv422p",
+        _ => "yuv420p",
+    }
 }
 
 fn hide_window(command: &mut Command) {
@@ -83,6 +106,7 @@ fn runs(path: &PathBuf) -> bool {
 /// The ffmpeg this process uses: `ETHERQUIC_FFMPEG`, beside the program,
 /// Homebrew on macOS (a Finder-started app has no Homebrew on `PATH`), then
 /// `PATH` widened with the signed-in user's path and WinGet on Windows.
+/// On Android the binary is packed as `libffmpeg.so` in `nativeLibraryDir`.
 pub fn binary() -> Option<PathBuf> {
     static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
     BINARY
@@ -97,10 +121,15 @@ pub fn binary() -> Option<PathBuf> {
             if let Some(path) = std::env::var_os("ETHERQUIC_FFMPEG") {
                 list.push(PathBuf::from(path));
             }
+            for dir in etherquic::native_library_dirs() {
+                list.push(dir.join("libffmpeg.so"));
+                list.push(dir.join(exe));
+            }
             if let Some(dir) = std::env::current_exe()
                 .ok()
                 .and_then(|e| e.parent().map(|d| d.to_path_buf()))
             {
+                list.push(dir.join("libffmpeg.so"));
                 list.push(dir.join(exe));
             }
             if cfg!(target_os = "macos") {
@@ -142,13 +171,23 @@ fn listed(text: &str, name: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some(name))
 }
 
+/// Frames in a long GOP when the player asked for dirty-rects. Hardware
+/// encoders often clamp this; libx264 also gets `keyint=infinite`.
+pub const LONG_GOP: u32 = 25_000;
+
 /// Encoder arguments after the input. `kbps` is the target rate.
-fn encoder_args(name: &str, fps: u32, kbps: u32) -> Vec<String> {
+/// `long_gop` is the dirty-rects temporal path: infinite/large GOP, B-frames
+/// still off, intra-refresh when that encoder documents it.
+pub fn encoder_args(name: &str, fps: u32, kbps: u32, long_gop: bool) -> Vec<String> {
     let fps = fps.max(1);
     let rate = format!("{kbps}k");
     // One frame of buffer: the rate controller cannot borrow from later frames.
     let buffer = format!("{}k", (kbps / fps).max(64) * 2);
-    let gop = (fps * 10).to_string();
+    let gop = if long_gop {
+        LONG_GOP.to_string()
+    } else {
+        (fps * 10).to_string()
+    };
     let mut args: Vec<String> = vec![
         "-c:v".into(),
         name.into(),
@@ -157,6 +196,11 @@ fn encoder_args(name: &str, fps: u32, kbps: u32) -> Vec<String> {
         "-g".into(),
         gop,
     ];
+    let x264 = if long_gop {
+        "repeat-headers=1:sliced-threads=1:keyint=infinite:intra-refresh=1"
+    } else {
+        "repeat-headers=1:sliced-threads=1"
+    };
     let more: Vec<&str> = match name {
         "libx264" => vec![
             "-preset",
@@ -164,21 +208,27 @@ fn encoder_args(name: &str, fps: u32, kbps: u32) -> Vec<String> {
             "-tune",
             "zerolatency",
             "-x264-params",
-            "repeat-headers=1:sliced-threads=1",
+            x264,
         ],
         n if n.ends_with("_videotoolbox") => vec!["-realtime", "1", "-prio_speed", "1"],
-        n if n.ends_with("_nvenc") => vec![
-            "-preset",
-            "p1",
-            "-tune",
-            "ull",
-            "-zerolatency",
-            "1",
-            "-delay",
-            "0",
-            "-rc",
-            "cbr",
-        ],
+        n if n.ends_with("_nvenc") => {
+            let mut nvenc = vec![
+                "-preset",
+                "p1",
+                "-tune",
+                "ull",
+                "-zerolatency",
+                "1",
+                "-delay",
+                "0",
+                "-rc",
+                "cbr",
+            ];
+            if long_gop {
+                nvenc.extend(["-intra-refresh", "1"]);
+            }
+            nvenc
+        }
         n if n.ends_with("_amf") => vec!["-usage", "ultralowlatency", "-rc", "cbr"],
         n if n.ends_with("_qsv") => vec![
             "-preset",
@@ -188,6 +238,8 @@ fn encoder_args(name: &str, fps: u32, kbps: u32) -> Vec<String> {
             "-async_depth",
             "1",
         ],
+        "liboapv" => vec!["-preset", "fastest"],
+        n if n.contains("jpegxs") => vec!["-tag:v", "jxs"],
         _ => vec![],
     };
     args.extend(more.into_iter().map(String::from));
@@ -207,6 +259,10 @@ fn codec_of(name: &str) -> VideoCodec {
         VideoCodec::H265
     } else if name.contains("av1") {
         VideoCodec::Av1
+    } else if name.contains("oapv") || name == "apv" || name.starts_with("apv_") {
+        VideoCodec::OpenApv
+    } else if name.contains("jpegxs") || name.contains("jxs") {
+        VideoCodec::JpegXs
     } else {
         VideoCodec::H264
     }
@@ -225,9 +281,9 @@ pub fn probe_encoder(name: &str) -> Result<(), String> {
         "-frames:v",
         "8",
         "-pix_fmt",
-        "yuv420p",
+        encoder_pix_fmt(name),
     ]);
-    cmd.args(encoder_args(name, 30, 2000));
+    cmd.args(encoder_args(name, 30, 2000, false));
     cmd.args(["-f", "null", "-"]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -263,7 +319,14 @@ pub fn working_encoders() -> Vec<EncoderSpec> {
         return Vec::new();
     }
     let list = listing("-encoders");
-    let rows = [Video::Av1Hw, Video::H265Hw, Video::H264Hw, Video::H264Sw];
+    let rows = [
+        Video::Av1Hw,
+        Video::H265Hw,
+        Video::H264Hw,
+        Video::H264Sw,
+        Video::JpegXs,
+        Video::OpenApv,
+    ];
     let handles: Vec<_> = rows
         .into_iter()
         .map(|video| {
@@ -303,6 +366,16 @@ pub fn working_decoders() -> Vec<(VideoCodec, &'static str)> {
     if listed(&list, "libdav1d") {
         out.push((VideoCodec::Av1, "libdav1d"));
     }
+    if listed(&list, "apv") {
+        out.push((VideoCodec::OpenApv, "apv"));
+    } else if listed(&list, "liboapv") {
+        out.push((VideoCodec::OpenApv, "liboapv"));
+    }
+    if listed(&list, "libsvtjpegxs") {
+        out.push((VideoCodec::JpegXs, "libsvtjpegxs"));
+    } else if listed(&list, "jpegxs") {
+        out.push((VideoCodec::JpegXs, "jpegxs"));
+    }
     out
 }
 
@@ -321,10 +394,17 @@ pub fn default_kbps(codec: VideoCodec, width: u32, height: u32, fps: u32) -> u32
         VideoCodec::H264 => 12_000u64,
         VideoCodec::H265 => 8_000,
         VideoCodec::Av1 => 6_000,
+        VideoCodec::OpenApv => 16_000,
+        // JPEG XS is bits-per-pixel; ~3 bpp at 1280x720 30 fps is 80 Mbps.
+        VideoCodec::JpegXs => 80_000,
         _ => 12_000,
     };
     let scale = (width as u64 * height as u64 * fps.max(1) as u64).max(1);
-    ((base * scale) / (1280 * 720 * 30)).clamp(1_000, 80_000) as u32
+    let cap = match codec {
+        VideoCodec::JpegXs => 400_000,
+        _ => 80_000,
+    };
+    ((base * scale) / (1280 * 720 * 30)).clamp(1_000, cap) as u32
 }
 
 type Failure = Arc<Mutex<Option<String>>>;
@@ -365,6 +445,7 @@ impl Encoder {
         height: u32,
         fps: u32,
         kbps: u32,
+        long_gop: bool,
         sink: Sink<Vec<u8>>,
     ) -> Result<Encoder, String> {
         let binary = binary().ok_or("no ffmpeg")?;
@@ -385,10 +466,10 @@ impl Encoder {
             "pipe:0",
             "-an",
             "-pix_fmt",
-            "yuv420p",
+            encoder_pix_fmt(spec.name),
         ]);
-        cmd.args(encoder_args(spec.name, fps, kbps));
-        cmd.args(["-flush_packets", "1", "-f", output_format(codec), "pipe:1"]);
+        cmd.args(encoder_args(spec.name, fps, kbps, long_gop));
+        cmd.args(["-flush_packets", "1", "-f", encoder_format(codec), "pipe:1"]);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -503,10 +584,10 @@ impl Decoder {
             "low_delay",
         ]);
         cmd.args(["-threads", "1"]);
-        if cfg!(target_os = "macos") && codec != VideoCodec::Av1 {
+        if cfg!(target_os = "macos") && matches!(codec, VideoCodec::H264 | VideoCodec::H265) {
             cmd.args(["-hwaccel", "videotoolbox"]);
         }
-        cmd.args(["-c:v", name, "-f", output_format(codec), "-i", "pipe:0"]);
+        cmd.args(["-c:v", name, "-f", decoder_format(codec), "-i", "pipe:0"]);
         cmd.args([
             "-f",
             "rawvideo",
@@ -577,5 +658,111 @@ impl Drop for Decoder {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined(args: &[String]) -> String {
+        args.join(" ")
+    }
+
+    #[test]
+    fn libx264_long_gop_keeps_no_bframes_and_infinite_keyint() {
+        let short = encoder_args("libx264", 30, 2000, false);
+        let text = joined(&short);
+        assert!(text.contains("-bf 0"), "{text}");
+        assert!(text.contains("-g 300"), "{text}");
+        assert!(text.contains("repeat-headers=1:sliced-threads=1"), "{text}");
+        assert!(
+            !text.contains("keyint=infinite"),
+            "short GOP should not request infinite keyint: {text}"
+        );
+
+        let long = encoder_args("libx264", 30, 2000, true);
+        let text = joined(&long);
+        assert!(text.contains("-bf 0"), "{text}");
+        assert!(text.contains(&format!("-g {LONG_GOP}")), "{text}");
+        assert!(text.contains("keyint=infinite"), "{text}");
+        assert!(text.contains("intra-refresh=1"), "{text}");
+        assert!(text.contains("-tune zerolatency"), "{text}");
+    }
+
+    #[test]
+    fn nvenc_long_gop_keeps_delay_zero_and_adds_intra_refresh() {
+        let long = encoder_args("h264_nvenc", 60, 4000, true);
+        let text = joined(&long);
+        assert!(text.contains("-bf 0"), "{text}");
+        assert!(text.contains("-delay 0"), "{text}");
+        assert!(text.contains(&format!("-g {LONG_GOP}")), "{text}");
+        assert!(text.contains("-intra-refresh 1"), "{text}");
+        let short = encoder_args("h264_nvenc", 60, 4000, false);
+        assert!(joined(&short).contains("-g 600"), "{}", joined(&short));
+        assert!(
+            !joined(&short).contains("-intra-refresh"),
+            "{}",
+            joined(&short)
+        );
+    }
+
+    #[test]
+    fn openapv_and_jpegxs_map_to_raw_mux_and_intra_pix_fmt() {
+        assert_eq!(codec_of("liboapv"), VideoCodec::OpenApv);
+        assert_eq!(codec_of("apv"), VideoCodec::OpenApv);
+        assert_eq!(codec_of("libsvtjpegxs"), VideoCodec::JpegXs);
+        assert_eq!(encoder_format(VideoCodec::OpenApv), "apv");
+        assert_eq!(decoder_format(VideoCodec::OpenApv), "apv");
+        assert_eq!(encoder_format(VideoCodec::JpegXs), "nut");
+        assert_eq!(decoder_format(VideoCodec::JpegXs), "nut");
+        let jxs = joined(&encoder_args("libsvtjpegxs", 30, 2000, false));
+        assert!(jxs.contains("-tag:v jxs"), "{jxs}");
+        assert_eq!(encoder_format(VideoCodec::H264), "nut");
+        assert_eq!(encoder_pix_fmt("liboapv"), "yuv422p10le");
+        assert_eq!(encoder_pix_fmt("libsvtjpegxs"), "yuv422p");
+        assert_eq!(encoder_pix_fmt("libx264"), "yuv420p");
+        let args = joined(&encoder_args("liboapv", 30, 2000, false));
+        assert!(args.contains("-preset fastest"), "{args}");
+        assert!(args.contains("-bf 0"), "{args}");
+        assert!(args.contains("-b:v 2000k"), "{args}");
+        assert_eq!(candidates(Video::OpenApv), &["liboapv"]);
+        assert_eq!(candidates(Video::JpegXs), &["libsvtjpegxs"]);
+    }
+
+    #[test]
+    fn liboapv_encodes_and_decodes_when_ffmpeg_has_it() {
+        let Some(_) = binary() else {
+            return;
+        };
+        let list = listing("-encoders");
+        if !listed(&list, "liboapv") {
+            return;
+        }
+        probe_encoder("liboapv").expect("liboapv test encode");
+        assert!(
+            working_decoders()
+                .iter()
+                .any(|(codec, _)| *codec == VideoCodec::OpenApv),
+            "ffmpeg lists liboapv but no APV decoder"
+        );
+    }
+
+    #[test]
+    fn libsvtjpegxs_encodes_and_decodes_when_ffmpeg_has_it() {
+        let Some(_) = binary() else {
+            return;
+        };
+        let list = listing("-encoders");
+        if !listed(&list, "libsvtjpegxs") {
+            return;
+        }
+        probe_encoder("libsvtjpegxs").expect("libsvtjpegxs test encode");
+        assert!(
+            working_decoders()
+                .iter()
+                .any(|(codec, _)| *codec == VideoCodec::JpegXs),
+            "ffmpeg lists libsvtjpegxs but no JPEG XS decoder"
+        );
     }
 }

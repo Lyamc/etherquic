@@ -104,6 +104,8 @@ pub const VIDEO_H264: u8 = 3;
 pub const VIDEO_H265: u8 = 4;
 pub const VIDEO_AV1: u8 = 5;
 pub const VIDEO_MJ2K: u8 = 6;
+pub const VIDEO_JPEGXS: u8 = 7;
+pub const VIDEO_APV: u8 = 8;
 /// Audio codec ids on a version-2 offer.
 pub const AUDIO_PCM: u8 = 1;
 pub const AUDIO_OPUS: u8 = 2;

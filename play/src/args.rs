@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use etherquic::parse_mac;
 use etherquic_play::{
-    CursorMode, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, CLIENT_MAC, DEFAULT_FPS,
+    CursorMode, Dither, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, CLIENT_MAC, DEFAULT_FPS,
     DEFAULT_MAX_WIDTH, HOST_MAC, PAD_SLOTS, SERVICE_ID,
 };
 
@@ -123,6 +123,25 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
                 view.look =
                     Look::from_token(&token).ok_or_else(|| format!("bad --look {token}"))?;
             }
+            "--dither" => {
+                let token = need(args, &mut i, "--dither")?;
+                view.dither =
+                    Dither::from_token(&token).ok_or_else(|| format!("bad --dither {token}"))?;
+            }
+            "--pixel-size" => {
+                let value: u32 = number(need(args, &mut i, "--pixel-size")?)?;
+                if !(1..=32).contains(&value) {
+                    return Err(format!("--pixel-size {value} is not 1-32"));
+                }
+                view.pixel_size = value as u8;
+            }
+            "--dither-strength" => {
+                let value: u32 = number(need(args, &mut i, "--dither-strength")?)?;
+                if value > 100 {
+                    return Err(format!("--dither-strength {value} is not 0-100"));
+                }
+                view.dither_strength = value as u8;
+            }
             "--size-match" => {
                 let token = need(args, &mut i, "--size-match")?;
                 view.size_match = SizeMatch::from_token(&token)
@@ -164,6 +183,17 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
                 }
                 codecs.quality = value as u8;
                 view.quality = codecs.quality;
+            }
+            "--dirty-rects" => {
+                flag(&mut i, &mut codecs.dirty_rects);
+                view.dirty_rects = true;
+            }
+            "--yuv" => {
+                let token = need(args, &mut i, "--yuv")?;
+                let yuv = etherquic::negotiate::YuvFormat::from_token(&token)
+                    .ok_or_else(|| format!("bad --yuv {token}"))?;
+                codecs.yuv = yuv;
+                view.yuv = yuv;
             }
             other => return Err(format!("unknown arg {other}\n{}", usage())),
         }
@@ -259,12 +289,13 @@ etherquic-play connect --peer-mac MAC [--nic IFACE] [--local-mac MAC] [--service
 etherquic-play connect --udp IP:PORT
   connect also takes: [--trace-input] [--scale fit|fill|stretch|native]
     [--cursor native|copy|remote] [--size-match independent|window-to-host]
-    [--look off|gameboy|pico8|cga|onebit|newsprint|endesga|sweetie|poster]
+    [--look off|blocks|poster|gameboy|pico8|…] [--dither bayer4|bluenoise|floyd-steinberg|…]
+    [--pixel-size 1-32] [--dither-strength 0-100]
     [--no-keyboard] [--no-mouse] [--no-pads]
     [--output-device NAME] [--pad SLOT=NAME]... [--parent-pipe]
-    [--video av1-hw,h265-hw,h264-hw,pyrowave,mjpeg,h264-sw] [--audio opus,pcm]
+    [--video av1-hw,h265-hw,h264-hw,pyrowave,jpegxs,openapv,mjpeg,h264-sw] [--audio opus,pcm]
     [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--bitrate KBPS]
-    [--quality 1-100]
+    [--quality 1-100] [--dirty-rects] [--yuv 420p8|422p8|444p8|420p10|422p10|444p10]
 
 host shares this desktop, its audio, and takes keyboard, mouse, and gamepad from one player.
 connect opens the view. The player window has to be focused to send the keyboard and the mouse. Gamepads send while that view is open.
@@ -292,6 +323,7 @@ mod tests {
             "9000",
             "--quality",
             "7",
+            "--dirty-rects",
         ];
         let Ok(Command::Connect(c)) = parse(args.iter().map(|s| s.to_string())) else {
             panic!()
@@ -314,6 +346,8 @@ mod tests {
         assert_eq!(c.codecs.bitrate_kbps, 9000);
         assert_eq!(c.codecs.quality, 7);
         assert_eq!(c.view.quality, 7);
+        assert!(c.codecs.dirty_rects);
+        assert!(c.view.dirty_rects);
         let back = c.codecs.args();
         assert!(back
             .windows(2)
@@ -352,6 +386,12 @@ mod tests {
             "copy",
             "--look",
             "pico8",
+            "--dither",
+            "bluenoise",
+            "--pixel-size",
+            "8",
+            "--dither-strength",
+            "70",
             "--size-match",
             "window-to-host",
             "--no-keyboard",
@@ -366,6 +406,9 @@ mod tests {
         assert_eq!(c.view.scale, ScaleMode::Native);
         assert_eq!(c.view.cursor, CursorMode::Copy);
         assert_eq!(c.view.look, Look::Pico8);
+        assert_eq!(c.view.dither, Dither::BlueNoise);
+        assert_eq!(c.view.pixel_size, 8);
+        assert_eq!(c.view.dither_strength, 70);
         assert_eq!(c.view.size_match, SizeMatch::WindowToHost);
         assert!(!c.view.send_keyboard && c.view.send_mouse && !c.view.send_pads);
         assert_eq!(
@@ -387,6 +430,8 @@ mod tests {
             &["connect", "--udp", "1.2.3.4:1", "--scale", "zoom"][..],
             &["connect", "--udp", "1.2.3.4:1", "--cursor", "zoom"][..],
             &["connect", "--udp", "1.2.3.4:1", "--look", "zoom"][..],
+            &["connect", "--udp", "1.2.3.4:1", "--dither", "zoom"][..],
+            &["connect", "--udp", "1.2.3.4:1", "--pixel-size", "0"][..],
             &["connect", "--udp", "1.2.3.4:1", "--pad", "4=X"][..],
             &["connect", "--udp", "1.2.3.4:1", "--pad", "nameonly"][..],
         ] {

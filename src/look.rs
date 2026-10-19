@@ -5,11 +5,15 @@
 //! blocks instead: flatter blocks compress better, and the picture stays the
 //! same size.
 //!
-//! The named palettes are the published Lospec sets (Game Boy, PICO-8, CGA,
-//! 1-bit monitor, 4-level grey, Endesga 32, Sweetie 16). Image-to-Pixel
-//! (<https://github.com/Tezumie/Image-to-Pixel>, MIT) is the catalogue this
-//! list follows. Ordered dither is a 4×4 Bayer bias on the block average.
-//! Poster flattens each channel and uses no palette.
+//! Palettes, ordered screens, and error-diffusion kernels follow Image-to-Pixel
+//! (<https://github.com/Tezumie/Image-to-Pixel>, MIT). Ordered dither is
+//! stable across video frames. Error diffusion is included for the patterns;
+//! it can flicker between frames.
+
+mod dither;
+mod palettes;
+
+pub use dither::Dither;
 
 /// What the host does to the picture before sending it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -17,11 +21,13 @@ pub enum Look {
     /// The captured picture, unchanged.
     #[default]
     Off,
-    /// DMG green, large blocks.
+    /// Downsample only. Colours stay, in solid blocks.
+    Blocks,
+    /// DMG green.
     GameBoy,
     /// PICO-8.
     Pico8,
-    /// CGA's 16 colours, large blocks.
+    /// CGA's 16 colours.
     Cga,
     /// Black and an off-white.
     OneBit,
@@ -31,26 +37,62 @@ pub enum Look {
     Endesga,
     /// Sweetie 16.
     Sweetie,
+    Apollo,
+    Batpalette,
+    Beached,
+    Cc29,
+    Chaotic,
+    Fantasy,
+    Hidden,
+    Intacto14,
+    Journey,
+    Lospec500,
+    Nyx8,
+    Oil6,
+    Resurrect,
+    Slso8,
+    SweetCanyon,
+    Toxic,
+    Vinik24,
     /// Fewer steps per channel, full resolution. Flatter for the codec.
     Poster,
 }
 
 impl Look {
-    pub const ALL: [Look; 9] = [
+    pub const ALL: [Look; 27] = [
         Self::Off,
+        Self::Blocks,
+        Self::Poster,
+        Self::OneBit,
         Self::GameBoy,
+        Self::Newsprint,
         Self::Pico8,
         Self::Cga,
-        Self::OneBit,
-        Self::Newsprint,
-        Self::Endesga,
         Self::Sweetie,
-        Self::Poster,
+        Self::Endesga,
+        Self::Apollo,
+        Self::Batpalette,
+        Self::Beached,
+        Self::Cc29,
+        Self::Chaotic,
+        Self::Fantasy,
+        Self::Hidden,
+        Self::Intacto14,
+        Self::Journey,
+        Self::Lospec500,
+        Self::Nyx8,
+        Self::Oil6,
+        Self::Resurrect,
+        Self::Slso8,
+        Self::SweetCanyon,
+        Self::Toxic,
+        Self::Vinik24,
     ];
 
     pub fn token(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Blocks => "blocks",
             Self::GameBoy => "gameboy",
             Self::Pico8 => "pico8",
             Self::Cga => "cga",
@@ -58,6 +100,23 @@ impl Look {
             Self::Newsprint => "newsprint",
             Self::Endesga => "endesga",
             Self::Sweetie => "sweetie",
+            Self::Apollo => "apollo",
+            Self::Batpalette => "batpalette",
+            Self::Beached => "beached",
+            Self::Cc29 => "cc-29",
+            Self::Chaotic => "chaotic",
+            Self::Fantasy => "fantasy",
+            Self::Hidden => "hidden",
+            Self::Intacto14 => "intacto14",
+            Self::Journey => "journey",
+            Self::Lospec500 => "lospec500",
+            Self::Nyx8 => "nyx8",
+            Self::Oil6 => "oil-6",
+            Self::Resurrect => "resurrect",
+            Self::Slso8 => "slso8",
+            Self::SweetCanyon => "sweet-canyon",
+            Self::Toxic => "toxic",
+            Self::Vinik24 => "vinik24",
             Self::Poster => "poster",
         }
     }
@@ -69,6 +128,7 @@ impl Look {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
+            Self::Blocks => "Blocks",
             Self::GameBoy => "Game Boy",
             Self::Pico8 => "PICO-8",
             Self::Cga => "CGA",
@@ -76,167 +136,90 @@ impl Look {
             Self::Newsprint => "Newsprint",
             Self::Endesga => "Endesga",
             Self::Sweetie => "Sweetie",
+            Self::Apollo => "Apollo",
+            Self::Batpalette => "Batpalette",
+            Self::Beached => "Beached",
+            Self::Cc29 => "CC-29",
+            Self::Chaotic => "Chaotic",
+            Self::Fantasy => "Fantasy",
+            Self::Hidden => "Hidden Library",
+            Self::Intacto14 => "Intacto14",
+            Self::Journey => "Journey",
+            Self::Lospec500 => "Lospec500",
+            Self::Nyx8 => "Nyx8",
+            Self::Oil6 => "Oil 6",
+            Self::Resurrect => "Resurrect 64",
+            Self::Slso8 => "SLSO8",
+            Self::SweetCanyon => "Sweet Canyon",
+            Self::Toxic => "Toxic Haze",
+            Self::Vinik24 => "Vinik24",
             Self::Poster => "Poster",
+        }
+    }
+
+    /// Block size used when an older offer has no `pixel-size` line.
+    pub fn default_pixel_size(self) -> u8 {
+        match self {
+            Self::Off | Self::Poster => 1,
+            Self::GameBoy | Self::Cga => 4,
+            _ => 2,
         }
     }
 }
 
-const fn rgb(hex: u32) -> [u8; 3] {
-    [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]
+/// Palette, dither pattern, block size, and strength the host paints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Style {
+    pub look: Look,
+    pub dither: Dither,
+    pub pixel_size: u8,
+    /// 0–100. Image-to-Pixel's default is 60.
+    pub strength: u8,
 }
 
-/// 4×4 Bayer, values 0..=15. Index is `(y & 3) * 4 + (x & 3)`.
-const BAYER4: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-
-const ONE_BIT: [[u8; 3]; 2] = [rgb(0x222323), rgb(0xf0f6f0)];
-const CGA: [[u8; 3]; 16] = [
-    rgb(0x000000),
-    rgb(0x0000aa),
-    rgb(0x00aa00),
-    rgb(0x00aaaa),
-    rgb(0xaa0000),
-    rgb(0xaa00aa),
-    rgb(0xaa5500),
-    rgb(0xaaaaaa),
-    rgb(0x555555),
-    rgb(0x5555ff),
-    rgb(0x55ff55),
-    rgb(0x55ffff),
-    rgb(0xff5555),
-    rgb(0xff55ff),
-    rgb(0xffff55),
-    rgb(0xffffff),
-];
-const ENDESGA: [[u8; 3]; 32] = [
-    rgb(0xbe4a2f),
-    rgb(0xd77643),
-    rgb(0xead4aa),
-    rgb(0xe4a672),
-    rgb(0xb86f50),
-    rgb(0x733e39),
-    rgb(0x3e2731),
-    rgb(0xa22633),
-    rgb(0xe43b44),
-    rgb(0xf77622),
-    rgb(0xfeae34),
-    rgb(0xfee761),
-    rgb(0x63c74d),
-    rgb(0x3e8948),
-    rgb(0x265c42),
-    rgb(0x193c3e),
-    rgb(0x124e89),
-    rgb(0x0099db),
-    rgb(0x2ce8f5),
-    rgb(0xffffff),
-    rgb(0xc0cbdc),
-    rgb(0x8b9bb4),
-    rgb(0x5a6988),
-    rgb(0x3a4466),
-    rgb(0x262b44),
-    rgb(0x181425),
-    rgb(0xff0044),
-    rgb(0x68386c),
-    rgb(0xb55088),
-    rgb(0xf6757a),
-    rgb(0xe8b796),
-    rgb(0xc28569),
-];
-const GAME_BOY: [[u8; 3]; 4] = [rgb(0x0f380f), rgb(0x306230), rgb(0x8bac0f), rgb(0x9bbc0f)];
-const GREY4: [[u8; 3]; 4] = [rgb(0x000000), rgb(0x555555), rgb(0xaaaaaa), rgb(0xffffff)];
-const PICO8: [[u8; 3]; 16] = [
-    rgb(0x000000),
-    rgb(0x1d2b53),
-    rgb(0x7e2553),
-    rgb(0x008751),
-    rgb(0xab5236),
-    rgb(0x5f574f),
-    rgb(0xc2c3c7),
-    rgb(0xfff1e8),
-    rgb(0xff004d),
-    rgb(0xffa300),
-    rgb(0xffec27),
-    rgb(0x00e436),
-    rgb(0x29adff),
-    rgb(0x83769c),
-    rgb(0xff77a8),
-    rgb(0xffccaa),
-];
-const SWEETIE: [[u8; 3]; 16] = [
-    rgb(0x1a1c2c),
-    rgb(0x5d275d),
-    rgb(0xb13e53),
-    rgb(0xef7d57),
-    rgb(0xffcd75),
-    rgb(0xa7f070),
-    rgb(0x38b764),
-    rgb(0x257179),
-    rgb(0x29366f),
-    rgb(0x3b5dc9),
-    rgb(0x41a6f6),
-    rgb(0x73eff7),
-    rgb(0xf4f4f4),
-    rgb(0x94b0c2),
-    rgb(0x566c86),
-    rgb(0x333c57),
-];
-
-struct Recipe {
-    palette: &'static [[u8; 3]],
-    /// Pixels on a side. The block is one colour.
-    block: u32,
-    /// Peak Bayer bias, in channel levels. 0 is no dither.
-    strength: i16,
-}
-
-fn recipe(look: Look) -> Recipe {
-    match look {
-        Look::GameBoy => Recipe {
-            palette: &GAME_BOY,
-            block: 4,
-            strength: 40,
-        },
-        Look::Pico8 => Recipe {
-            palette: &PICO8,
-            block: 2,
-            strength: 16,
-        },
-        Look::Cga => Recipe {
-            palette: &CGA,
-            block: 4,
-            strength: 36,
-        },
-        Look::OneBit => Recipe {
-            palette: &ONE_BIT,
-            block: 2,
-            strength: 48,
-        },
-        Look::Newsprint => Recipe {
-            palette: &GREY4,
-            block: 2,
-            strength: 40,
-        },
-        Look::Endesga => Recipe {
-            palette: &ENDESGA,
-            block: 2,
-            strength: 12,
-        },
-        Look::Sweetie => Recipe {
-            palette: &SWEETIE,
-            block: 2,
-            strength: 16,
-        },
-        Look::Off | Look::Poster => Recipe {
-            palette: &[],
-            block: 1,
-            strength: 0,
-        },
+impl Default for Style {
+    fn default() -> Self {
+        Self {
+            look: Look::Off,
+            dither: Dither::Bayer4,
+            pixel_size: 2,
+            strength: 60,
+        }
     }
 }
 
-/// Paint `look` into packed RGB. `Off` does not write. A short buffer is left
-/// alone. Width and height stay the caller's.
+impl Style {
+    pub fn from_look(look: Look) -> Self {
+        Self {
+            look,
+            dither: Dither::Bayer4,
+            pixel_size: look.default_pixel_size(),
+            strength: 60,
+        }
+    }
+
+    pub fn pixel_size(self) -> u32 {
+        u32::from(self.pixel_size.clamp(1, 32))
+    }
+
+    pub fn strength01(self) -> f32 {
+        f32::from(self.strength.min(100)) / 100.0
+    }
+}
+
+pub(crate) const fn rgb(hex: u32) -> [u8; 3] {
+    [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]
+}
+
+/// Paint `look` with its default Bayer 4×4 and block size.
 pub fn apply(rgb: &mut [u8], width: u32, height: u32, look: Look) {
-    if look == Look::Off || width == 0 || height == 0 {
+    apply_style(rgb, width, height, Style::from_look(look));
+}
+
+/// Paint `style` into packed RGB. `Off` does not write. A short buffer is left
+/// alone. Width and height stay the caller's.
+pub fn apply_style(rgb: &mut [u8], width: u32, height: u32, style: Style) {
+    if style.look == Look::Off || width == 0 || height == 0 {
         return;
     }
     let Some(need) = (width as usize)
@@ -249,54 +232,217 @@ pub fn apply(rgb: &mut [u8], width: u32, height: u32, look: Look) {
         return;
     }
     let rgb = &mut rgb[..need];
-    if look == Look::Poster {
-        posterize(rgb, width, height);
-    } else {
-        quantize(rgb, width, height, recipe(look));
-    }
-}
-
-fn poster_channel(value: u8) -> u8 {
-    let stepped = (u16::from(value) + 16) / 32 * 32;
-    if stepped > 255 {
-        255
-    } else {
-        stepped as u8
-    }
-}
-
-fn posterize(rgb: &mut [u8], width: u32, height: u32) {
+    let block = style.pixel_size() as usize;
     let width = width as usize;
-    let count = width * height as usize;
-    for pixel in 0..count {
-        let i = pixel * 3;
-        rgb[i] = poster_channel(rgb[i]);
-        rgb[i + 1] = poster_channel(rgb[i + 1]);
-        rgb[i + 2] = poster_channel(rgb[i + 2]);
+    let height = height as usize;
+    let gw = width.div_ceil(block);
+    let gh = height.div_ceil(block);
+    let mut grid = vec![0.0f32; gw * gh * 3];
+    downsample(rgb, width, height, block, gw, gh, &mut grid);
+    match style.look {
+        Look::Off => {}
+        Look::Blocks => {}
+        Look::Poster => posterize_grid(&mut grid),
+        _ => quantize_grid(&mut grid, gw, gh, style),
+    }
+    upsample(rgb, width, height, block, gw, gh, &grid);
+}
+
+fn downsample(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    block: usize,
+    gw: usize,
+    gh: usize,
+    grid: &mut [f32],
+) {
+    for gy in 0..gh {
+        let y0 = gy * block;
+        let bh = block.min(height - y0);
+        for gx in 0..gw {
+            let x0 = gx * block;
+            let bw = block.min(width - x0);
+            let mut sr = 0u32;
+            let mut sg = 0u32;
+            let mut sb = 0u32;
+            for row in y0..y0 + bh {
+                let start = (row * width + x0) * 3;
+                for col in 0..bw {
+                    let i = start + col * 3;
+                    sr += u32::from(rgb[i]);
+                    sg += u32::from(rgb[i + 1]);
+                    sb += u32::from(rgb[i + 2]);
+                }
+            }
+            let n = (bw * bh) as f32;
+            let o = (gy * gw + gx) * 3;
+            grid[o] = sr as f32 / n / 255.0;
+            grid[o + 1] = sg as f32 / n / 255.0;
+            grid[o + 2] = sb as f32 / n / 255.0;
+        }
     }
 }
 
-fn bayer_bias(x: usize, y: usize, strength: i16) -> i16 {
-    let b = i16::from(BAYER4[((y & 3) * 4) + (x & 3)]);
-    (b - 8) * strength / 8
+fn upsample(
+    rgb: &mut [u8],
+    width: usize,
+    height: usize,
+    block: usize,
+    gw: usize,
+    gh: usize,
+    grid: &[f32],
+) {
+    for gy in 0..gh {
+        let y0 = gy * block;
+        let bh = block.min(height - y0);
+        for gx in 0..gw {
+            let x0 = gx * block;
+            let bw = block.min(width - x0);
+            let o = (gy * gw + gx) * 3;
+            let colour = [
+                (grid[o] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (grid[o + 1] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (grid[o + 2] * 255.0).round().clamp(0.0, 255.0) as u8,
+            ];
+            for row in y0..y0 + bh {
+                let start = (row * width + x0) * 3;
+                for col in 0..bw {
+                    let i = start + col * 3;
+                    rgb[i] = colour[0];
+                    rgb[i + 1] = colour[1];
+                    rgb[i + 2] = colour[2];
+                }
+            }
+        }
+    }
 }
 
-fn shift(average: u32, bias: i16) -> u8 {
-    (average as i16 + bias).clamp(0, 255) as u8
+fn poster_channel(value: f32) -> f32 {
+    let stepped = ((value * 255.0 + 16.0) / 32.0).floor() * 32.0;
+    (stepped / 255.0).clamp(0.0, 1.0)
 }
 
-fn dist(colour: [u8; 3], entry: [u8; 3]) -> u32 {
-    let dr = i32::from(colour[0]) - i32::from(entry[0]);
-    let dg = i32::from(colour[1]) - i32::from(entry[1]);
-    let db = i32::from(colour[2]) - i32::from(entry[2]);
-    (dr * dr * 3 + dg * dg * 6 + db * db) as u32
+fn posterize_grid(grid: &mut [f32]) {
+    for chunk in grid.chunks_exact_mut(3) {
+        chunk[0] = poster_channel(chunk[0]);
+        chunk[1] = poster_channel(chunk[1]);
+        chunk[2] = poster_channel(chunk[2]);
+    }
 }
 
-fn nearest(palette: &[[u8; 3]], colour: [u8; 3]) -> [u8; 3] {
-    let mut best = colour;
-    let mut best_d = u32::MAX;
+fn quantize_grid(grid: &mut [f32], gw: usize, gh: usize, style: Style) {
+    let palette = style.look.palette();
+    if palette.is_empty() {
+        return;
+    }
+    if style.dither.is_diffusion() {
+        diffuse(grid, gw, gh, palette, style);
+    } else {
+        ordered(grid, gw, gh, palette, style);
+    }
+}
+
+fn ordered(grid: &mut [f32], gw: usize, gh: usize, palette: &[[u8; 3]], style: Style) {
+    let spread = palette_spread(palette) * style.strength01();
+    let map = dither::threshold_map(style.dither);
+    for y in 0..gh {
+        for x in 0..gw {
+            let o = (y * gw + x) * 3;
+            let mut r = grid[o];
+            let mut g = grid[o + 1];
+            let mut b = grid[o + 2];
+            if let Some(map) = &map {
+                if spread > 0.0 {
+                    let t = (f32::from(map.values[(y % map.h) * map.w + (x % map.w)]) + 0.5)
+                        / map.levels as f32
+                        - 0.5;
+                    let amt = t * spread;
+                    r = (r + amt).clamp(0.0, 1.0);
+                    g = (g + amt).clamp(0.0, 1.0);
+                    b = (b + amt).clamp(0.0, 1.0);
+                }
+            }
+            let colour = nearest(palette, r, g, b);
+            grid[o] = f32::from(colour[0]) / 255.0;
+            grid[o + 1] = f32::from(colour[1]) / 255.0;
+            grid[o + 2] = f32::from(colour[2]) / 255.0;
+        }
+    }
+}
+
+fn diffuse(grid: &mut [f32], gw: usize, gh: usize, palette: &[[u8; 3]], style: Style) {
+    let kernel = dither::kernel(style.dither);
+    let strength = style.strength01();
+    let mut acc = vec![0.0f32; gw * gh * 3];
+    for y in 0..gh {
+        for x in 0..gw {
+            let p = y * gw + x;
+            let o = p * 3;
+            let r = (grid[o] + acc[o] * strength).clamp(0.0, 1.0);
+            let g = (grid[o + 1] + acc[o + 1] * strength).clamp(0.0, 1.0);
+            let b = (grid[o + 2] + acc[o + 2] * strength).clamp(0.0, 1.0);
+            let colour = nearest(palette, r, g, b);
+            let nr = f32::from(colour[0]) / 255.0;
+            let ng = f32::from(colour[1]) / 255.0;
+            let nb = f32::from(colour[2]) / 255.0;
+            let er = r - nr;
+            let eg = g - ng;
+            let eb = b - nb;
+            for &(dx, dy, wt) in kernel {
+                let xx = x as i32 + dx;
+                let yy = y as i32 + dy;
+                if xx < 0 || yy < 0 || xx >= gw as i32 || yy >= gh as i32 {
+                    continue;
+                }
+                let q = ((yy as usize) * gw + xx as usize) * 3;
+                acc[q] += er * wt;
+                acc[q + 1] += eg * wt;
+                acc[q + 2] += eb * wt;
+            }
+            grid[o] = nr;
+            grid[o + 1] = ng;
+            grid[o + 2] = nb;
+        }
+    }
+}
+
+fn palette_spread(palette: &[[u8; 3]]) -> f32 {
+    if palette.len() < 2 {
+        return 1.0;
+    }
+    let mut sum = 0.0f32;
+    for (i, a) in palette.iter().enumerate() {
+        let mut best = f32::INFINITY;
+        for (j, b) in palette.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let dr = f32::from(a[0]) - f32::from(b[0]);
+            let dg = f32::from(a[1]) - f32::from(b[1]);
+            let db = f32::from(a[2]) - f32::from(b[2]);
+            let d = (dr * dr + dg * dg + db * db).sqrt();
+            if d < best {
+                best = d;
+            }
+        }
+        sum += best;
+    }
+    (sum / palette.len() as f32 / 255.0).clamp(0.04, 1.0)
+}
+
+/// Luma-weighted RGB, Image-to-Pixel's `rgb` distance.
+fn nearest(palette: &[[u8; 3]], r: f32, g: f32, b: f32) -> [u8; 3] {
+    let pr = r * 255.0;
+    let pg = g * 255.0;
+    let pb = b * 255.0;
+    let mut best = palette[0];
+    let mut best_d = f32::INFINITY;
     for entry in palette {
-        let d = dist(colour, *entry);
+        let dr = pr - f32::from(entry[0]);
+        let dg = pg - f32::from(entry[1]);
+        let db = pb - f32::from(entry[2]);
+        let d = 0.299 * dr * dr + 0.587 * dg * dg + 0.114 * db * db;
         if d < best_d {
             best = *entry;
             best_d = d;
@@ -305,56 +451,10 @@ fn nearest(palette: &[[u8; 3]], colour: [u8; 3]) -> [u8; 3] {
     best
 }
 
-fn quantize(rgb: &mut [u8], width: u32, height: u32, recipe: Recipe) {
-    let width = width as usize;
-    let height = height as usize;
-    let block = recipe.block.max(1) as usize;
-    let mut y = 0;
-    while y < height {
-        let bh = block.min(height - y);
-        let mut x = 0;
-        while x < width {
-            let bw = block.min(width - x);
-            let mut sr = 0u32;
-            let mut sg = 0u32;
-            let mut sb = 0u32;
-            for row in y..y + bh {
-                let start = (row * width + x) * 3;
-                for col in 0..bw {
-                    let i = start + col * 3;
-                    sr += u32::from(rgb[i]);
-                    sg += u32::from(rgb[i + 1]);
-                    sb += u32::from(rgb[i + 2]);
-                }
-            }
-            let n = (bw * bh) as u32;
-            let bias = bayer_bias(x / block, y / block, recipe.strength);
-            let colour = nearest(
-                recipe.palette,
-                [
-                    shift(sr / n, bias),
-                    shift(sg / n, bias),
-                    shift(sb / n, bias),
-                ],
-            );
-            for row in y..y + bh {
-                let start = (row * width + x) * 3;
-                for col in 0..bw {
-                    let i = start + col * 3;
-                    rgb[i] = colour[0];
-                    rgb[i + 1] = colour[1];
-                    rgb[i + 2] = colour[2];
-                }
-            }
-            x += block;
-        }
-        y += block;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palettes::{GAME_BOY, GREY4, ONE_BIT, PICO8};
 
     fn solid(w: u32, h: u32, colour: [u8; 3]) -> Vec<u8> {
         let mut rgb = Vec::new();
@@ -374,8 +474,14 @@ mod tests {
             assert_eq!(Look::from_token(look.token()), Some(look));
             assert!(!look.label().is_empty());
         }
+        for dither in Dither::ALL {
+            assert_eq!(Dither::from_token(dither.token()), Some(dither));
+            assert!(!dither.label().is_empty());
+        }
         assert_eq!(Look::from_token("crt"), None);
+        assert_eq!(Dither::from_token("ordered"), None);
         assert_eq!(Look::default(), Look::Off);
+        assert_eq!(Dither::default(), Dither::Bayer4);
     }
 
     #[test]
@@ -403,13 +509,21 @@ mod tests {
     #[test]
     fn pico8_red_is_the_palette_red() {
         let mut rgb = solid(4, 2, [255, 0, 0]);
-        apply(&mut rgb, 4, 2, Look::Pico8);
-        assert!(pixels_are(&rgb, rgb_const(0xff004d)), "{rgb:?}");
+        apply_style(
+            &mut rgb,
+            4,
+            2,
+            Style {
+                look: Look::Pico8,
+                dither: Dither::None,
+                pixel_size: 2,
+                strength: 0,
+            },
+        );
+        let red = super::rgb(0xff004d);
+        assert!(pixels_are(&rgb, red), "{rgb:?}");
         assert_eq!(rgb.len(), 4 * 2 * 3);
-    }
-
-    fn rgb_const(hex: u32) -> [u8; 3] {
-        rgb(hex)
+        assert!(PICO8.contains(&red));
     }
 
     #[test]
@@ -449,7 +563,17 @@ mod tests {
     #[test]
     fn newsprint_is_only_the_four_greys() {
         let mut rgb = solid(2, 2, [128, 140, 100]);
-        apply(&mut rgb, 2, 2, Look::Newsprint);
+        apply_style(
+            &mut rgb,
+            2,
+            2,
+            Style {
+                look: Look::Newsprint,
+                dither: Dither::None,
+                pixel_size: 2,
+                strength: 0,
+            },
+        );
         let pixel = [rgb[0], rgb[1], rgb[2]];
         assert!(GREY4.contains(&pixel), "{pixel:?}");
         assert!(pixels_are(&rgb, pixel));
@@ -460,5 +584,113 @@ mod tests {
         let mut rgb = vec![0u8, 16, 100, 255, 224, 240];
         apply(&mut rgb, 2, 1, Look::Poster);
         assert_eq!(rgb, vec![0, 32, 96, 255, 224, 255]);
+    }
+
+    #[test]
+    fn blocks_average_without_a_palette() {
+        let mut rgb = Vec::new();
+        rgb.extend_from_slice(&[0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255]);
+        apply_style(
+            &mut rgb,
+            2,
+            2,
+            Style {
+                look: Look::Blocks,
+                dither: Dither::None,
+                pixel_size: 2,
+                strength: 0,
+            },
+        );
+        assert!(pixels_are(&rgb, [128, 128, 128]), "{rgb:?}");
+    }
+
+    #[test]
+    fn bayer4_threshold_order_matches_image_to_pixel() {
+        assert_eq!(
+            dither::BAYER4,
+            [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+        );
+        let map = dither::threshold_map(Dither::BlueNoise).unwrap();
+        assert_eq!(map.w, 64);
+        assert_eq!(map.h, 64);
+        assert_eq!(map.levels, 256);
+        assert_eq!(map.values.len(), 4096);
+    }
+
+    #[test]
+    fn floyd_steinberg_on_a_grey_ramp_uses_both_onebit_colours() {
+        let mut rgb = Vec::new();
+        for x in 0..16u32 {
+            let v = (x * 17) as u8;
+            rgb.extend_from_slice(&[v, v, v]);
+        }
+        apply_style(
+            &mut rgb,
+            16,
+            1,
+            Style {
+                look: Look::OneBit,
+                dither: Dither::FloydSteinberg,
+                pixel_size: 1,
+                strength: 100,
+            },
+        );
+        let mut saw_dark = false;
+        let mut saw_light = false;
+        for pixel in rgb.chunks(3) {
+            if pixel == ONE_BIT[0] {
+                saw_dark = true;
+            } else if pixel == ONE_BIT[1] {
+                saw_light = true;
+            } else {
+                panic!("pixel {pixel:?} left 1-bit");
+            }
+        }
+        assert!(saw_dark && saw_light, "{rgb:?}");
+    }
+
+    #[test]
+    fn every_ordered_pattern_stays_on_the_palette() {
+        for dither in [
+            Dither::None,
+            Dither::Bayer2,
+            Dither::Bayer8,
+            Dither::Bayer16,
+            Dither::Cluster4,
+            Dither::Cluster8,
+            Dither::Lines,
+            Dither::BlueNoise,
+            Dither::Atkinson,
+            Dither::SierraLite,
+            Dither::Sierra,
+            Dither::Burkes,
+            Dither::Jarvis,
+            Dither::Stucki,
+        ] {
+            let mut rgb = Vec::new();
+            for y in 0..8u32 {
+                for x in 0..8u32 {
+                    let v = (x * 20 + y * 9) as u8;
+                    rgb.extend_from_slice(&[v, 80, 200u8.saturating_sub(v)]);
+                }
+            }
+            apply_style(
+                &mut rgb,
+                8,
+                8,
+                Style {
+                    look: Look::Pico8,
+                    dither,
+                    pixel_size: 1,
+                    strength: 80,
+                },
+            );
+            for pixel in rgb.chunks(3) {
+                assert!(
+                    PICO8.iter().any(|entry| pixel == entry),
+                    "{dither:?} left the palette at {pixel:?}"
+                );
+            }
+        }
     }
 }

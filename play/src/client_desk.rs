@@ -635,14 +635,24 @@ async fn connect_player(
     let view_look = connect.view.clone();
     let initial = crate::snapshot(&view_look);
     offer.look = initial.look;
+    offer.dither = Some(initial.dither);
+    offer.pixel_size = Some(initial.pixel_size);
+    offer.dither_strength = Some(initial.dither_strength);
     if connect.codecs.quality > 0 {
         offer.quality = connect.codecs.quality;
     } else {
         offer.quality = initial.quality;
     }
+    offer.want_dirty_rects = Some(connect.codecs.dirty_rects || initial.dirty_rects);
+    offer.yuv = Some(initial.yuv);
     let (live_tx, live_rx) = tokio::sync::watch::channel(crate::LiveOffer {
         look: offer.look,
+        dither: initial.dither,
+        pixel_size: initial.pixel_size,
+        dither_strength: initial.dither_strength,
         quality: offer.quality,
+        dirty_rects: offer.want_dirty_rects.unwrap_or(false),
+        yuv: offer.yuv.unwrap_or_default(),
     });
     tokio::spawn(async move {
         loop {
@@ -651,7 +661,12 @@ async fn connect_player(
             if live_tx
                 .send(crate::LiveOffer {
                     look: snap.look,
+                    dither: snap.dither,
+                    pixel_size: snap.pixel_size,
+                    dither_strength: snap.dither_strength,
                     quality: snap.quality,
+                    dirty_rects: snap.dirty_rects,
+                    yuv: snap.yuv,
                 })
                 .is_err()
             {
@@ -663,11 +678,16 @@ async fn connect_player(
         let video: Vec<&str> = offer.video.iter().map(|row| row.token()).collect();
         let audio: Vec<&str> = offer.audio.iter().map(|row| row.token()).collect();
         eprintln!(
-            "etherquic-play: offer video [{}] audio [{}] look {} quality {}",
+            "etherquic-play: offer video [{}] audio [{}] look {} quality {} dirty-rects {}",
             video.join(" "),
             audio.join(" "),
             offer.look.token(),
-            offer.quality
+            offer.quality,
+            if offer.want_dirty_rects == Some(true) {
+                1
+            } else {
+                0
+            }
         );
     } else {
         eprintln!("etherquic-play: the host does not negotiate codecs; MJPEG and PCM");

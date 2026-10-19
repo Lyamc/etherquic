@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "etherquic"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "bytes",
  "libc",
@@ -2234,6 +2234,7 @@ version = "0.1.0"
 dependencies = [
  "android-activity",
  "etherquic",
+ "etherquic-input",
  "etherquic-play",
  "gpui",
  "image",
@@ -2241,6 +2242,9 @@ dependencies = [
  "qrcode",
  "raw-window-handle",
  "resvg",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-rustcrypto",
  "tiny-skia",
  "tokio",
  "windows-sys 0.59.0",

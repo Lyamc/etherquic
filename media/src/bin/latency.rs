@@ -34,7 +34,14 @@ fn main() {
             true
         });
         let decoder = Arc::new(Mutex::new(
-            VideoDecoder::open(video, w, h, dsink).expect("decoder"),
+            VideoDecoder::open(
+                video,
+                w,
+                h,
+                dsink,
+                etherquic_media::negotiate::YuvFormat::YUV420P8,
+            )
+            .expect("decoder"),
         ));
         let d = decoder.clone();
         let bytes = Arc::new(Mutex::new(0usize));
@@ -51,6 +58,8 @@ fn main() {
             fps: 30,
             kbps: 0,
             quality: 0,
+            yuv: etherquic_media::negotiate::YuvFormat::YUV420P8,
+            dirty_rects: false,
         };
         let (mut enc, _) = VideoEncoder::open(&setup, esink).expect("encoder");
         let mut pushed = Vec::new();

@@ -1,8 +1,9 @@
 //! PyroWave through `libpyrowave-shared`, loaded at run time.
 //!
-//! The CPU-buffer API is used on both ends: the host converts RGB to I420
-//! and PyroWave compresses it with Vulkan compute; the player pushes packets
-//! and reads I420 back. Granite (inside PyroWave) loads the Vulkan loader
+//! The CPU-buffer API is used on both ends: the host converts RGB to planar
+//! YUV (4:2:0 / 4:2:2 / 4:4:4, 8- or 10-bit) and PyroWave compresses it with
+//! Vulkan compute; the player pushes packets and reads the same layout back.
+//! 4:2:2 is sent as 4:4:4 after a horizontal chroma upsample. Granite (inside PyroWave) loads the Vulkan loader
 //! itself. On Windows Granite only ever does `LoadLibraryA("vulkan-1.dll")`
 //! (it ignores `GRANITE_VULKAN_LIBRARY` there), so a PC without a Vulkan
 //! loader gets the bundled `vulkan-cpu\vulkan-1.dll` shim preloaded, which
@@ -19,7 +20,8 @@ use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
 
-use crate::yuv::{i420_to_rgb, rgb_to_i420, I420};
+use crate::negotiate::{YuvChroma, YuvDepth, YuvFormat};
+use crate::yuv::{rgb_to_yuv, yuv_to_rgb, YuvPlanes};
 use crate::Frame;
 
 type Handle = *mut c_void;
@@ -64,7 +66,47 @@ struct Packet {
 }
 
 const FORMAT_YUV420P: c_int = 1;
+const FORMAT_YUV444P: c_int = 2;
+const FORMAT_YUV420P10: c_int = 3;
+const FORMAT_YUV444P10: c_int = 4;
 const CHROMA_420: c_int = 0;
+const CHROMA_444: c_int = 1;
+
+fn pyro_chroma(format: YuvFormat) -> c_int {
+    match format.bitstream().chroma {
+        YuvChroma::Yuv420 => CHROMA_420,
+        YuvChroma::Yuv422 | YuvChroma::Yuv444 => CHROMA_444,
+    }
+}
+
+fn pyro_buffer_format(format: YuvFormat) -> c_int {
+    match (format.bitstream().chroma, format.depth) {
+        (YuvChroma::Yuv420, YuvDepth::Depth8) => FORMAT_YUV420P,
+        (YuvChroma::Yuv444, YuvDepth::Depth8) => FORMAT_YUV444P,
+        (YuvChroma::Yuv420, YuvDepth::Depth10) => FORMAT_YUV420P10,
+        (YuvChroma::Yuv444, YuvDepth::Depth10) => FORMAT_YUV444P10,
+        (YuvChroma::Yuv422, YuvDepth::Depth8) => FORMAT_YUV444P,
+        (YuvChroma::Yuv422, YuvDepth::Depth10) => FORMAT_YUV444P10,
+    }
+}
+
+fn pack_plane(src: &[u16], depth: YuvDepth) -> Vec<u8> {
+    match depth {
+        YuvDepth::Depth8 => src.iter().map(|sample| *sample as u8).collect(),
+        YuvDepth::Depth10 => src.iter().flat_map(|sample| sample.to_ne_bytes()).collect(),
+    }
+}
+
+fn unpack_plane(bytes: &[u8], depth: YuvDepth, count: usize) -> Vec<u16> {
+    match depth {
+        YuvDepth::Depth8 => bytes.iter().take(count).map(|b| u16::from(*b)).collect(),
+        YuvDepth::Depth10 => bytes
+            .chunks_exact(2)
+            .take(count)
+            .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+            .collect(),
+    }
+}
 /// Packet size cap. QUIC carries a whole frame reliably, so this only
 /// bounds the decoder's per-push work.
 const PACKET_BOUNDARY: usize = 64 * 1024;
@@ -133,15 +175,19 @@ pub fn library_candidates() -> Vec<PathBuf> {
         &["libpyrowave-shared-1.dll", "libpyrowave-shared.dll"]
     } else if cfg!(target_os = "macos") {
         &["libpyrowave-shared.1.dylib", "libpyrowave-shared.dylib"]
+    } else if cfg!(target_os = "android") {
+        &["libpyrowave-shared.so", "libpyrowave-shared.so.1"]
     } else {
         &["libpyrowave-shared.so.1", "libpyrowave-shared.so"]
     };
-    let mut dirs = Vec::new();
+    let mut dirs = etherquic::native_library_dirs();
     if let Some(dir) = exe_dir() {
         if cfg!(target_os = "macos") {
             dirs.push(dir.join("../Frameworks"));
         }
-        dirs.push(dir);
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
     }
     if cfg!(windows) {
         dirs.push(PathBuf::from(r"C:\Program Files\etherquic"));
@@ -543,20 +589,31 @@ impl Drop for Device {
     }
 }
 
-fn planes_buffer(planes: &mut I420) -> CpuBuffer {
-    let w = planes.width;
-    let h = planes.height;
+fn packed_buffer(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    width: usize,
+    height: usize,
+    format: YuvFormat,
+) -> CpuBuffer {
+    let format = format.bitstream();
+    let (cw, ch) = crate::yuv::chroma_size(width, height, format.chroma);
+    let bpp = match format.depth {
+        YuvDepth::Depth8 => 1,
+        YuvDepth::Depth10 => 2,
+    };
     CpuBuffer {
         data: [
-            planes.y.as_mut_ptr().cast(),
-            planes.u.as_mut_ptr().cast(),
-            planes.v.as_mut_ptr().cast(),
+            y.as_mut_ptr().cast(),
+            u.as_mut_ptr().cast(),
+            v.as_mut_ptr().cast(),
         ],
-        stride: [w, w / 2, w / 2],
-        size: [w * h, (w / 2) * (h / 2), (w / 2) * (h / 2)],
-        width: w as c_int,
-        height: h as c_int,
-        format: FORMAT_YUV420P,
+        stride: [width * bpp, cw * bpp, cw * bpp],
+        size: [width * height * bpp, cw * ch * bpp, cw * ch * bpp],
+        width: width as c_int,
+        height: height as c_int,
+        format: pyro_buffer_format(format),
     }
 }
 
@@ -566,7 +623,11 @@ pub struct Encoder {
     handle: Handle,
     width: u32,
     height: u32,
-    planes: I420,
+    format: YuvFormat,
+    planes: YuvPlanes,
+    pack_y: Vec<u8>,
+    pack_u: Vec<u8>,
+    pack_v: Vec<u8>,
     bitstream: Vec<u8>,
     packets: Vec<Packet>,
     frame_bytes: usize,
@@ -576,7 +637,12 @@ unsafe impl Send for Encoder {}
 
 impl Encoder {
     /// `frame_bytes` is the per-picture budget (bitrate / 8 / fps).
-    pub fn new(width: u32, height: u32, frame_bytes: usize) -> Result<Encoder, String> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        frame_bytes: usize,
+        format: YuvFormat,
+    ) -> Result<Encoder, String> {
         if width % 2 != 0 || height % 2 != 0 || width < 16 || height < 16 {
             return Err(format!(
                 "pyrowave needs even sides of 16 or more, got {width}x{height}"
@@ -587,7 +653,7 @@ impl Encoder {
             device: device.handle,
             width: width as c_int,
             height: height as c_int,
-            chroma: CHROMA_420,
+            chroma: pyro_chroma(format),
         };
         let mut handle: Handle = std::ptr::null_mut();
         check(
@@ -600,7 +666,11 @@ impl Encoder {
             handle,
             width,
             height,
-            planes: I420::new(width as usize, height as usize),
+            format,
+            planes: YuvPlanes::new(width as usize, height as usize, format),
+            pack_y: Vec::new(),
+            pack_u: Vec::new(),
+            pack_v: Vec::new(),
             bitstream: vec![0; frame_bytes + 64 * 1024],
             packets: Vec::new(),
             frame_bytes,
@@ -622,9 +692,21 @@ impl Encoder {
         if (frame.width, frame.height) != (self.width, self.height) {
             return Err("frame size changed under the encoder".into());
         }
-        rgb_to_i420(frame, &mut self.planes);
+        rgb_to_yuv(frame, &mut self.planes);
+        let work = self.planes.for_bitstream();
+        debug_assert_eq!(work.format, self.format.bitstream());
+        self.pack_y = pack_plane(&work.y, work.format.depth);
+        self.pack_u = pack_plane(&work.u, work.format.depth);
+        self.pack_v = pack_plane(&work.v, work.format.depth);
         let api = &self.device.api;
-        let buffer = planes_buffer(&mut self.planes);
+        let buffer = packed_buffer(
+            &mut self.pack_y,
+            &mut self.pack_u,
+            &mut self.pack_v,
+            work.width,
+            work.height,
+            work.format,
+        );
         let rate = RateControl {
             maximum_bitstream_size: self.frame_bytes,
         };
@@ -678,23 +760,28 @@ impl Drop for Encoder {
 pub struct Decoder {
     device: Device,
     handle: Handle,
-    planes: I420,
+    format: YuvFormat,
+    planes: YuvPlanes,
+    pack_y: Vec<u8>,
+    pack_u: Vec<u8>,
+    pack_v: Vec<u8>,
 }
 
 unsafe impl Send for Decoder {}
 
 impl Decoder {
-    pub fn new(width: u32, height: u32) -> Result<Decoder, String> {
+    pub fn new(width: u32, height: u32, format: YuvFormat) -> Result<Decoder, String> {
         if width % 2 != 0 || height % 2 != 0 || width == 0 || height == 0 {
             return Err(format!("pyrowave needs even sides, got {width}x{height}"));
         }
+        let format = format.bitstream();
         let device = Device::new()?;
         let fragment = unsafe { (device.api.prefers_fragment)(device.handle) };
         let info = DecInfo {
             device: device.handle,
             width: width as c_int,
             height: height as c_int,
-            chroma: CHROMA_420,
+            chroma: pyro_chroma(format),
             fragment_path: fragment,
         };
         let mut handle: Handle = std::ptr::null_mut();
@@ -702,10 +789,19 @@ impl Decoder {
             unsafe { (device.api.decoder_create)(&info, &mut handle) },
             "decoder",
         )?;
+        let (cw, ch) = crate::yuv::chroma_size(width as usize, height as usize, format.chroma);
+        let bpp = match format.depth {
+            YuvDepth::Depth8 => 1,
+            YuvDepth::Depth10 => 2,
+        };
         Ok(Decoder {
             device,
             handle,
-            planes: I420::new(width as usize, height as usize),
+            format,
+            planes: YuvPlanes::new(width as usize, height as usize, format),
+            pack_y: vec![0; width as usize * height as usize * bpp],
+            pack_u: vec![0; cw * ch * bpp],
+            pack_v: vec![0; cw * ch * bpp],
         })
     }
 
@@ -736,9 +832,20 @@ impl Decoder {
         {
             return Err("pyrowave frame is incomplete".into());
         }
-        let buffer = planes_buffer(&mut self.planes);
+        let buffer = packed_buffer(
+            &mut self.pack_y,
+            &mut self.pack_u,
+            &mut self.pack_v,
+            self.planes.width,
+            self.planes.height,
+            self.format,
+        );
         check(unsafe { (api.decode_cpu)(self.handle, &buffer) }, "decode")?;
-        Ok(i420_to_rgb(&self.planes))
+        let (cw, ch) = self.planes.chroma_size();
+        self.planes.y = unpack_plane(&self.pack_y, self.format.depth, self.planes.y.len());
+        self.planes.u = unpack_plane(&self.pack_u, self.format.depth, cw * ch);
+        self.planes.v = unpack_plane(&self.pack_v, self.format.depth, cw * ch);
+        Ok(yuv_to_rgb(&self.planes))
     }
 }
 
@@ -757,9 +864,23 @@ fn take_u32(rest: &mut &[u8]) -> Result<u32, String> {
     Ok(value)
 }
 
-/// Default per-frame budget: about 1.5 bits per pixel.
+/// Default per-frame budget: about 4 bits per pixel.
+///
+/// Quality 40 is 1.0× this. The D3D11 encoder skips per-block RDO and, when
+/// the payload exceeds the budget, raises every leftover block from quant 0
+/// to 7. 1.5 bpp often crossed that cliff on desktop UI. 4 bpp keeps typical
+/// 720p desks at quant 0 on a LAN (about 111 Mbit/s at 30 fps).
 pub fn default_frame_bytes(width: u32, height: u32) -> usize {
-    (width as usize * height as usize * 3 / 16).max(32 * 1024)
+    (width as usize * height as usize / 2).max(32 * 1024)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    #[test]
+    fn default_is_four_bits_per_pixel() {
+        assert_eq!(super::default_frame_bytes(1280, 720), 1280 * 720 / 2);
+        assert_eq!(super::default_frame_bytes(64, 64), 32 * 1024);
+    }
 }
 
 #[cfg(test)]

@@ -139,6 +139,8 @@ fn host_desktop_and_connect_view_carry_file_clipboard_keys_and_chat() {
                     max_width: 320,
                     bitrate_kbps: 0,
                     quality: 0,
+                    dirty_rects: false,
+                    yuv: etherquic::negotiate::YuvFormat::YUV444P8,
                 },
                 picture: Arc::new(AtomicU64::new(0)),
             },

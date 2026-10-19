@@ -1,8 +1,10 @@
 //! Motion JPEG 2000: every picture a JPEG 2000 codestream (raw J2K).
 //!
-//! Quality 1–99 maps to an OpenJPEG compression ratio on the irreversible
-//! 9/7 path. 100 is lossless 5/3. MJPEG stays the negotiation floor; this
-//! row can be switched off.
+//! Quality 1–99 maps to an OpenJPEG compression ratio on the integer 5/3
+//! path (rate allocation still shrinks the codestream). 100 is lossless.
+//! Worker threads run T1 on large pictures; tiny dirty tiles stay
+//! single-threaded. MJPEG stays the negotiation floor; this row can be
+//! switched off.
 
 use std::num::NonZeroUsize;
 
@@ -19,20 +21,41 @@ fn rate(quality: u8) -> f32 {
     (2.0 + (100.0 - q) * 0.35).clamp(1.0, 80.0)
 }
 
-fn encode_options(quality: u8) -> EncodeOptions {
+/// T1 workers. 0 is OpenJPEG single-thread (no pool). Leave one core for
+/// capture; cap so a laptop encode does not starve the rest of the session.
+fn worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).clamp(1, 6))
+        .unwrap_or(2)
+}
+
+fn encode_threads(width: u32, height: u32) -> usize {
+    if width.saturating_mul(height) < 48 * 48 {
+        0
+    } else {
+        worker_threads()
+    }
+}
+
+fn num_resolutions(width: u32, height: u32) -> i32 {
+    let min_dim = width.min(height).max(1);
+    (min_dim.ilog2() as i32).saturating_sub(3).clamp(2, 4)
+}
+
+fn encode_options(width: u32, height: u32, quality: u8) -> EncodeOptions {
     let quality = clamp_quality(quality);
     let lossless = quality >= 100;
     EncodeOptions {
         format: Format::J2k,
-        threads: 0,
-        irreversible: !lossless,
+        threads: encode_threads(width, height),
+        irreversible: false,
         use_mct: true,
         rates: if lossless {
             Vec::new()
         } else {
             vec![rate(quality)]
         },
-        num_resolutions: None,
+        num_resolutions: Some(num_resolutions(width, height)),
     }
 }
 
@@ -41,7 +64,8 @@ pub fn encode(frame: &Frame, quality: u8) -> Result<Vec<u8>, String> {
     let image =
         Image::from_interleaved_u8(frame.width, frame.height, ColorSpace::Srgb, 3, &frame.rgb)
             .map_err(|error| error.to_string())?;
-    Encoder::encode(&image, &encode_options(quality)).map_err(|error| error.to_string())
+    Encoder::encode(&image, &encode_options(frame.width, frame.height, quality))
+        .map_err(|error| error.to_string())
 }
 
 fn sample_u8(value: i32) -> u8 {
@@ -53,7 +77,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, String> {
         bytes,
         DecodeOptions {
             format: Format::Auto,
-            threads: 0,
+            threads: worker_threads(),
             output: OutputFormat::Interleaved8 {
                 channels: NonZeroUsize::new(3).unwrap(),
             },
@@ -72,6 +96,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, String> {
     let format = Format::detect(bytes).unwrap_or(Format::J2k);
     let image = Decoder::new(format)
         .map_err(|error| error.to_string())?
+        .with_threads(worker_threads() as i32)
         .decode_slice(bytes)
         .map_err(|error| error.to_string())?;
     let width = image.width;
@@ -135,5 +160,21 @@ mod tests {
         assert_eq!(back.width, 64);
         assert_eq!(back.height, 48);
         assert_eq!(back.rgb.len(), 64 * 48 * 3);
+    }
+
+    #[test]
+    fn speed_knobs_keep_small_tiles_single_threaded() {
+        assert_eq!(encode_threads(16, 16), 0);
+        assert_eq!(encode_threads(32, 32), 0);
+        assert!(encode_threads(1280, 720) >= 1);
+        assert_eq!(num_resolutions(16, 16), 2);
+        assert_eq!(num_resolutions(1280, 720), 4);
+        let opts = encode_options(1280, 720, 40);
+        assert!(!opts.irreversible);
+        assert_eq!(opts.num_resolutions, Some(4));
+        assert!(!opts.rates.is_empty());
+        let lossless = encode_options(1280, 720, 100);
+        assert!(lossless.rates.is_empty());
+        assert!(!lossless.irreversible);
     }
 }

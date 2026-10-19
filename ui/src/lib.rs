@@ -8,6 +8,12 @@
 
 #[cfg(feature = "ui")]
 mod badge;
+#[cfg(feature = "ui")]
+mod extra_keys;
+#[cfg(feature = "ui")]
+mod overlay;
+#[cfg(feature = "ui")]
+mod update;
 #[cfg(all(feature = "ui", target_os = "macos"))]
 mod child_view;
 #[cfg(feature = "ui")]

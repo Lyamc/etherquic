@@ -5,7 +5,7 @@
 //! only some tiles moved, MJPEG and MJ2K can send those tiles as patches.
 //! Inter-frame codecs still encode a full picture when anything changed.
 
-use crate::negotiate::RECORD_PATCH;
+use crate::negotiate::{Video, RECORD_PATCH};
 use crate::Frame;
 
 /// Tile edge in pixels. Even, so a JPEG crop stays even.
@@ -36,6 +36,36 @@ pub enum Plan {
     Unchanged,
     Full,
     Patches(Vec<Rect>),
+}
+
+/// Host send-path after the dirty plan: skip, type-`R`, or a full `D`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Skip,
+    Full,
+    Patches(Vec<Rect>),
+}
+
+/// Decide whether this captured picture is a skip, type-`R` tiles, or a full
+/// `D`. `want` is the offer/Settings request. `can_patch` is v2 plus
+/// `knows dirty-rects`.
+pub fn action(
+    want: bool,
+    can_patch: bool,
+    video: Video,
+    prev: Option<&[u8]>,
+    next: &[u8],
+    width: u32,
+    height: u32,
+) -> Action {
+    if !want {
+        return Action::Full;
+    }
+    match plan(prev, next, width, height) {
+        Plan::Unchanged => Action::Skip,
+        Plan::Patches(rects) if can_patch && video.patch_updates() => Action::Patches(rects),
+        _ => Action::Full,
+    }
 }
 
 /// Compare `next` to the last encoded picture. `prev` is `None` on the first
@@ -317,5 +347,62 @@ mod tests {
         assert_eq!(back, rect);
         assert_eq!(coded, b"jpeg");
         assert_eq!(RECORD, b'R');
+    }
+
+    #[test]
+    fn only_mjpeg_and_mj2k_send_patch_records() {
+        assert!(Video::Mjpeg.patch_updates());
+        assert!(Video::Mj2k.patch_updates());
+        assert!(!Video::Pyrowave.patch_updates());
+        assert!(!Video::PyrowaveCpu.patch_updates());
+        assert!(!Video::H264Sw.patch_updates());
+        assert!(!Video::H265Hw.patch_updates());
+        assert!(!Video::Av1Hw.patch_updates());
+        assert!(!Video::JpegXs.patch_updates());
+        assert!(!Video::OpenApv.patch_updates());
+    }
+
+    #[test]
+    fn send_path_skips_identical_frames_and_never_patches_temporal() {
+        let prev = solid(64, 48, [10, 20, 30]);
+        assert_eq!(
+            action(true, true, Video::Mjpeg, Some(&prev), &prev, 64, 48),
+            Action::Skip
+        );
+        assert_eq!(
+            action(true, true, Video::H264Sw, Some(&prev), &prev, 64, 48),
+            Action::Skip
+        );
+        assert_eq!(
+            action(true, true, Video::Pyrowave, Some(&prev), &prev, 64, 48),
+            Action::Skip
+        );
+        assert_eq!(
+            action(false, true, Video::Mjpeg, Some(&prev), &prev, 64, 48),
+            Action::Full
+        );
+        assert_eq!(
+            action(true, true, Video::Mjpeg, None, &prev, 64, 48),
+            Action::Full
+        );
+
+        let mut next = prev.clone();
+        paint(&mut next, 64, 20, 18, 4, 4, [255, 0, 0]);
+        match action(true, true, Video::Mjpeg, Some(&prev), &next, 64, 48) {
+            Action::Patches(rects) => assert_eq!(rects.len(), 1),
+            other => panic!("mjpeg should patch, got {other:?}"),
+        }
+        assert_eq!(
+            action(true, true, Video::Pyrowave, Some(&prev), &next, 64, 48),
+            Action::Full
+        );
+        assert_eq!(
+            action(true, true, Video::H264Sw, Some(&prev), &next, 64, 48),
+            Action::Full
+        );
+        assert_eq!(
+            action(true, false, Video::Mjpeg, Some(&prev), &next, 64, 48),
+            Action::Full
+        );
     }
 }

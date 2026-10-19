@@ -1,76 +1,152 @@
-# QUIC over Ethernet
+# Optional dirty-rectangle picture updates
 
-Quinn works on Ethernet when the backend looks like UDP and hides the rest.
+A player can ask the host to spend encode work only on pixels that changed. Off by default. The host honours the request when it can, the same way it honours a codec pin: the offer carries the wish, the config record says what this session is actually doing.
 
-Each send and receive is one datagram. The peer address is stable for the life of the path. The backend tells Quinn the maximum datagram size and refuses anything larger before it hits the wire. A 1200-byte Initial fits in one frame.
+Two codec families, one detection step, two transports.
 
-Packet protection, connection IDs, loss recovery, streams, and TLS never read the Ethernet header. The UDP socket calls (`sendmsg`, `IP_PKTINFO`, ECN, GSO, ICMP, real `SocketAddr` values) are the part that cannot be pointed at a raw Ethernet device. That binding is the only new seam:
+| Family | Rows | When something moved | When nothing moved |
+| --- | --- | --- | --- |
+| Intra (still image) | MJPEG, MJ2K | Type-`R` patches of the dirty tiles, or a full `D` if the dirty area is large | Send nothing |
+| Temporal (motion) | H.264, H.265, AV1 | Full `D` of the real RGB; the encoder’s P-skip is the dirty-rect | Send nothing |
+
+PyroWave is intra (one independent picture per push) but its encoder is opened at full size, so a crop is not a legal next packet. First cut: treat it with the temporal row’s “full `D` when anything moved.” Type-`R` for PyroWave is later.
+
+The pointer already rides `P` (cursor) records. It is not part of this plan.
+
+## Already on the wire
+
+Player offer (`ENEG`):
 
 ```text
-QUIC core          datagram + opaque peer + max size
-    |
-Datagram backend
-    |-- UDP socket
-    +-- Ethernet backend (MAC, EtherType, service id)
+knows pyrowave-cpu dirty-rects
+dirty-rects 1
 ```
 
-If a QUIC stack cannot take an opaque peer and an explicit max size, stop. Both ends of this path use the Ethernet backend. QUIC-over-UDP is a second backend, not a peer of this framing.
+`knows dirty-rects` means the player can blit a type-`R` record. `dirty-rects 1` / `0` is the request. A missing `dirty-rects` line is an older player: the host falls back to its own Settings toggle.
 
-## Backend contract
+`LiveOffer` already carries `dirty_rects`. A mid-session toggle resends the offer. `Offer::same_codecs` currently ignores that field so the encoder stays up; that is wrong once temporal GOP depends on the flag (see below).
 
-| | The backend must | Or else |
+Host encode loop already:
+
+1. Compares this captured RGB to the last encoded RGB in 16×16 tiles (`media/src/dirty.rs`).
+2. Unchanged → no picture record.
+3. MJPEG / MJ2K, v2, player `knows dirty-rects`, dirty area under 50% and at most 12 merged rects → type-`R`.
+4. Otherwise → full `D`.
+
+Type-`R` payload after the record type byte:
+
+```text
+x u16le | y u16le | w u16le | h u16le | coded tile (a complete JPEG or JPEG 2000)
+```
+
+The player decodes the tile and blits it onto the last full frame. After a `C` config the canvas is empty, so the next picture must be a full `D`.
+
+UI: Connect card quality slider plus “Send only changed tiles,” persisted as `dirty-rects=` in Settings. Same field as Display Capture.
+
+## Detection (every codec)
+
+Keep `dirty::plan`. Do not capture DXGI dirty rects in this pass; encode-side RGB compare is the source of truth.
+
+| Plan | Meaning |
+| --- | --- |
+| `Unchanged` | Identical to last encoded picture. No `D` or `R`. |
+| `Patches(rects)` | Small dirty area. Intra that can `patch_updates()` may send `R`. Everyone else sends `D`. |
+| `Full` | First picture, size change, ≥50% dirty, or more than 12 rects. Always `D`. |
+
+`previous` is cleared on encoder open and on size change, so the first picture after `C` is always `Full`.
+
+## Intra transport (MJPEG, MJ2K)
+
+Keep type-`R`. Rules:
+
+1. After every `C`, the next picture is a full `D`.
+2. `Unchanged`: send nothing.
+3. `Patches`: one `R` per merged rect.
+4. Never send `R` until a `D` has filled the canvas.
+5. Do not send `R` on a temporal session.
+
+`Video::patch_updates` stays MJPEG and MJ2K. PyroWave stays false until a crop encoder exists.
+
+## Temporal transport (H.264, H.265, AV1)
+
+The player keeps decoding every `D` as a full RGB frame. No composite step. No `R` on this stream.
+
+When the offer wants dirty-rects, open the ffmpeg encoder with a long prediction chain and B-frames still off:
+
+- `-bf 0` (already).
+- GOP infinite or as large as the encoder allows (`-g 0` / a very large keyint). Hardware encoders often clamp this; a long finite GOP is acceptable.
+- Intra-refresh where the encoder has it (`intra-refresh=1` on x264; NVENC refresh mode when present).
+- Zerolatency / ull presets stay. Do not turn B-frames up.
+
+`Unchanged` still means do not `push`. Anything dirty: `push` the real RGB. Skip-coded macroblocks are the encoder’s job. Size or codec change already drops the encoder, sends `C`, and the next picture is an IDR.
+
+`same_codecs` must **not** ignore `want_dirty_rects` once GOP is tied to that flag. A live toggle reopens the encoder (same as a quality change) so the new GOP takes effect. Skip-unchanged can also flip on that reopen.
+
+## Config echo
+
+`StreamConfig` (`C` record) gains an optional line the player can show and that old players ignore:
+
+```text
+dirty-rects patches
+dirty-rects pskip
+dirty-rects off
+```
+
+| Value | Host behaviour |
+| --- | --- |
+| `patches` | Intra row, type-`R` when the plan says so |
+| `pskip` | Temporal row, long GOP, skip-unchanged |
+| `off` | Detection off; every captured picture is a full `D` |
+
+The offer line is the request. This line is what the host is doing.
+
+## Encoder arguments (temporal, dirty-rects on)
+
+Per encoder, best effort:
+
+| Encoder | GOP | Refresh |
 | --- | --- | --- |
-| 1 | Keep datagram boundaries. One Ethernet payload is one receive. | A stream read splits coalesced packets. |
-| 2 | Pass QUIC bytes through, padding included. | AEAD or the 1200-byte Initial rule breaks. |
-| 3 | Put a stable peer address on every receive, and accept it on send. | A MAC that changes per frame looks like a new path. |
-| 4 | Report max size as MTU minus the adapter header. | The default 65527 invites a jumbo datagram. |
-| 5 | Fail an oversize send, and do not transmit it. | A silent drop looks like a successful probe. |
-| 6 | Leave ECN unmarked. | A path that requires `IP_TOS` on every datagram delivers nothing. |
-| 7 | Skip GSO, GRO, packet info, TTL, and ICMP. | Setup or the MTU search stalls on those calls. |
-| 8 | Omit `preferred_address` unless that address is an Ethernet peer. | The peer leaves the L2 path. |
-| 9 | Bind Retry tokens and path checks to the address Quinn stored. | A token that holds a real IP fails the next packet. |
-| 10 | Demux connections by Connection ID. The MAC is only the path. | One MAC pair cannot hold two connections. |
-| 11 | Deliver unicast frames for this MAC, this EtherType, and this service id. | Broadcast burns the anti-amplification budget. |
+| libx264 | `keyint=infinite` in `-x264-params` (keep `repeat-headers=1:sliced-threads=1`) | `intra-refresh=1` |
+| *_nvenc | large `-g`, keep `-bf 0 -delay 0` | intra-refresh if that build lists it |
+| *_qsv / *_amf / *_videotoolbox | large `-g` if accepted | whatever the encoder documents |
 
-A 1500-byte payload MTU holds a 1200-byte Initial plus the 2-byte service id. VLAN tags come out of that budget when the socket is bound to the parent device. The adapter does not fragment.
+Probe or accept failure to set infinite GOP. Do not fail the row because refresh is missing.
 
-## Address
+## Session rules
 
-Above the backend the peer is opaque:
+- Dirty-rects is a player request (`dirty-rects 1` in the offer / live offer). The host Settings toggle is only the fallback for an offer with no line, and the persisted default for this PC as player.
+- Mixing `R` with a live P-decoder is forbidden.
+- NUT stays the ffmpeg packetization for one `D` payload. No custom NUT flags, no SEI, no extra NAL types.
+- No chroma-key, no alpha, no extra pixel row or column on the raster.
+- Unchanged pictures send nothing. Do not add a hold/`S` record in this pass.
+- Missed-frame detection and a player `refresh` / forced IDR request are out of this plan. Revisit later.
 
-```text
-mac: [u8; 6]
-service_id: u16    // demux, same job as a UDP port
-```
+## Work
 
-Quinn stores a `SocketAddr`, so the backend encodes a private IPv6 link-local address (MAC in the interface identifier, port = service id). That encoding stays inside the address conversion. It is not handed to the kernel IP stack, not used as a certificate name, and not advertised as `preferred_address`.
+1. **Config echo.** Add `dirty-rects` to `StreamConfig` encode/decode/tests. Host fills it from the active row and the offer.
+2. **Temporal GOP.** When `offer_wants_dirty_rects`, pass long GOP + intra-refresh into `encoder_args`. Keep `-bf 0`.
+3. **Reopen on toggle.** Stop ignoring `want_dirty_rects` in `same_codecs` (or treat GOP-affecting changes as encoder restart). Quality already restarts; this should too.
+4. **PyroWave.** No type-`R`. Skip-unchanged still applies; a dirty picture is a full `D`.
+5. **Status.** Surface the config echo in the session line when present (`patches` / `pskip`).
+6. **Tests.** Offer round-trip already covers `dirty-rects 0|1`. Add: config echo round-trip; `same_codecs` false when the request flips; host skip-unchanged with the request on and an identical frame; MJPEG type-`R` still blits; a temporal encoder is opened with a large GOP when the offer asks (inspect args or a probe helper).
+7. **Architecture.md.** One paragraph: request in the offer, `patches` vs `pskip` in config, type-`R` for MJPEG/MJ2K, long GOP for H.264/H.265/AV1.
 
-One connection uses one peer MAC and one interface. A later source MAC is a new path. Path validation runs. Migration beyond that is out of scope.
+## Out
 
-## Wire
+- DXGI / display-engine dirty rects as the detector.
+- Alpha, fixed chroma-key, dynamic chroma-key, teletext pad strip.
+- Infinite B-frames.
+- Type-`R` or chroma-key for PyroWave (follow-up).
+- Hold/`S` records for idle FPS stats.
+- Player “missed a frame → force IDR” (follow-up).
+- New ALPN or record types besides the config line.
 
-Development EtherType is `0x88B6` (IEEE local-experimental range `0x88B5`–`0x88B6`).
+## Tests (acceptance)
 
-```text
-Ethernet: dst MAC | src MAC | EtherType | payload
-payload:  service_id (2 bytes) | one QUIC datagram
-```
-
-On Linux the backend is `AF_PACKET` / `SOCK_DGRAM`, bound to the interface and the EtherType. The kernel owns the Ethernet header. The process sees the payload and the peer MAC. Unicast to the host MAC needs no promiscuous mode.
-
-Drop a frame that is short, has the wrong service id, or is not for the local MAC. Do not parse QUIC to decide that.
-
-## Scope
-
-In: two hosts on one L2 segment, many connections demuxed by Connection ID, a UDP backend kept for comparison, MTU from the interface, handshake plus stream data, and tests for framing, loss, reorder, duplication, and oversize sends.
-
-Out: a second packet format, a private congestion or TLS stack, IP routing, Ethernet fragmentation, QUIC extensions, DPDK, and `AF_XDP`. Same-LAN is not trust. QUIC authentication is the security boundary. EtherType, destination MAC, and service id only demux.
-
-## Tests
-
-- Round-trip MAC, EtherType, service id, and QUIC bytes, including empty, 1200, max, and max+1.
-- Oversize send returns too-big and the peer sees no frame.
-- Two QUIC packets in one payload are one receive.
-- On a veth pair with no IP: handshake, one stream, many streams, two connections on one MAC pair, and recovery after loss, reorder, and duplication.
-- UDP-backend tests still pass.
-- The QUIC packet, recovery, and TLS modules do not name Ethernet, `AF_PACKET`, or EtherType.
+- Offer `dirty-rects 1` round-trips; missing line stays `None`; host fallback still uses Settings.
+- MJPEG session with the request on: mouse-only motion yields `R` records; player canvas matches a full encode.
+- Identical frames: no `D` or `R` for any codec.
+- H.264 (sw) with the request on: encoder args include a large/infinite GOP and `-bf 0`; first picture after `C` is an IDR `D`; later identical pictures send nothing.
+- Toggle off mid-session: encoder reopens, config says `off`, full `D` every captured picture.
+- Old player (no `dirty-rects` line, no `knows dirty-rects`): no `R`; host Settings still gates skip-unchanged.
+- Unknown config key `dirty-rects` is ignored by a decoder that does not parse it (existing unknown-key rule).

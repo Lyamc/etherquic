@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use etherquic::discover::{
-    AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_AV1, VIDEO_H264, VIDEO_H265, VIDEO_MJ2K,
-    VIDEO_MJPEG, VIDEO_PYROWAVE,
+    AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_APV, VIDEO_AV1, VIDEO_H264, VIDEO_H265,
+    VIDEO_JPEGXS, VIDEO_MJ2K, VIDEO_MJPEG, VIDEO_PYROWAVE,
 };
 use etherquic::{BackendProbe, MediaBackend};
 use etherquic_play::{
@@ -20,7 +20,7 @@ use etherquic_play::{
     MachineCodecs, PicturePref,
 };
 
-/// AV1 (HW), H.265 (HW), H.264 (HW), Pyrowave, MJ2K, MJPEG, H.264 (SW).
+/// AV1 (HW), H.265 (HW), H.264 (HW), Pyrowave, JPEG XS, OpenAPV, MJ2K, MJPEG, H.264 (SW).
 pub fn default_video() -> Vec<PicturePref> {
     PicturePref::order().to_vec()
 }
@@ -74,6 +74,10 @@ pub fn video_hint(pref: PicturePref) -> &'static str {
         PicturePref::PyrowaveCpu => {
             "PyroWave on a CPU Vulkan driver (no GPU). Uses many cores and about 40 Mbit/s"
         }
+        PicturePref::JpegXs => {
+            "intra JPEG XS through ffmpeg, visually lossless, no encode hardware"
+        }
+        PicturePref::OpenApv => "intra APV through ffmpeg liboapv, no encode hardware",
         PicturePref::Mj2k => {
             "intra JPEG 2000, stronger than MJPEG, no encode hardware"
         }
@@ -99,6 +103,8 @@ fn video_wire(codec: CodecId) -> u8 {
     match codec {
         CodecId::Pyrowave => VIDEO_PYROWAVE,
         CodecId::Mj2k => VIDEO_MJ2K,
+        CodecId::JpegXs => VIDEO_JPEGXS,
+        CodecId::OpenApv => VIDEO_APV,
         CodecId::Mjpeg => VIDEO_MJPEG,
         CodecId::H264 => VIDEO_H264,
         CodecId::H265 => VIDEO_H265,
@@ -110,6 +116,8 @@ fn codec_from_wire(id: u8) -> Option<CodecId> {
     match id {
         VIDEO_PYROWAVE => Some(CodecId::Pyrowave),
         VIDEO_MJ2K => Some(CodecId::Mj2k),
+        VIDEO_JPEGXS => Some(CodecId::JpegXs),
+        VIDEO_APV => Some(CodecId::OpenApv),
         VIDEO_MJPEG => Some(CodecId::Mjpeg),
         VIDEO_H264 => Some(CodecId::H264),
         VIDEO_H265 => Some(CodecId::H265),
@@ -395,6 +403,8 @@ pub fn codec_choice_for(
     video_pin: Option<PicturePref>,
     audio_pin: Option<AudioId>,
     quality: u8,
+    dirty_rects: bool,
+    yuv: etherquic::negotiate::YuvFormat,
 ) -> etherquic_play::CodecChoice {
     let mut video = applied.video.clone();
     if let Some(pin) = video_pin {
@@ -412,6 +422,8 @@ pub fn codec_choice_for(
         max_width: 0,
         bitrate_kbps: 0,
         quality,
+        dirty_rects,
+        yuv,
     }
 }
 
@@ -1097,7 +1109,14 @@ mod tests {
     fn a_pin_leads_the_offer() {
         let prefs = Preferences::baseline();
         let applied = apply_override(&prefs, None);
-        let choice = codec_choice_for(&applied, Some(PicturePref::Mjpeg), None, 0);
+        let choice = codec_choice_for(
+            &applied,
+            Some(PicturePref::Mjpeg),
+            None,
+            0,
+            false,
+            etherquic::negotiate::YuvFormat::YUV444P8,
+        );
         assert_eq!(choice.video.first(), Some(&PicturePref::Mjpeg));
         assert_eq!(choice.video_pin, Some(PicturePref::Mjpeg));
         assert_eq!(choice.video.len(), applied.video.len());

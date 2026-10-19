@@ -16,7 +16,7 @@ use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::audio::AudioEncoder;
-use crate::dirty::{self, Plan};
+use crate::dirty;
 use crate::negotiate::{
     choose_audio, choose_video, Audio, HostCaps, Offer, StreamConfig, Video, AUDIO2_MAGIC,
     OFFER_MAGIC, RECORD_CURSOR, RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
@@ -27,13 +27,36 @@ use crate::{wire, yuv, Frame, Log, Pcm};
 static DIRTY_RECTS: AtomicBool = AtomicBool::new(false);
 
 /// When this computer hosts: skip unchanged pictures, and send MJPEG/MJ2K
-/// dirty tiles when the player said `knows dirty-rects`.
+/// dirty tiles, for a player that did not send `dirty-rects` in its offer.
 pub fn set_dirty_rects(on: bool) {
     DIRTY_RECTS.store(on, Ordering::Relaxed);
 }
 
 pub fn dirty_rects() -> bool {
     DIRTY_RECTS.load(Ordering::Relaxed)
+}
+
+fn style_from_offer(offer: Option<&Offer>) -> etherquic::look::Style {
+    let Some(offer) = offer else {
+        return etherquic::look::Style::default();
+    };
+    etherquic::look::Style {
+        look: offer.look,
+        dither: offer.dither.unwrap_or_default(),
+        pixel_size: offer
+            .pixel_size
+            .unwrap_or_else(|| offer.look.default_pixel_size()),
+        strength: offer.dither_strength.unwrap_or(60),
+    }
+}
+
+/// The player's offer wins when it sent `dirty-rects`. An older player leaves
+/// the line off, and this host's Settings toggle still applies.
+fn offer_wants_dirty_rects(offer: Option<&Offer>) -> bool {
+    match offer.and_then(|offer| offer.want_dirty_rects) {
+        Some(want) => want,
+        None => dirty_rects(),
+    }
 }
 
 pub const LEGACY_VIDEO_MAGIC: &[u8; 4] = b"EVID";
@@ -422,8 +445,12 @@ fn video_pump(
             .map(|o| (o.max.width, o.max.height))
             .unwrap_or((0, 0));
         let mut frame = yuv::fit(&frame, max_w, max_h);
-        let look = offer.as_ref().map(|item| item.look).unwrap_or_default();
-        etherquic::look::apply(&mut frame.rgb, frame.width, frame.height, look);
+        etherquic::look::apply_style(
+            &mut frame.rgb,
+            frame.width,
+            frame.height,
+            style_from_offer(offer.as_ref()),
+        );
         if active
             .as_ref()
             .map(|a| a.size != (frame.width, frame.height))
@@ -449,6 +476,13 @@ fn video_pump(
                 };
                 let kbps = offer.as_ref().map(|o| o.bitrate_kbps).unwrap_or(0);
                 let quality = offer.as_ref().map(|o| o.quality).unwrap_or(0);
+                let yuv = offer
+                    .as_ref()
+                    .map(crate::negotiate::pick_pyrowave_yuv)
+                    .unwrap_or(crate::negotiate::YuvFormat::YUV420P8);
+                let want_dirty = offer_wants_dirty_rects(offer.as_ref());
+                let knows_patches =
+                    v2 && offer.as_ref().is_some_and(|offer| offer.knows_dirty_rects);
                 let setup = EncodeSetup {
                     video,
                     encoder: encoder_name.clone(),
@@ -457,6 +491,8 @@ fn video_pump(
                     fps: options.fps,
                     kbps,
                     quality,
+                    yuv,
+                    dirty_rects: want_dirty,
                 };
                 let sink_out = out.clone();
                 let sink_sent = sent.clone();
@@ -474,6 +510,8 @@ fn video_pump(
                             options.fps,
                         );
                         config.bitrate_kbps = kbps;
+                        config.yuv = yuv.bitstream();
+                        config.dirty_rects = video.dirty_rects_mode(want_dirty, knows_patches);
                         config.reason = std::mem::take(&mut reason);
                         if first_config {
                             config.host = options.caps.clone();
@@ -530,31 +568,34 @@ fn video_pump(
         let Some(current) = active.as_mut() else {
             continue;
         };
-        if dirty_rects() {
-            let prev = previous
-                .as_ref()
-                .filter(|(w, h, _)| *w == frame.width && *h == frame.height)
-                .map(|(_, _, rgb)| rgb.as_slice());
-            match dirty::plan(prev, &frame.rgb, frame.width, frame.height) {
-                Plan::Unchanged => continue,
-                Plan::Patches(rects)
-                    if v2
-                        && offer.as_ref().is_some_and(|offer| offer.knows_dirty_rects)
-                        && current.video.patch_updates() =>
-                {
-                    match send_patches(current, &frame, &rects, &out, &sent) {
-                        Ok(true) => {
-                            current.encode_fails = 0;
-                            frames_in += 1;
-                            previous = Some((frame.width, frame.height, frame.rgb.clone()));
-                            continue;
-                        }
-                        Ok(false) => return,
-                        Err(_) => {}
+        let prev = previous
+            .as_ref()
+            .filter(|(w, h, _)| *w == frame.width && *h == frame.height)
+            .map(|(_, _, rgb)| rgb.as_slice());
+        let knows_patches = v2 && offer.as_ref().is_some_and(|offer| offer.knows_dirty_rects);
+        match dirty::action(
+            offer_wants_dirty_rects(offer.as_ref()),
+            knows_patches,
+            current.video,
+            prev,
+            &frame.rgb,
+            frame.width,
+            frame.height,
+        ) {
+            dirty::Action::Skip => continue,
+            dirty::Action::Patches(rects) => {
+                match send_patches(current, &frame, &rects, &out, &sent) {
+                    Ok(true) => {
+                        current.encode_fails = 0;
+                        frames_in += 1;
+                        previous = Some((frame.width, frame.height, frame.rgb.clone()));
+                        continue;
                     }
+                    Ok(false) => return,
+                    Err(_) => {}
                 }
-                _ => {}
             }
+            dirty::Action::Full => {}
         }
         match current.encoder.push(&frame) {
             Ok(true) => {

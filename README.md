@@ -72,6 +72,8 @@ cargo run --manifest-path play/Cargo.toml --bin etherquic-play -- connect --nic 
 
 `etherquic` is the window: `host` and `connect`. The `ui` feature is the GPUI front end. Host and Connect call the play library inside `etherquic.exe`: the picture, the audio, and keyboard, mouse, and gamepad.
 
+Settings → Updates checks [GitHub tagged releases](https://github.com/Lyamc/etherquic/releases). **Download and install** fetches the MSI, pkg, or Linux tarball for this computer. **Beta releases** also considers pre-release tags. `packaging/release.sh` builds those assets and publishes the tag.
+
 ## Android
 
 The Play APK (`dev.etherquic.play`) is a UDP player. Scan the host-card QR, or paste that text. Ethernet is not used. The native crate is [`android`](android/README.md) (`etherquic-android`), built with `--no-default-features` on `etherquic-play`. `INTERNET` and `ACCESS_NETWORK_STATE` are in the manifest. A phone `.so` needs the NDK and `aarch64-linux-android`.

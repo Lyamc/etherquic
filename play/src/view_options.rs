@@ -144,9 +144,18 @@ pub struct ViewOptions {
     pub cursor: CursorMode,
     /// Painted on the host before the picture is encoded.
     pub look: etherquic::look::Look,
+    pub dither: etherquic::look::Dither,
+    /// Source pixels per output pixel, 1–32.
+    pub pixel_size: u8,
+    /// Dither strength 0–100.
+    pub dither_strength: u8,
     /// Picture quality 1–100. MJPEG uses this as JPEG quality. Other codecs
     /// scale their default bitrate. 40 is the previous fixed JPEG quality.
     pub quality: u8,
+    /// Ask the host to skip unchanged pictures and send MJPEG/MJ2K dirty tiles.
+    pub dirty_rects: bool,
+    /// PyroWave colour format asked of the host.
+    pub yuv: etherquic::negotiate::YuvFormat,
     pub pad_slots: Vec<PadSlot>,
     /// Output device by name. `None` is the default device. Read when sound starts.
     pub output_device: Option<String>,
@@ -162,7 +171,12 @@ impl Default for ViewOptions {
             send_pads: true,
             cursor: CursorMode::Native,
             look: etherquic::look::Look::Off,
+            dither: etherquic::look::Dither::Bayer4,
+            pixel_size: 2,
+            dither_strength: 60,
             quality: etherquic::negotiate::DEFAULT_QUALITY,
+            dirty_rects: false,
+            yuv: etherquic::negotiate::YuvFormat::YUV444P8,
             pad_slots: Vec::new(),
             output_device: None,
         }

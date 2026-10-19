@@ -236,11 +236,17 @@ async fn write_acks(conn: Connection, mut acks: mpsc::Receiver<InputAck>) -> Res
     Ok(())
 }
 
-/// Picture look and encode quality the player can change while a session is open.
+/// Picture look, encode quality, and dirty-rect request the player can change
+/// while a session is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveOffer {
     pub look: etherquic::look::Look,
+    pub dither: etherquic::look::Dither,
+    pub pixel_size: u8,
+    pub dither_strength: u8,
     pub quality: u8,
+    pub dirty_rects: bool,
+    pub yuv: etherquic::negotiate::YuvFormat,
 }
 
 /// What the player asks for, and where session events go.
@@ -249,7 +255,8 @@ pub struct PlayerMedia {
     pub offer: etherquic_media::negotiate::Offer,
     pub frames: etherquic_media::Sink<etherquic_media::Frame>,
     pub events: mpsc::UnboundedSender<etherquic_media::player::PlayerEvent>,
-    /// Latest picture look and quality. A change is written again on the offer stream.
+    /// Latest picture look, quality, and dirty-rect request. A change is
+    /// written again on the offer stream.
     pub live: tokio::sync::watch::Receiver<LiveOffer>,
 }
 
@@ -258,11 +265,23 @@ async fn resend_live(
     live: LiveOffer,
     offer_send: &mut Option<SendStream>,
 ) {
-    if offer.look == live.look && offer.quality == live.quality {
+    if offer.look == live.look
+        && offer.dither == Some(live.dither)
+        && offer.pixel_size == Some(live.pixel_size)
+        && offer.dither_strength == Some(live.dither_strength)
+        && offer.quality == live.quality
+        && offer.want_dirty_rects == Some(live.dirty_rects)
+        && offer.yuv == Some(live.yuv)
+    {
         return;
     }
     offer.look = live.look;
+    offer.dither = Some(live.dither);
+    offer.pixel_size = Some(live.pixel_size);
+    offer.dither_strength = Some(live.dither_strength);
     offer.quality = live.quality;
+    offer.want_dirty_rects = Some(live.dirty_rects);
+    offer.yuv = Some(live.yuv);
     let Some(send) = offer_send.as_mut() else {
         return;
     };

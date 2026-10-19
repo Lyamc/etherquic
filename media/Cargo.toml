@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Negotiated codecs for etherquic: PyroWave, Opus, ffmpeg H.264/HEVC/AV1, MJPEG, MJ2K, PCM"
+description = "Negotiated codecs for etherquic: PyroWave, Opus, ffmpeg H.264/HEVC/AV1/OpenAPV/JPEG-XS, MJPEG, MJ2K, PCM"
 publish = false
 
 [dependencies]

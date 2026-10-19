@@ -53,6 +53,8 @@ pub fn manifest(application_id: &str, version_code: u32, version_name: &str) -> 
     let lib_name_val = pool.string("etherquic_android");
     let true_val = pool.string("true");
     let false_val = pool.string("false");
+    // SOFT_INPUT_ADJUST_RESIZE. The extra-keys bar sits in the remaining
+    // content above the IME.
     let window_soft_raw = pool.string("16");
     let config_raw = pool.string("1200");
     let action_main = pool.string("android.intent.action.MAIN");

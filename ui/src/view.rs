@@ -34,13 +34,17 @@ use crate::{
 };
 use crate::{codec_choice_for, last_session, predicted_pair, Predicted};
 use etherquic::discover::Found;
+use etherquic::negotiate::{YuvChroma, YuvDepth};
 use etherquic::{BackendProbe, MediaBackend};
 use etherquic_play::{
     display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
 };
-use etherquic_play::{CursorMode, Look, ScaleMode, SizeMatch, PAD_SLOTS};
+use etherquic_play::{CursorMode, Dither, Look, ScaleMode, SizeMatch, PAD_SLOTS};
 
 use crate::badge::os_badge;
+use crate::extra_keys::{self, ExtraKey, ExtraMods, Tap};
+use crate::overlay::{self, Dir, OverlayItem, OverlayRuntime, Side};
+use crate::update::{self, Status as UpdateStatus};
 use crate::scan::Scan;
 use gpui::{
     anchored, canvas, deferred, div, fill, img, point, prelude::*, px, relative, rgb, size,
@@ -403,6 +407,12 @@ struct Desk {
     scroll_to_settings: u8,
     /// Left edge and width of the quality slider while the pointer is down.
     quality_drag: Option<(f32, f32)>,
+    /// Phone IME is requested open. Extra-keys sit above it while connected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    ime_open: bool,
+    extra_mods: ExtraMods,
+    overlay_run: OverlayRuntime,
+    update: UpdateStatus,
 }
 
 impl Desk {
@@ -492,6 +502,10 @@ impl Desk {
             settings_y: Rc::new(Cell::new(0.)),
             scroll_to_settings: 0,
             quality_drag: None,
+            ime_open: false,
+            extra_mods: ExtraMods::default(),
+            overlay_run: OverlayRuntime::default(),
+            update: UpdateStatus::Idle,
         };
         desk.refresh_devices(cx);
         desk.apply_settings(false);
@@ -688,6 +702,10 @@ impl Desk {
         }
         self.show_picture();
         self.message = None;
+        if self.link.role() != Role::Client {
+            self.hide_ime();
+            self.release_overlay();
+        }
     }
 
     fn show_host_service_prompt(&self) -> bool {
@@ -752,11 +770,364 @@ impl Desk {
             } else {
                 self.link.stop();
             }
+            self.hide_ime();
+            self.release_overlay();
             self.message = None;
             cx.notify();
             return;
         }
         self.open_typed_connection(cx);
+    }
+
+    fn hide_ime(&mut self) {
+        self.ime_open = false;
+        crate::link::set_soft_keyboard(false);
+    }
+
+    fn toggle_ime(&mut self) {
+        self.ime_open = !self.ime_open;
+        crate::link::set_soft_keyboard(self.ime_open);
+    }
+
+    fn on_extra_key(&mut self, key: ExtraKey, cx: &mut Context<Self>) {
+        match extra_keys::tap(key, &mut self.extra_mods) {
+            Tap::ToggleIme => self.toggle_ime(),
+            Tap::Keys(keys) => {
+                crate::link::send_player_keys(&keys);
+            }
+        }
+        cx.notify();
+    }
+
+    fn forward_session_key(&mut self, ev: &KeyDownEvent) -> bool {
+        if self.link.role() != Role::Client {
+            return false;
+        }
+        let keys = extra_keys::type_named(
+            &ev.keystroke.key,
+            ev.keystroke.modifiers.control,
+            ev.keystroke.modifiers.alt,
+            ev.keystroke.modifiers.shift,
+            &mut self.extra_mods,
+        );
+        if keys.is_empty() {
+            return false;
+        }
+        crate::link::send_player_keys(&keys)
+    }
+
+    fn extra_keys_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mods = self.extra_mods;
+        let ime_open = self.ime_open;
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .bg(rgb(0x1a1e27))
+            .border_t_1()
+            .border_color(rgb(CARD_EDGE))
+            .px_1()
+            .py_1()
+            .gap_1()
+            .children(extra_keys::default_rows().iter().map(|row| {
+                let keys = *row;
+                div()
+                    .flex()
+                    .flex_row()
+                    .w_full()
+                    .gap_1()
+                    .children(keys.iter().copied().map(|key| {
+                        let on = match key {
+                            ExtraKey::Keyboard => ime_open,
+                            other => mods.lit(other),
+                        };
+                        extra_key_chip(key, on, cx.listener(move |desk, _, _, cx| {
+                            desk.on_extra_key(key, cx);
+                        }))
+                    }))
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .w_full()
+                    .gap_1()
+                    .child(extra_session_chip(
+                        "ek-controls",
+                        if self.settings.overlay.visible {
+                            "HIDE PAD"
+                        } else {
+                            "CONTROLS"
+                        },
+                        self.settings.overlay.visible,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.toggle_overlay();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(extra_session_chip(
+                        "ek-edit-pad",
+                        if self.overlay_run.edit { "DONE" } else { "EDIT" },
+                        self.overlay_run.edit,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.toggle_overlay_edit();
+                            cx.notify();
+                        }),
+                    )),
+            )
+    }
+
+    fn overlay_active(&self) -> bool {
+        self.link.role() == Role::Client
+            && (self.settings.overlay.visible || self.overlay_run.edit)
+    }
+
+    fn sync_touch_pointer(&self) {
+        crate::link::set_touch_pointer(self.overlay_active());
+    }
+
+    fn release_overlay(&mut self) {
+        let events = overlay::release_all(&mut self.overlay_run);
+        crate::link::send_player_events(events);
+        self.overlay_run.edit = false;
+        crate::link::set_touch_pointer(false);
+    }
+
+    fn toggle_overlay(&mut self) {
+        let show = !self.settings.overlay.visible;
+        self.edit_settings(|settings| settings.overlay.visible = show);
+        if show && self.settings.overlay.is_empty() {
+            self.overlay_run.edit = true;
+        }
+        if !show {
+            self.overlay_run.edit = false;
+            let events = overlay::release_all(&mut self.overlay_run);
+            crate::link::send_player_events(events);
+        }
+        self.sync_touch_pointer();
+    }
+
+    fn toggle_overlay_edit(&mut self) {
+        self.overlay_run.edit = !self.overlay_run.edit;
+        if self.overlay_run.edit {
+            self.edit_settings(|settings| settings.overlay.visible = true);
+        }
+        self.sync_touch_pointer();
+    }
+
+    fn overlay_add(&mut self, item: OverlayItem) {
+        let side = self.overlay_run.add_side;
+        self.edit_settings(|settings| settings.overlay.add(side, item));
+        self.sync_touch_pointer();
+    }
+
+    fn overlay_remove(&mut self, side: Side, index: usize) {
+        self.edit_settings(|settings| settings.overlay.remove(side, index));
+    }
+
+    fn overlay_preset(&mut self, layout: overlay::OverlayLayout) {
+        self.edit_settings(|settings| {
+            settings.overlay = layout;
+            settings.overlay.visible = true;
+        });
+        self.overlay_run.edit = true;
+        self.sync_touch_pointer();
+    }
+
+    fn emit_overlay(&mut self, events: Vec<etherquic_input::Event>, cx: &mut Context<Self>) {
+        crate::link::send_player_events(events);
+        cx.notify();
+    }
+
+    fn overlay_hold(&mut self, item: OverlayItem, down: bool, cx: &mut Context<Self>) {
+        let events = overlay::hold(item, down, &mut self.overlay_run);
+        self.emit_overlay(events, cx);
+    }
+
+    fn overlay_dir(&mut self, item: OverlayItem, dir: Dir, down: bool, cx: &mut Context<Self>) {
+        let events = overlay::hold_dir(item, dir, down, &mut self.overlay_run);
+        self.emit_overlay(events, cx);
+    }
+
+    fn overlay_stick_down(&mut self, side: Side, index: usize, ev: &MouseDownEvent) {
+        overlay::stick_down(
+            side,
+            index,
+            f32::from(ev.position.x),
+            f32::from(ev.position.y),
+            &mut self.overlay_run,
+        );
+    }
+
+    fn overlay_stick_drag(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(touch) = self.overlay_run.stick else {
+            return;
+        };
+        let Some(item) = self
+            .settings
+            .overlay
+            .column(touch.side)
+            .get(touch.index)
+            .copied()
+        else {
+            return;
+        };
+        let events = overlay::stick_move(
+            f32::from(ev.position.x),
+            f32::from(ev.position.y),
+            item,
+            &mut self.overlay_run,
+        );
+        self.emit_overlay(events, cx);
+    }
+
+    fn overlay_stick_up(&mut self, cx: &mut Context<Self>) {
+        let Some(touch) = self.overlay_run.stick else {
+            return;
+        };
+        let Some(item) = self
+            .settings
+            .overlay
+            .column(touch.side)
+            .get(touch.index)
+            .copied()
+        else {
+            self.overlay_run.stick = None;
+            return;
+        };
+        let events = overlay::stick_up(item, &mut self.overlay_run);
+        self.emit_overlay(events, cx);
+    }
+
+    fn overlay_layer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let edit = self.overlay_run.edit;
+        let add_side = self.overlay_run.add_side;
+        let layout = self.settings.overlay.clone();
+        let stick = self.overlay_run.stick;
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .justify_end()
+            .when(edit, |layer| {
+                layer.child(self.overlay_editor(add_side, cx))
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .justify_between()
+                    .w_full()
+                    .p_2()
+                    .gap_2()
+                    .child(overlay_column(Side::Left, &layout.left, edit, stick, cx))
+                    .child(overlay_column(Side::Middle, &layout.middle, edit, stick, cx))
+                    .child(overlay_column(Side::Right, &layout.right, edit, stick, cx)),
+            )
+    }
+
+    fn overlay_editor(&mut self, add_side: Side, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .p_2()
+            .bg(rgb(0x12141a))
+            .border_b_1()
+            .border_color(rgb(CARD_EDGE))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(small_chip(
+                        "ov-game",
+                        "Game pad",
+                        None,
+                        true,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.overlay_preset(overlay::preset_game());
+                            cx.notify();
+                        }),
+                    ))
+                    .child(small_chip(
+                        "ov-arrows",
+                        "WASD + arrows",
+                        None,
+                        true,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.overlay_preset(overlay::preset_arrows());
+                            cx.notify();
+                        }),
+                    ))
+                    .child(small_chip(
+                        "ov-clear",
+                        "Clear",
+                        None,
+                        true,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.overlay_preset(overlay::OverlayLayout {
+                                visible: true,
+                                ..overlay::OverlayLayout::default()
+                            });
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .children(Side::ALL.iter().copied().map(|side| {
+                        small_chip(
+                            SharedString::from(format!("ov-side-{}", side.token())),
+                            side.label(),
+                            (add_side == side).then_some(PLAYER_BLUE),
+                            true,
+                            cx.listener(move |desk, _, _, cx| {
+                                desk.overlay_run.add_side = side;
+                                cx.notify();
+                            }),
+                        )
+                    })),
+            )
+            .child(muted_line(
+                "Pick a column, then tap a control to add it. Sticks, d-pads, and arrow clusters go on the left or right.".into(),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(overlay::catalog().iter().copied().map(|item| {
+                        let label = item.label();
+                        div()
+                            .id(SharedString::from(format!("ov-add-{}", item.token())))
+                            .flex()
+                            .flex_none()
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(CARD_EDGE))
+                            .bg(rgb(CARD))
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(cx.listener(move |desk, _, _, cx| {
+                                desk.overlay_add(item);
+                                cx.notify();
+                            }))
+                    })),
+            )
     }
 
     /// Start another player connection. A host session that is already open
@@ -1235,6 +1606,8 @@ impl Desk {
         let tabs = self.transport_tabs(cx);
         let video = self.codec_row(Menu::Video, cx);
         let audio = self.codec_row(Menu::Audio, cx);
+        let dirty_on = self.settings.dirty_rects;
+        let quality = self.picture_quality_slider("connect-quality", cx);
         div()
             .flex()
             .flex_col()
@@ -1289,6 +1662,11 @@ impl Desk {
                         cx.notify();
                     }))
                     .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, window, cx| {
+                        if desk.forward_session_key(ev) {
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
                         if ev.keystroke.key == "enter" {
                             desk.on_connect(window, cx);
                             return;
@@ -1299,6 +1677,23 @@ impl Desk {
             )
             .child(video)
             .child(audio)
+            .child(quality)
+            .child(self.yuv_pick_row("connect-yuv", cx))
+            .child(muted_line(
+                "PyroWave colour. 4:4:4 keeps every chroma sample. 4:2:2 and 4:2:0 subsample. 10-bit feeds the encoder finer YUV. MJPEG and the other codecs ignore this.".into(),
+            ))
+            .child(toggle_row(
+                "connect-dirty-rects",
+                "Send only changed tiles",
+                dirty_on,
+                cx.listener(|desk, _, _, cx| {
+                    desk.edit_settings(|settings| settings.dirty_rects = !settings.dirty_rects);
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "Asked of the host, like the codec. If it supports dirty rectangles it skips an unchanged picture, and with MJPEG or MJ2K it encodes only the tiles that moved.".into(),
+            ))
             .child(action_button(
                 "connect-btn",
                 label,
@@ -1308,6 +1703,19 @@ impl Desk {
                     desk.on_connect(window, cx);
                 }),
             ))
+            .when(cfg!(target_os = "android"), |card| {
+                let open = self.ime_open;
+                card.child(small_chip(
+                    "connect-keyboard",
+                    if open { "Hide keyboard" } else { "Show keyboard" },
+                    open.then_some(PLAYER_BLUE),
+                    true,
+                    cx.listener(|desk, _, _, cx| {
+                        desk.toggle_ime();
+                        cx.notify();
+                    }),
+                ))
+            })
             .child(disclosure(
                 "connect-more",
                 "Connection path",
@@ -2523,6 +2931,45 @@ impl Desk {
         self.set_quality(((t * 99.0).round() as u8).saturating_add(1), persist);
     }
 
+    fn yuv_pick_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        let yuv = self.settings.yuv;
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .w_full()
+            .child(pick_row(
+                SharedString::from(format!("{id}-chroma")),
+                format!("Chroma {}", yuv.chroma.label()),
+                cx.listener(|desk, _, _, cx| {
+                    let all = YuvChroma::ALL;
+                    let i = all
+                        .iter()
+                        .position(|item| *item == desk.settings.yuv.chroma)
+                        .unwrap_or(0);
+                    desk.edit_settings(|settings| {
+                        settings.yuv.chroma = all[(i + 1) % all.len()];
+                    });
+                    cx.notify();
+                }),
+            ))
+            .child(pick_row(
+                SharedString::from(format!("{id}-depth")),
+                yuv.depth.label().to_string(),
+                cx.listener(|desk, _, _, cx| {
+                    let all = YuvDepth::ALL;
+                    let i = all
+                        .iter()
+                        .position(|item| *item == desk.settings.yuv.depth)
+                        .unwrap_or(0);
+                    desk.edit_settings(|settings| {
+                        settings.yuv.depth = all[(i + 1) % all.len()];
+                    });
+                    cx.notify();
+                }),
+            ))
+    }
+
     fn picture_quality_slider(
         &mut self,
         id: &'static str,
@@ -2628,6 +3075,10 @@ impl Desk {
     }
 
     fn on_drag_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.overlay_run.stick.is_some() {
+            self.overlay_stick_drag(ev, cx);
+            return;
+        }
         if let Some((left, width)) = self.quality_drag {
             if ev.pressed_button != Some(MouseButton::Left) {
                 self.quality_drag = None;
@@ -2812,6 +3263,8 @@ impl Desk {
         let skip_on = applied.skip_without_hw;
         let trace_on = applied.trace_input;
         let custom = applied.custom;
+        let dirty_on = self.settings.dirty_rects;
+        let quality = self.picture_quality_slider("conn-quality", cx);
         div()
             .flex()
             .flex_col()
@@ -2830,6 +3283,27 @@ impl Desk {
             .child(section_label("Picture"))
             .child(picture)
             .when_some(video_line, |panel, line| panel.child(muted_line(line)))
+            .child(section_label("Quality"))
+            .child(quality)
+            .child(muted_line(
+                "Applies to an open view at once. MJPEG uses this as JPEG quality (7% is very small files). PyroWave and the other codecs scale their default bitrate from 40%.".into(),
+            ))
+            .child(self.yuv_pick_row("conn-yuv", cx))
+            .child(muted_line(
+                "PyroWave colour asked of this host. 4:2:2 is sent as 4:4:4 after a horizontal chroma upsample.".into(),
+            ))
+            .child(toggle_row(
+                "conn-dirty-rects",
+                "Send only changed tiles",
+                dirty_on,
+                cx.listener(|desk, _, _, cx| {
+                    desk.edit_settings(|settings| settings.dirty_rects = !settings.dirty_rects);
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "Asked of this host, like the picture codec. If it supports dirty rectangles it skips an unchanged picture, and with MJPEG or MJ2K it encodes only the tiles that moved.".into(),
+            ))
             .child(section_label("Audio"))
             .child(sound)
             .when_some(audio_line, |panel, line| panel.child(muted_line(line)))
@@ -2838,11 +3312,6 @@ impl Desk {
             .child(muted_line(format!(
                 "Auto uses this computer's rate when the picture is hardware-encoded. Without that, Auto is {SOFTWARE_FPS} fps. A host that does not read a rate still sends its own."
             )))
-            .child(section_label("Quality"))
-            .child(self.picture_quality_slider("conn-quality", cx))
-            .child(muted_line(
-                "Applies to an open view at once. MJPEG uses this as JPEG quality (7% is very small files). PyroWave and the other codecs scale their default bitrate from 40%.".into(),
-            ))
             .child(
                 div()
                     .flex()
@@ -3177,6 +3646,60 @@ impl Desk {
         self.apply_settings(true);
     }
 
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.update,
+            UpdateStatus::Checking | UpdateStatus::Downloading { .. }
+        ) {
+            return;
+        }
+        self.update = UpdateStatus::Checking;
+        let beta = self.settings.beta_releases;
+        let task = cx.background_executor().spawn(async move { update::check(beta) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.update = match result {
+                    Ok(status) => status,
+                    Err(err) => UpdateStatus::Failed(err),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateStatus::Available(offer) = self.update.clone() else {
+            return;
+        };
+        let tag = offer.tag.clone();
+        self.update = UpdateStatus::Downloading { tag: tag.clone() };
+        let task = cx.background_executor().spawn(async move { update::install(&offer) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.update = match result {
+                    Ok(detail) => UpdateStatus::Installed { tag, detail },
+                    Err(err) => UpdateStatus::Failed(err),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_update_page(&mut self) {
+        let url = match &self.update {
+            UpdateStatus::Available(offer) => offer.page.clone(),
+            UpdateStatus::NoPackage { page, .. } => page.clone(),
+            _ => format!("https://github.com/{}/releases", update::REPO),
+        };
+        if let Err(err) = update::open_url(&url) {
+            self.update = UpdateStatus::Failed(err);
+        }
+    }
+
     /// Make the current value of `fields` the user's default.
     fn make_default(&mut self, fields: &[Field]) {
         for field in fields {
@@ -3218,7 +3741,7 @@ impl Desk {
                     self.session_audio = None;
                 }
                 Section::Input => self.trace_input = false,
-                Section::Appearance | Section::Network | Section::Language => {}
+                Section::Appearance | Section::Network | Section::Language | Section::Updates => {}
             }
         }
         self.persist();
@@ -3450,6 +3973,8 @@ impl Desk {
             self.session_video.or(saved.video),
             self.session_audio.or(saved.audio),
             self.settings.quality,
+            self.settings.dirty_rects,
+            self.settings.yuv,
         )
     }
 
@@ -4027,9 +4552,15 @@ impl Desk {
         let scale = self.settings.scale;
         let size_match = self.settings.size_match;
         let look = self.settings.look;
+        let dither = self.settings.dither;
+        let pixel_size = self.settings.pixel_size;
+        let dither_strength = self.settings.dither_strength;
         let default_scale = self.defaults.scale;
         let default_size = self.defaults.size_match;
         let default_look = self.defaults.look;
+        let default_dither = self.defaults.dither;
+        let default_pixel_size = self.defaults.pixel_size;
+        let default_strength = self.defaults.dither_strength;
         let mut scales = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
         for mode in ScaleMode::ALL {
             scales = scales.child(with_default(
@@ -4083,9 +4614,60 @@ impl Desk {
                 default_look == choice,
             ));
         }
+        let mut dithers = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for choice in Dither::ALL {
+            dithers = dithers.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("dither-{}", choice.token())),
+                    choice.label(),
+                    dither == choice,
+                    160.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.dither = choice);
+                        cx.notify();
+                    }),
+                ),
+                default_dither == choice,
+            ));
+        }
+        let mut sizes_px = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for size in [1u8, 2, 4, 8, 16] {
+            sizes_px = sizes_px.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("pixel-size-{size}")),
+                    format!("{size} px"),
+                    pixel_size == size,
+                    72.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.pixel_size = size);
+                        cx.notify();
+                    }),
+                ),
+                default_pixel_size == size,
+            ));
+        }
+        let mut strengths = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for amount in [0u8, 30, 60, 100] {
+            strengths = strengths.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("dither-strength-{amount}")),
+                    format!("{amount}%"),
+                    dither_strength == amount,
+                    72.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.dither_strength = amount);
+                        cx.notify();
+                    }),
+                ),
+                default_strength == amount,
+            ));
+        }
         let scale_head = self.field_head("Scale to fit", &[Field::Scale], cx);
         let size_head = self.field_head("Resolution matching", &[Field::SizeMatch], cx);
         let look_head = self.field_head("Picture look", &[Field::Look], cx);
+        let dither_head = self.field_head("Dither", &[Field::Dither], cx);
+        let pixel_head = self.field_head("Pixel size", &[Field::PixelSize], cx);
+        let strength_head = self.field_head("Dither strength", &[Field::DitherStrength], cx);
         let appearance_body = div()
             .flex()
             .flex_col()
@@ -4098,11 +4680,17 @@ impl Desk {
             .child(sizes)
             .child(look_head)
             .child(looks)
+            .child(pixel_head)
+            .child(sizes_px)
+            .child(dither_head)
+            .child(dithers)
+            .child(strength_head)
+            .child(strengths)
             .child(muted_line(
                 "Scale and resolution matching apply to an open view at once. Host matches window is not available: hosts do not change their resolution yet.".into(),
             ))
             .child(muted_line(
-                "Picture look is painted by the host before it sends the frame, and it applies to an open view at once. Poster flattens each colour so the stream is simpler. Game Boy, PICO-8, CGA, 1-bit, Newsprint, Endesga, and Sweetie use those palettes, in solid blocks.".into(),
+                "Picture look is painted by the host before it encodes, and it applies to an open view at once. Off leaves the capture. Blocks only downsamples. Poster flattens each channel. The other names are Lospec palettes from Image-to-Pixel. Pixel size is source pixels per block. Ordered dither (Bayer, cluster, lines, blue noise) is stable on video; error diffusion (Floyd–Steinberg and the rest) can flicker between frames.".into(),
             ));
         let appearance = self.section(Section::Appearance, Some(render), appearance_body, cx);
 
@@ -4134,7 +4722,7 @@ impl Desk {
                 }),
             ))
             .child(muted_line(
-                "When this PC hosts: skip a picture that did not change. The pointer already rides its own record. With MJPEG or MJ2K, and a player that knows dirty rectangles, only the changed tiles are encoded. Inter-frame codecs still encode a full picture when anything moved. Off by default.".into(),
+                "The same control as on the Connect card. When you view a host, it is sent in the offer. A host that supports it skips an unchanged picture. With MJPEG or MJ2K, only the changed tiles are encoded. Inter-frame codecs still encode a full picture when anything moved. When this PC hosts, it also applies for a player that does not send the request. Off by default.".into(),
             ));
         let capture_section =
             self.section(Section::Capture, Some(capture_backends), capture_body, cx);
@@ -4435,6 +5023,11 @@ impl Desk {
             .child(quality_slider)
             .child(muted_line(
                 "Applies to an open view at once. MJPEG uses this percent as JPEG quality. PyroWave and H.264/H.265/AV1 scale their default bitrate from 40%.".into(),
+            ))
+            .child(self.field_head("PyroWave colour", &[Field::Yuv], cx))
+            .child(self.yuv_pick_row("settings-yuv", cx))
+            .child(muted_line(
+                "4:4:4 keeps every chroma sample. 4:2:2 is sent as 4:4:4 after a horizontal upsample. 10-bit feeds the encoder finer YUV. Older players stay on 4:2:0 8-bit.".into(),
             ));
         let codecs = self.section(Section::Codecs, None, codecs_body, cx);
 
@@ -4722,6 +5315,89 @@ impl Desk {
             .child(muted_line("More languages are not translated yet.".into()));
         let language = self.section(Section::Language, None, language_body, cx);
 
+        let beta = self.settings.beta_releases;
+        let checking = matches!(
+            self.update,
+            UpdateStatus::Checking | UpdateStatus::Downloading { .. }
+        );
+        let installable = matches!(self.update, UpdateStatus::Available(_));
+        let update_line = match &self.update {
+            UpdateStatus::Idle => format!("This build is {}.", etherquic::RELEASE),
+            UpdateStatus::Checking => "Checking GitHub tagged releases…".into(),
+            UpdateStatus::Current { latest } => {
+                format!("This build is {}. {} is the latest tag.", etherquic::RELEASE, latest)
+            }
+            UpdateStatus::Available(offer) => {
+                let kind = if offer.prerelease { "beta" } else { "release" };
+                format!(
+                    "{} {} is available ({}). This build is {}.",
+                    offer.tag,
+                    kind,
+                    offer.asset_name,
+                    etherquic::RELEASE
+                )
+            }
+            UpdateStatus::NoPackage { tag, .. } => format!(
+                "{} is newer than {}, and GitHub has no installer for this computer.",
+                tag,
+                etherquic::RELEASE
+            ),
+            UpdateStatus::Downloading { tag } => format!("Downloading {tag}…"),
+            UpdateStatus::Installed { detail, .. } => detail.clone(),
+            UpdateStatus::Failed(err) => err.clone(),
+        };
+        let updates_body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(muted_line(update_line))
+            .child(toggle_chip(
+                "beta-releases",
+                "Beta releases",
+                beta,
+                Some(self.defaults.beta_releases),
+                cx.listener(|desk, _, _, cx| {
+                    desk.edit_settings(|settings| settings.beta_releases = !settings.beta_releases);
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "Off uses the latest GitHub release. On also considers pre-release tags.".into(),
+            ))
+            .child(action_button(
+                "check-updates",
+                "Check for updates",
+                !checking,
+                PLAYER_BLUE,
+                cx.listener(|desk, _, _, cx| {
+                    desk.check_updates(cx);
+                    cx.notify();
+                }),
+            ))
+            .child(action_button(
+                "install-update",
+                "Download and install",
+                installable && !checking,
+                HOST_GREEN,
+                cx.listener(|desk, _, _, cx| {
+                    desk.install_update(cx);
+                    cx.notify();
+                }),
+            ))
+            .child(small_chip(
+                SharedString::from("open-releases"),
+                "Open on GitHub",
+                None,
+                true,
+                cx.listener(|desk, _, _, cx| {
+                    desk.open_update_page();
+                    cx.notify();
+                }),
+            ));
+        let updates = self.section(Section::Updates, None, updates_body, cx);
+
         // This computer's own picks, from its discovery record.
         let computer = self
             .peer
@@ -4778,6 +5454,7 @@ impl Desk {
             .child(input)
             .child(network)
             .child(language)
+            .child(updates)
             .child(
                 div()
                     .flex()
@@ -4957,6 +5634,12 @@ impl Render for Desk {
                     }),
             );
 
+        let playing = self.link.role() == Role::Client;
+        let extra_keys = (cfg!(target_os = "android") && playing)
+            .then(|| self.extra_keys_bar(cx));
+        let overlay = (cfg!(target_os = "android") && self.overlay_active())
+            .then(|| self.overlay_layer(cx));
+        self.sync_touch_pointer();
         div()
             .flex()
             .flex_col()
@@ -4964,12 +5647,19 @@ impl Render for Desk {
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .text_sm()
+            .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, _, cx| {
+                if desk.forward_session_key(ev) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_mouse_move(cx.listener(|desk, ev: &MouseMoveEvent, _, cx| {
                 desk.on_drag_move(ev, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|desk, _: &MouseUpEvent, _, cx| {
+                    desk.overlay_stick_up(cx);
                     let quality = desk.quality_drag.take().is_some();
                     let bar = desk.drag.take().is_some();
                     if quality {
@@ -4983,6 +5673,7 @@ impl Render for Desk {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|desk, _: &MouseUpEvent, _, cx| {
+                    desk.overlay_stick_up(cx);
                     let quality = desk.quality_drag.take().is_some();
                     let bar = desk.drag.take().is_some();
                     if quality {
@@ -5085,8 +5776,10 @@ impl Render for Desk {
                             .track_scroll(&self.page_scroll)
                             .child(content),
                     )
-                    .child(page_bar),
+                    .child(page_bar)
+                    .when_some(overlay, |layer, pad| layer.child(pad)),
             )
+            .when_some(extra_keys, |root, bar| root.child(bar))
     }
 }
 
@@ -5320,6 +6013,260 @@ fn chevron(open: bool) -> impl IntoElement {
         }
         shape.child(row)
     }
+}
+
+fn extra_session_chip(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    on: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    extra_key_chip_label(id, label, on, on_click)
+}
+
+fn extra_key_chip_label(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    on: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_1()
+        .h(px(36.))
+        .min_w(px(36.))
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { 0x12141a }))
+        .text_color(rgb(if on { PLAYER_BLUE } else { TEXT }))
+        .font_weight(if on { FontWeight::BOLD } else { FontWeight::NORMAL })
+        .cursor_pointer()
+        .child(label)
+        .on_click(on_click)
+}
+
+fn overlay_column(
+    side: Side,
+    items: &[OverlayItem],
+    edit: bool,
+    stick: Option<overlay::StickTouch>,
+    cx: &Context<Desk>,
+) -> impl IntoElement {
+    let mut col = div().flex().flex_col().gap_2().items_center();
+    for (index, item) in items.iter().copied().enumerate() {
+        col = col.child(overlay_widget(side, index, item, edit, stick, cx));
+    }
+    col
+}
+
+fn overlay_widget(
+    side: Side,
+    index: usize,
+    item: OverlayItem,
+    edit: bool,
+    stick: Option<overlay::StickTouch>,
+    cx: &Context<Desk>,
+) -> AnyElement {
+    let body = if item.is_stick() {
+        let (nx, ny) = match stick {
+            Some(touch) if touch.side == side && touch.index == index => (touch.nx, touch.ny),
+            _ => (0.0, 0.0),
+        };
+        overlay_stick(side, index, nx, ny, cx).into_any_element()
+    } else if item.is_cluster() {
+        overlay_cluster(item, cx).into_any_element()
+    } else {
+        overlay_button(item, cx).into_any_element()
+    };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .child(body)
+        .when(edit, |wrap| {
+            wrap.child(
+                div()
+                    .id(SharedString::from(format!("ov-x-{}-{index}", side.token())))
+                    .px_2()
+                    .text_color(rgb(DANGER))
+                    .cursor_pointer()
+                    .child("×")
+                    .on_click(cx.listener(move |desk, _, _, cx| {
+                        desk.overlay_remove(side, index);
+                        cx.notify();
+                    })),
+            )
+        })
+        .into_any_element()
+}
+
+fn overlay_stick(
+    side: Side,
+    index: usize,
+    nx: f32,
+    ny: f32,
+    cx: &Context<Desk>,
+) -> impl IntoElement {
+    let thumb_x = 56.0 + nx * 36.0 - 18.0;
+    let thumb_y = 56.0 - ny * 36.0 - 18.0;
+    div()
+        .id(SharedString::from(format!("ov-stick-{}-{index}", side.token())))
+        .relative()
+        .w(px(112.))
+        .h(px(112.))
+        .rounded_full()
+        .bg(rgb(0x1a1e27))
+        .border_2()
+        .border_color(rgb(CARD_EDGE))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |desk, ev: &MouseDownEvent, _, cx| {
+                desk.overlay_stick_down(side, index, ev);
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(thumb_x))
+                .top(px(thumb_y))
+                .w(px(36.))
+                .h(px(36.))
+                .rounded_full()
+                .bg(rgb(PLAYER_BLUE)),
+        )
+}
+
+fn overlay_cluster(item: OverlayItem, cx: &Context<Desk>) -> impl IntoElement {
+    let cell = |dir: Dir, label: &'static str| {
+        overlay_hold_cell(
+            SharedString::from(format!("ov-{}-{}", item.token(), label)),
+            label,
+            cx.listener(move |desk, ev: &MouseDownEvent, _, cx| {
+                let _ = ev;
+                desk.overlay_dir(item, dir, true, cx);
+                cx.stop_propagation();
+            }),
+            cx.listener(move |desk, _: &MouseUpEvent, _, cx| {
+                desk.overlay_dir(item, dir, false, cx);
+                cx.stop_propagation();
+            }),
+        )
+    };
+    let (up, left, down, right) = match item {
+        OverlayItem::Wasd => ("W", "A", "S", "D"),
+        OverlayItem::Arrows => ("↑", "←", "↓", "→"),
+        _ => ("▲", "◀", "▼", "▶"),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(overlay_spacer())
+                .child(cell(Dir::Up, up))
+                .child(overlay_spacer()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(cell(Dir::Left, left))
+                .child(cell(Dir::Down, down))
+                .child(cell(Dir::Right, right)),
+        )
+}
+
+fn overlay_button(item: OverlayItem, cx: &Context<Desk>) -> AnyElement {
+    let label = item.label();
+    overlay_hold_cell(
+        SharedString::from(format!("ov-btn-{}", item.token())),
+        label,
+        cx.listener(move |desk, _: &MouseDownEvent, _, cx| {
+            desk.overlay_hold(item, true, cx);
+            cx.stop_propagation();
+        }),
+        cx.listener(move |desk, _: &MouseUpEvent, _, cx| {
+            desk.overlay_hold(item, false, cx);
+            cx.stop_propagation();
+        }),
+    )
+    .into_any_element()
+}
+
+fn overlay_spacer() -> impl IntoElement {
+    div().w(px(44.)).h(px(44.))
+}
+
+fn overlay_hold_cell(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    on_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_up: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_up = Rc::new(on_up);
+    let up = on_up.clone();
+    div()
+        .id(id)
+        .flex()
+        .w(px(44.))
+        .h(px(44.))
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(CARD_EDGE))
+        .bg(rgb(0x1a1e27))
+        .text_color(rgb(TEXT))
+        .cursor_pointer()
+        .child(label.into())
+        .on_mouse_down(MouseButton::Left, on_down)
+        .on_mouse_up(MouseButton::Left, move |ev, window, cx| up(ev, window, cx))
+        .on_mouse_up_out(MouseButton::Left, move |ev, window, cx| on_up(ev, window, cx))
+}
+
+fn extra_key_chip(
+    key: ExtraKey,
+    on: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = if key == ExtraKey::Keyboard {
+        if on {
+            "HIDE KB"
+        } else {
+            "KEYBOARD"
+        }
+    } else {
+        key.label()
+    };
+    div()
+        .id(key.id())
+        .flex()
+        .flex_1()
+        .h(px(36.))
+        .min_w(px(36.))
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
+        .bg(rgb(if on { 0x243044 } else { 0x12141a }))
+        .text_color(rgb(if on { PLAYER_BLUE } else { TEXT }))
+        .font_weight(if on { FontWeight::BOLD } else { FontWeight::NORMAL })
+        .cursor_pointer()
+        .child(label)
+        .on_click(on_click)
 }
 
 fn small_chip(
@@ -6474,6 +7421,28 @@ fn column_owned(title: String, body: impl IntoElement) -> impl IntoElement {
 }
 
 /// A full-width on/off row.
+fn pick_row(
+    id: SharedString,
+    label: String,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .h(px(32.))
+        .px_2()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(CARD_EDGE))
+        .bg(rgb(CARD))
+        .cursor_pointer()
+        .child(label)
+        .on_click(on_click)
+}
+
 fn toggle_row(
     id: &'static str,
     label: &'static str,

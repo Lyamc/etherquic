@@ -41,6 +41,8 @@ fn main() {
             fps: 30,
             kbps: 0,
             quality: 0,
+            yuv: etherquic_media::negotiate::YuvFormat::YUV420P8,
+            dirty_rects: false,
         };
         let sink: etherquic_media::Sink<Vec<u8>> = Arc::new(move |b: Vec<u8>| {
             rx.lock().unwrap().push(b);
@@ -79,7 +81,13 @@ fn main() {
                 *g.lock().unwrap() += 1;
                 true
             });
-            match VideoDecoder::open(video, w, h, sink) {
+            match VideoDecoder::open(
+                video,
+                w,
+                h,
+                sink,
+                etherquic_media::negotiate::YuvFormat::YUV420P8,
+            ) {
                 Ok(mut dec) => {
                     for r in &records {
                         if let Err(e) = dec.push(r) {

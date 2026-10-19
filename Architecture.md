@@ -76,7 +76,9 @@ The host opens the picture stream and the audio stream before it accepts input, 
 
 After the kind, every record is a little-endian `u32` length and then that many bytes. A record over 12 MiB is rejected. A clean end of stream before the next length finishes that stream.
 
-The live path negotiates PyroWave, MJPEG, or H.264. H.265 and AV1 hardware sit ahead of those in the preference list, and CPU PyroWave sits last. When both ends agree on ALPN `etherquic/2`, the picture stream is `EVI2` and the audio stream is `EAU2`: a config record, then coded bytes. Quality applies to MJPEG. A player that lists `knows dirty-rects` can receive type-`R` patch records for MJPEG and MJ2K when the host has dirty rectangles on. An unchanged picture is not encoded; the pointer still rides its own cursor record.
+The live path negotiates PyroWave, MJPEG, or H.264. H.265 and AV1 hardware sit ahead of those in the preference list. JPEG XS and OpenAPV (ffmpeg intra) sit after GPU PyroWave. CPU PyroWave sits last. When both ends agree on ALPN `etherquic/2`, the picture stream is `EVI2` and the audio stream is `EAU2`: a config record, then coded bytes. Quality applies to MJPEG. The player asks for dirty rectangles with `dirty-rects 1` in the offer, the same way it names a codec. StreamConfig echoes what the host is doing: `dirty-rects patches` (MJPEG/MJ2K may send type-`R` tiles: u16le x,y,w,h then a complete JPEG or JPEG 2000), `dirty-rects pskip` (H.264/H.265/AV1, PyroWave, JPEG XS, and OpenAPV skip unchanged pictures and send a full `D` when anything moved; temporal ffmpeg opens with `-bf 0` and a long or infinite GOP), or `dirty-rects off` (every captured picture is a full `D`). A missing config line is off. A live toggle reopens the encoder. The pointer still rides its own cursor record. An older player that omits the offer line leaves the host's own Settings toggle in place and never receives `R` without `knows dirty-rects`.
+
+PyroWave colour is `yuv 420p8`, `422p8`, `444p8`, `420p10`, `422p10`, or `444p10`. A new player also lists `knows yuv-444` and defaults to `444p8`. The sequence header has one chroma bit, so 4:2:2 is encoded as 4:4:4 after a horizontal chroma upsample. 10-bit is the CPU buffer (10 LSBs, native endian); it is not a bitstream flag. StreamConfig writes `yuv` only when the bitstream is not 4:2:0 8-bit. An older player with no `yuv` line, or 4:2:2/4:4:4 without `knows yuv-444`, stays on 4:2:0 at the requested depth.
 
 An original `EVID` payload is a JPEG. The decoder treats `FF D8` as JPEG and an `EINT` prefix as an intra frame. An original `EAUD` payload is a little-endian sample rate (`u32`), a channel count (`u16`), and interleaved `i16` samples.
 
@@ -104,7 +106,7 @@ Version `1` ends there. Version `2` continues with a video list, an audio list, 
 | `0x20` | GStreamer |
 | `0x40` | libopus |
 
-Video ids are Pyrowave `1`, MJPEG `2`, H.264 `3`, H.265 `4`, AV1 `5`. Audio ids are PCM `1` and Opus `2`. Those rows describe the host. The live session picks from that catalog. A desktop settles on PyroWave, MJPEG, or H.264.
+Video ids are Pyrowave `1`, MJPEG `2`, H.264 `3`, H.265 `4`, AV1 `5`, MJ2K `6`, JPEG XS `7`, OpenAPV `8`. Audio ids are PCM `1` and Opus `2`. Those rows describe the host. The live session picks from that catalog. A desktop settles on PyroWave, MJPEG, or H.264. JPEG XS and OpenAPV are ffmpeg intra rows when that ffmpeg has them: `libsvtjpegxs` encode in NUT with codec tag `jxs`, `liboapv` encode with the raw `apv` mux and `apv` decode.
 
 ## File tools
 

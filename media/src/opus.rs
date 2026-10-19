@@ -44,10 +44,12 @@ pub fn library_candidates() -> Vec<PathBuf> {
         &["opus.dll", "libopus-0.dll", "libopus.dll"]
     } else if cfg!(target_os = "macos") {
         &["libopus.0.dylib", "libopus.dylib"]
+    } else if cfg!(target_os = "android") {
+        &["libopus.so", "libopus.so.0"]
     } else {
         &["libopus.so.0", "libopus.so"]
     };
-    let mut dirs = Vec::new();
+    let mut dirs = etherquic::native_library_dirs();
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
@@ -55,7 +57,9 @@ pub fn library_candidates() -> Vec<PathBuf> {
         if cfg!(target_os = "macos") {
             dirs.push(dir.join("../Frameworks"));
         }
-        dirs.push(dir);
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
     }
     if cfg!(windows) {
         dirs.push(PathBuf::from(r"C:\Program Files\etherquic"));

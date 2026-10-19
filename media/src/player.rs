@@ -33,6 +33,8 @@ pub fn offer_for(
     max: Limit,
     bitrate_kbps: u32,
     quality: u8,
+    want_dirty_rects: bool,
+    yuv: crate::negotiate::YuvFormat,
 ) -> Offer {
     let (video, audio) = decodes();
     build_offer(&OfferInput {
@@ -45,6 +47,8 @@ pub fn offer_for(
         max,
         bitrate_kbps,
         quality,
+        want_dirty_rects,
+        yuv,
     })
 }
 
@@ -152,6 +156,7 @@ pub async fn read_video(
                             config.width,
                             config.height,
                             counted.clone(),
+                            config.yuv,
                         ) {
                             Ok(dec) => decoder = Some((dec, video)),
                             Err(reason) => {

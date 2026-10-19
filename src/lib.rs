@@ -43,10 +43,10 @@ pub type Mac = [u8; 6];
 
 pub use addr::{peer_to_socket_addr, socket_addr_to_peer};
 pub use backend::{
-    default_backend_order, gpu_compute_present, nvidia_present, offer_from, offer_media,
-    pick_backend, probe_backends, pyrowave_hardware_encode, pyrowave_library_present,
-    pyrowave_ready, pyrowave_ready_with, selected_backend, widen_process_path, BackendProbe,
-    MediaBackend,
+    default_backend_order, gpu_compute_present, native_library_dir_from_maps, native_library_dirs,
+    nvidia_present, offer_from, offer_media, pick_backend, probe_backends,
+    pyrowave_hardware_encode, pyrowave_library_present, pyrowave_ready, pyrowave_ready_with,
+    selected_backend, widen_process_path, BackendProbe, MediaBackend,
 };
 pub use capture::{
     capture_active, capture_dir, capture_from_env, capture_start, capture_stop, note_app,

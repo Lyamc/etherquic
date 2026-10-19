@@ -7,7 +7,10 @@
 //! passes a higher version code so the package manager updates that id in place.
 //! The manifest targets SDK 35, allows `INTERNET` and `ACCESS_NETWORK_STATE`,
 //! and launches `android.app.NativeActivity` with `libetherquic_android.so`
-//! so the phone runs the same GPUI Desk as the desktop window.
+//! so the phone runs the same GPUI Desk as the desktop window. Codec
+//! libraries the host can send (`libopus.so`, `libpyrowave-shared.so`,
+//! `libffmpeg.so` with H.264/HEVC/AV1/OpenAPV/JPEG-XS) are packed next to it
+//! as unversioned `lib/arm64-v8a/lib*.so` so the package manager extracts them.
 //!
 //! Neither package is the Membrane NDIS driver under `windows/`.
 
@@ -19,6 +22,7 @@ mod dex;
 mod hash;
 mod zipstore;
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,11 +112,13 @@ pub fn build_android_package(output: &Path, version_code: u32, version_name: &st
     }
 
     let manifest = axml::manifest(APPLICATION_ID, version_code, version_name);
-    let native = android_library();
+    let natives = android_libraries();
     let mut files: Vec<(&str, &[u8])> = vec![("AndroidManifest.xml", manifest.as_slice())];
-    if let Some((name, bytes)) = native.as_ref() {
-        files.push((name.as_str(), bytes.as_slice()));
-    }
+    files.extend(
+        natives
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
     let unsigned_bytes = zipstore::store_zip(&files);
     let work = WorkDir::new("apk")?;
     let unsigned = work.path.join("unsigned.apk");
@@ -155,9 +161,51 @@ pub fn build_android_package(output: &Path, version_code: u32, version_name: &st
     Ok(())
 }
 
-/// `lib/arm64-v8a/libetherquic_android.so` when a release build of the
-/// NativeActivity crate is on disk, or `ETHERQUIC_ANDROID_SO` points at one.
-fn android_library() -> Option<(String, Vec<u8>)> {
+const ANDROID_JNI: &str = "lib/arm64-v8a";
+
+/// NativeActivity plus codec `.so` files the player dlopens or execs.
+///
+/// Android's package manager only extracts unversioned `lib*.so` names, so
+/// versioned SONAMEs (`libopus.so.0`) are skipped. `ETHERQUIC_ANDROID_SO`
+/// names the NativeActivity library; `ETHERQUIC_ANDROID_LIBS` is a directory
+/// of extra `lib*.so` files (opus, PyroWave, ffmpeg, and their deps).
+fn android_libraries() -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    push_jni(
+        &mut out,
+        &mut seen,
+        "libetherquic_android.so",
+        android_activity_library(),
+    );
+    for dir in android_codec_dirs() {
+        for (name, bytes) in android_jni_files_from(&dir) {
+            let file = name.rsplit('/').next().unwrap_or(&name).to_string();
+            push_jni(&mut out, &mut seen, &file, Some(bytes));
+        }
+    }
+    out
+}
+
+fn push_jni(
+    out: &mut Vec<(String, Vec<u8>)>,
+    seen: &mut BTreeSet<String>,
+    file: &str,
+    bytes: Option<Vec<u8>>,
+) {
+    let Some(bytes) = bytes else {
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    let name = format!("{ANDROID_JNI}/{file}");
+    if seen.insert(name.clone()) {
+        out.push((name, bytes));
+    }
+}
+
+fn android_activity_library() -> Option<Vec<u8>> {
     let path = std::env::var_os("ETHERQUIC_ANDROID_SO")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -166,9 +214,52 @@ fn android_library() -> Option<(String, Vec<u8>)> {
         });
     let bytes = fs::read(&path).ok()?;
     if bytes.is_empty() {
-        return None;
+        None
+    } else {
+        Some(bytes)
     }
-    Some(("lib/arm64-v8a/libetherquic_android.so".into(), bytes))
+}
+
+fn android_codec_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("ETHERQUIC_ANDROID_LIBS") {
+        dirs.push(PathBuf::from(path));
+    }
+    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("android/jni/arm64-v8a"));
+    dirs
+}
+
+/// Unversioned `lib*.so` files under `dir`, as APK zip paths.
+fn android_jni_files_from(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        names.push(entry.path());
+    }
+    names.sort();
+    for path in names {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !jni_so_name(name) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        out.push((format!("{ANDROID_JNI}/{name}"), bytes));
+    }
+    out
+}
+
+fn jni_so_name(name: &str) -> bool {
+    name.starts_with("lib") && name.ends_with(".so") && !name[3..name.len() - 3].contains('.')
 }
 
 fn stage_play_exe(dest: &Path, version: &str) -> Result<()> {
@@ -273,5 +364,53 @@ impl Drop for WorkDir {
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Error(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jni_so_names_are_unversioned_lib_dot_so() {
+        assert!(jni_so_name("libopus.so"));
+        assert!(jni_so_name("libpyrowave-shared.so"));
+        assert!(jni_so_name("libffmpeg.so"));
+        assert!(jni_so_name("libc++_shared.so"));
+        assert!(!jni_so_name("libopus.so.0"));
+        assert!(!jni_so_name("libpyrowave-shared.so.1"));
+        assert!(!jni_so_name("ffmpeg"));
+        assert!(!jni_so_name("notes.txt"));
+    }
+
+    #[test]
+    fn android_jni_dir_packs_codec_libraries_and_skips_sonames() {
+        let root = std::env::temp_dir().join(format!(
+            "etherquic-android-jni-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).expect("jni fixture dir");
+        fs::write(root.join("libopus.so"), b"opus").unwrap();
+        fs::write(root.join("libopus.so.0"), b"skip-soname").unwrap();
+        fs::write(root.join("libpyrowave-shared.so"), b"pyro").unwrap();
+        fs::write(root.join("libffmpeg.so"), b"ffmpeg").unwrap();
+        fs::write(root.join("notes.txt"), b"no").unwrap();
+        let names: Vec<String> = android_jni_files_from(&root)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            names,
+            vec![
+                "lib/arm64-v8a/libffmpeg.so".to_string(),
+                "lib/arm64-v8a/libopus.so".to_string(),
+                "lib/arm64-v8a/libpyrowave-shared.so".to_string(),
+            ]
+        );
     }
 }

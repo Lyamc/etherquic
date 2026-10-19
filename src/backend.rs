@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::discover::{
-    AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_AV1, VIDEO_H264, VIDEO_H265, VIDEO_MJ2K,
-    VIDEO_MJPEG, VIDEO_PYROWAVE,
+    AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_APV, VIDEO_AV1, VIDEO_H264, VIDEO_H265,
+    VIDEO_JPEGXS, VIDEO_MJ2K, VIDEO_MJPEG, VIDEO_PYROWAVE,
 };
 
 /// A tool that can encode and decode Opus.
@@ -83,17 +83,30 @@ pub fn probe_backends() -> BackendProbe {
     widen_process_path();
     BackendProbe {
         libopus: native_opus_present(),
-        ffmpeg: tool_runs("ffmpeg", "-version"),
+        ffmpeg: ffmpeg_present(),
         gstreamer: tool_runs("gst-inspect-1.0", "--version"),
     }
 }
 
+fn ffmpeg_present() -> bool {
+    if tool_runs("ffmpeg", "-version") {
+        return true;
+    }
+    native_library_dirs().into_iter().any(|dir| {
+        ["libffmpeg.so", "ffmpeg"]
+            .iter()
+            .any(|name| tool_runs_path(&dir.join(name), "-version"))
+    })
+}
+
 /// `libopus.dll` or `opus.dll` on Windows. `libopus.so` on other systems.
 fn native_opus_present() -> bool {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            dirs.push(parent.to_path_buf());
+    let mut dirs = native_library_dirs();
+    if dirs.is_empty() {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                dirs.push(parent.to_path_buf());
+            }
         }
     }
     #[cfg(windows)]
@@ -279,6 +292,57 @@ pub fn pyrowave_search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Directories that hold bundled native libraries for this process.
+///
+/// On Android, `current_exe()` is `/system/bin/app_process64`. The Package
+/// Manager extracts `lib/arm64-v8a/lib*.so` into `nativeLibraryDir`, which is
+/// the parent of `libetherquic_android.so` in `/proc/self/maps`.
+pub fn native_library_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = android_native_library_dir() {
+        dirs.push(dir);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let parent = parent.to_path_buf();
+            if !dirs.iter().any(|dir| dir == &parent) {
+                dirs.push(parent);
+            }
+        }
+    }
+    dirs
+}
+
+/// Parent of `libetherquic_android.so` as mapped in `/proc/self/maps`.
+pub fn native_library_dir_from_maps(maps: &str) -> Option<PathBuf> {
+    for line in maps.lines() {
+        let Some(path) = line.split_whitespace().last() else {
+            continue;
+        };
+        if let Some(dir) = path.strip_suffix("/libetherquic_android.so") {
+            if !dir.is_empty() {
+                return Some(PathBuf::from(dir));
+            }
+        }
+    }
+    None
+}
+
+fn android_native_library_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ETHERQUIC_NATIVE_LIBDIR") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        return native_library_dir_from_maps(&std::fs::read_to_string("/proc/self/maps").ok()?);
+    }
+    #[cfg(not(target_os = "android"))]
+    None
+}
+
 /// `libpyrowave-shared` beside this program, on the library path, or in the install directory.
 pub fn pyrowave_library_present() -> bool {
     if let Some(path) = std::env::var_os("ETHERQUIC_PYROWAVE") {
@@ -286,10 +350,12 @@ pub fn pyrowave_library_present() -> bool {
             return true;
         }
     }
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            dirs.push(parent.to_path_buf());
+    let mut dirs = native_library_dirs();
+    if dirs.is_empty() {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                dirs.push(parent.to_path_buf());
+            }
         }
     }
     #[cfg(windows)]
@@ -371,6 +437,26 @@ pub fn offer_from(
             pyrowave_ready(gpu, pyrowave_library_present()),
             false,
             false,
+            false,
+        ),
+        row(
+            VIDEO_JPEGXS,
+            false,
+            false,
+            false,
+            false,
+            false,
+            probe.ffmpeg,
+            false,
+        ),
+        row(
+            VIDEO_APV,
+            false,
+            false,
+            false,
+            false,
+            false,
+            probe.ffmpeg,
             false,
         ),
         row(VIDEO_MJ2K, false, false, false, false, false, false, false),
@@ -529,6 +615,8 @@ pub fn gpu_compute_present() -> bool {
         || std::env::var_os("VK_DRIVER_FILES").is_some()
         || Path::new("/dev/dri/renderD128").exists()
         || Path::new("/run/opengl-driver/lib/libvulkan.so.1").exists()
+        || Path::new("/system/lib64/libvulkan.so").exists()
+        || Path::new("/system/lib/libvulkan.so").exists()
 }
 
 /// No-op off Windows. The service account does not see the signed-in user's path.
@@ -542,7 +630,14 @@ pub fn widen_process_path() {
 }
 
 fn tool_runs(program: &str, arg: &str) -> bool {
-    let mut cmd = Command::new(program);
+    tool_runs_cmd(Command::new(program), arg)
+}
+
+fn tool_runs_path(path: &Path, arg: &str) -> bool {
+    path.is_file() && tool_runs_cmd(Command::new(path), arg)
+}
+
+fn tool_runs_cmd(mut cmd: Command, arg: &str) -> bool {
     cmd.arg(arg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -815,6 +910,22 @@ mod tests {
             parts.iter().filter(|part| part.contains("FFmpeg")).count(),
             1
         );
+    }
+
+    #[test]
+    fn android_maps_point_at_jni_dir() {
+        let maps = concat!(
+            "70e5c00000-70e5c01000 r--p 00000000 fd:07 123 /system/bin/app_process64\n",
+            "70f5c1a000-70f5d2b000 r-xp 00000000 fd:05 456 ",
+            "/data/app/~~X==/dev.etherquic.play-Y/lib/arm64/libetherquic_android.so\n",
+            "70f5d2b000-70f5d2c000 r--p 00111000 fd:05 456 ",
+            "/data/app/~~X==/dev.etherquic.play-Y/lib/arm64/libetherquic_android.so\n",
+        );
+        assert_eq!(
+            native_library_dir_from_maps(maps).as_deref(),
+            Some(Path::new("/data/app/~~X==/dev.etherquic.play-Y/lib/arm64"))
+        );
+        assert_eq!(native_library_dir_from_maps("nothing mapped\n"), None);
     }
 
     #[test]

@@ -16,8 +16,9 @@ use std::path::PathBuf;
 
 use libloading::Library;
 
+use crate::negotiate::{YuvChroma, YuvDepth, YuvFormat};
 use crate::pyrowave::Decoder;
-use crate::yuv::{rgb_to_i420, I420};
+use crate::yuv::{rgb_to_yuv, YuvPlanes};
 use crate::Frame;
 
 type Handle = *mut c_void;
@@ -69,8 +70,37 @@ struct AdapterInfo {
 }
 
 const FORMAT_YUV420P: c_int = 1;
+const FORMAT_YUV444P: c_int = 2;
+const FORMAT_YUV420P10: c_int = 3;
+const FORMAT_YUV444P10: c_int = 4;
 const CHROMA_420: c_int = 0;
+const CHROMA_444: c_int = 1;
 const PACKET_BOUNDARY: usize = 64 * 1024;
+
+fn pyro_chroma(format: YuvFormat) -> c_int {
+    match format.bitstream().chroma {
+        YuvChroma::Yuv420 => CHROMA_420,
+        YuvChroma::Yuv422 | YuvChroma::Yuv444 => CHROMA_444,
+    }
+}
+
+fn pyro_buffer_format(format: YuvFormat) -> c_int {
+    match (format.bitstream().chroma, format.depth) {
+        (YuvChroma::Yuv420, YuvDepth::Depth8) => FORMAT_YUV420P,
+        (YuvChroma::Yuv444, YuvDepth::Depth8) => FORMAT_YUV444P,
+        (YuvChroma::Yuv420, YuvDepth::Depth10) => FORMAT_YUV420P10,
+        (YuvChroma::Yuv444, YuvDepth::Depth10) => FORMAT_YUV444P10,
+        (YuvChroma::Yuv422, YuvDepth::Depth8) => FORMAT_YUV444P,
+        (YuvChroma::Yuv422, YuvDepth::Depth10) => FORMAT_YUV444P10,
+    }
+}
+
+fn pack_plane(src: &[u16], depth: YuvDepth) -> Vec<u8> {
+    match depth {
+        YuvDepth::Depth8 => src.iter().map(|sample| *sample as u8).collect(),
+        YuvDepth::Depth10 => src.iter().flat_map(|sample| sample.to_ne_bytes()).collect(),
+    }
+}
 
 struct Api {
     _lib: Library,
@@ -239,20 +269,31 @@ fn open_api() -> Result<Api, String> {
     })
 }
 
-fn planes_buffer(planes: &mut I420) -> CpuBuffer {
-    let w = planes.width;
-    let h = planes.height;
+fn packed_buffer(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    width: usize,
+    height: usize,
+    format: YuvFormat,
+) -> CpuBuffer {
+    let format = format.bitstream();
+    let (cw, ch) = crate::yuv::chroma_size(width, height, format.chroma);
+    let bpp = match format.depth {
+        YuvDepth::Depth8 => 1,
+        YuvDepth::Depth10 => 2,
+    };
     CpuBuffer {
         data: [
-            planes.y.as_mut_ptr().cast(),
-            planes.u.as_mut_ptr().cast(),
-            planes.v.as_mut_ptr().cast(),
+            y.as_mut_ptr().cast(),
+            u.as_mut_ptr().cast(),
+            v.as_mut_ptr().cast(),
         ],
-        stride: [w, w / 2, w / 2],
-        size: [w * h, (w / 2) * (h / 2), (w / 2) * (h / 2)],
-        width: w as c_int,
-        height: h as c_int,
-        format: FORMAT_YUV420P,
+        stride: [width * bpp, cw * bpp, cw * bpp],
+        size: [width * height * bpp, cw * ch * bpp, cw * ch * bpp],
+        width: width as c_int,
+        height: height as c_int,
+        format: pyro_buffer_format(format),
     }
 }
 
@@ -264,7 +305,11 @@ pub struct Encoder {
     width: u32,
     height: u32,
     adapter: String,
-    planes: I420,
+    format: YuvFormat,
+    planes: YuvPlanes,
+    pack_y: Vec<u8>,
+    pack_u: Vec<u8>,
+    pack_v: Vec<u8>,
     bitstream: Vec<u8>,
     packets: Vec<Packet>,
     frame_bytes: usize,
@@ -274,7 +319,12 @@ unsafe impl Send for Encoder {}
 
 impl Encoder {
     /// `frame_bytes` is the per-picture budget (bitrate / 8 / fps).
-    pub fn new(width: u32, height: u32, frame_bytes: usize) -> Result<Encoder, String> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        frame_bytes: usize,
+        format: YuvFormat,
+    ) -> Result<Encoder, String> {
         if width % 2 != 0 || height % 2 != 0 || width < 16 || height < 16 {
             return Err(format!(
                 "pyrowave-d3d11 needs even sides of 16 or more, got {width}x{height}"
@@ -314,7 +364,7 @@ impl Encoder {
             device,
             width: width as c_int,
             height: height as c_int,
-            chroma: CHROMA_420,
+            chroma: pyro_chroma(format),
         };
         let mut handle: Handle = std::ptr::null_mut();
         let created = unsafe { (api.encoder_create)(&enc_info, &mut handle) };
@@ -330,7 +380,11 @@ impl Encoder {
             width,
             height,
             adapter: adapter_name,
-            planes: I420::new(width as usize, height as usize),
+            format,
+            planes: YuvPlanes::new(width as usize, height as usize, format),
+            pack_y: Vec::new(),
+            pack_u: Vec::new(),
+            pack_v: Vec::new(),
             bitstream: vec![0; frame_bytes + 64 * 1024],
             packets: Vec::new(),
             frame_bytes,
@@ -347,8 +401,20 @@ impl Encoder {
         if (frame.width, frame.height) != (self.width, self.height) {
             return Err("frame size changed under the encoder".into());
         }
-        rgb_to_i420(frame, &mut self.planes);
-        let buffer = planes_buffer(&mut self.planes);
+        rgb_to_yuv(frame, &mut self.planes);
+        let work = self.planes.for_bitstream();
+        debug_assert_eq!(work.format, self.format.bitstream());
+        self.pack_y = pack_plane(&work.y, work.format.depth);
+        self.pack_u = pack_plane(&work.u, work.format.depth);
+        self.pack_v = pack_plane(&work.v, work.format.depth);
+        let buffer = packed_buffer(
+            &mut self.pack_y,
+            &mut self.pack_u,
+            &mut self.pack_v,
+            work.width,
+            work.height,
+            work.format,
+        );
         let rate = RateControl {
             maximum_bitstream_size: self.frame_bytes,
         };
@@ -401,6 +467,7 @@ mod tests {
         disabled, library_candidates, record_acceptable, AdapterInfo, CpuBuffer, DeviceInfo,
         EncInfo, Encoder, Packet, RateControl,
     };
+    use crate::negotiate::YuvFormat;
     use crate::Frame;
 
     #[test]
@@ -437,7 +504,8 @@ mod tests {
             }
         }
         let frame = Frame { width, height, rgb };
-        let mut encoder = Encoder::new(width, height, 32 * 1024).expect("d3d11 encoder");
+        let mut encoder =
+            Encoder::new(width, height, 32 * 1024, YuvFormat::YUV420P8).expect("d3d11 encoder");
         let record = encoder.encode(&frame).expect("d3d11 encode");
         assert!(encoder.adapter().len() > 0, "adapter name");
         println!(
@@ -449,7 +517,7 @@ mod tests {
     }
 
     /// Desk capture is 1280×720. The host opens `pyrowave-d3d11` with kbps 0,
-    /// which is [`crate::pyrowave::default_frame_bytes`] (about 1.5 bits per
+    /// which is [`crate::pyrowave::default_frame_bytes`] (about 4 bits per
     /// pixel, at least 32 KiB). Two successive low-frequency frames must each
     /// produce a packet-bearing record. A CPU lavapipe reject is not a failure.
     #[test]
@@ -475,6 +543,8 @@ mod tests {
             fps,
             kbps: 0,
             quality: 0,
+            yuv: crate::negotiate::YuvFormat::YUV420P8,
+            dirty_rects: false,
         };
         let (mut encoder, kbps) =
             crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
@@ -511,7 +581,7 @@ mod tests {
             );
             record_acceptable(width, height, &record)
                 .unwrap_or_else(|error| panic!("frame {index}: {error}"));
-            match crate::pyrowave::Decoder::new(width, height) {
+            match crate::pyrowave::Decoder::new(width, height, YuvFormat::YUV420P8) {
                 Ok(mut decoder) => match decoder.decode(&record) {
                     Ok(got) => {
                         let mae = rgb_mae(frame, &got);
@@ -569,6 +639,8 @@ mod tests {
             fps,
             kbps: 0,
             quality: 0,
+            yuv: crate::negotiate::YuvFormat::YUV420P8,
+            dirty_rects: false,
         };
         let (mut encoder, kbps) =
             crate::video::VideoEncoder::open(&setup, sink).expect("open pyrowave-d3d11");
@@ -724,7 +796,7 @@ impl Drop for Encoder {
 /// on the HD 6670 rejects a bitstream the GPU decoder accepts, and that must
 /// not hide the Direct3D 11 encoder.
 pub fn record_acceptable(width: u32, height: u32, record: &[u8]) -> Result<(), String> {
-    match Decoder::new(width, height) {
+    match Decoder::new(width, height, crate::negotiate::YuvFormat::YUV420P8) {
         Ok(mut decoder) => match decoder.decode(record) {
             Ok(_) => Ok(()),
             Err(error) => {

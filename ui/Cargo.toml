@@ -10,11 +10,12 @@ autobins = false
 
 [features]
 default = ["ui"]
-ui = ["dep:gpui", "dep:etherquic-play", "dep:image"]
+ui = ["dep:gpui", "dep:etherquic-play", "dep:etherquic-input", "dep:image", "dep:rustls", "dep:rustls-rustcrypto", "dep:rustls-native-certs"]
 
 [dependencies]
 etherquic = { path = ".." }
 etherquic-play = { path = "../play", default-features = false, optional = true }
+etherquic-input = { path = "../input", optional = true }
 qrcode = { version = "0.14", default-features = false }
 # Discovery thumbnails are JPEG XL. Pure Rust, reads a cut-short progressive stream.
 jxl-oxide = { version = "0.12", default-features = false }
@@ -22,6 +23,9 @@ jxl-oxide = { version = "0.12", default-features = false }
 image = { version = "0.25.1", default-features = false, optional = true }
 tokio = { version = "1.28", features = ["rt", "macros", "sync", "time"] }
 gpui = { path = "../../../interfaces/gpui", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
+rustls-rustcrypto = { path = "../vendor/rustls-rustcrypto", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 # Desktop play (capture, winit picture window) is not built for the phone.
 [target.'cfg(not(target_os = "android"))'.dependencies]

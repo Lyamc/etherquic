@@ -18,6 +18,10 @@ pub struct CodecChoice {
     pub bitrate_kbps: u32,
     /// Picture quality 1–100. Zero is the host default (40).
     pub quality: u8,
+    /// Ask the host for dirty rectangles (`dirty-rects 1` in the offer).
+    pub dirty_rects: bool,
+    /// PyroWave colour format. Default is 4:4:4 8-bit.
+    pub yuv: etherquic::negotiate::YuvFormat,
 }
 
 pub fn video_row(pref: PicturePref) -> Video {
@@ -59,6 +63,8 @@ impl CodecChoice {
             },
             self.bitrate_kbps,
             self.quality,
+            self.dirty_rects,
+            self.yuv,
         )
     }
 
@@ -87,6 +93,12 @@ impl CodecChoice {
         }
         if self.quality > 0 {
             out.extend(["--quality".to_string(), self.quality.to_string()]);
+        }
+        if self.dirty_rects {
+            out.push("--dirty-rects".to_string());
+        }
+        if self.yuv != etherquic::negotiate::YuvFormat::YUV444P8 {
+            out.extend(["--yuv".to_string(), self.yuv.token().to_string()]);
         }
         out
     }
@@ -142,8 +154,13 @@ impl SessionLine {
         match &self.video {
             Some(config) => {
                 let name = config.video.map(Video::name).unwrap_or("?");
+                let dirty = config
+                    .dirty_rects
+                    .status_token()
+                    .map(|token| format!(" {token}"))
+                    .unwrap_or_default();
                 format!(
-                    "{name} {}x{} ({})",
+                    "{name} {}x{} ({}){dirty}",
                     config.width, config.height, config.encoder
                 )
             }
@@ -244,4 +261,35 @@ impl SessionLine {
 /// The host's announced encoders, as negotiation sees them.
 pub fn host_caps_from(config: &StreamConfig) -> Option<negotiate::HostCaps> {
     (!config.host.video.is_empty()).then(|| config.host.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use etherquic_media::negotiate::DirtyRectsMode;
+
+    #[test]
+    fn session_line_shows_patches_and_pskip() {
+        let mut line = SessionLine::new("peer".into(), true);
+        let mut config = StreamConfig::video(Video::Mjpeg, "jpeg", 64, 48, 30);
+        config.dirty_rects = DirtyRectsMode::Patches;
+        assert!(line.apply(&PlayerEvent::Video(config.clone())));
+        let text = line.text();
+        assert!(text.contains("patches"), "{text}");
+        assert!(text.contains("MJPEG"), "{text}");
+
+        config.dirty_rects = DirtyRectsMode::Pskip;
+        config.video = Some(Video::H264Sw);
+        config.encoder = "libx264".into();
+        line.apply(&PlayerEvent::Video(config));
+        let text = line.text();
+        assert!(text.contains("pskip"), "{text}");
+        assert!(!text.contains("patches"), "{text}");
+
+        let off = StreamConfig::video(Video::Mjpeg, "jpeg", 64, 48, 30);
+        line.apply(&PlayerEvent::Video(off));
+        let text = line.text();
+        assert!(!text.contains("patches"), "{text}");
+        assert!(!text.contains("pskip"), "{text}");
+    }
 }

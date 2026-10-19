@@ -6,7 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use etherquic_play::{CursorMode, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, PAD_SLOTS};
+use etherquic_play::{
+    CursorMode, Dither, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, PAD_SLOTS,
+};
+
+use crate::overlay::OverlayLayout;
 
 /// A heading in the Settings panel. Each one resets on its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,10 +22,11 @@ pub enum Section {
     Input,
     Network,
     Language,
+    Updates,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Self::Appearance,
         Self::Capture,
         Self::Sound,
@@ -29,6 +34,7 @@ impl Section {
         Self::Input,
         Self::Network,
         Self::Language,
+        Self::Updates,
     ];
 
     pub fn title(self) -> &'static str {
@@ -40,6 +46,7 @@ impl Section {
             Self::Input => "Input",
             Self::Network => "Network",
             Self::Language => "Language",
+            Self::Updates => "Updates",
         }
     }
 }
@@ -89,21 +96,31 @@ pub enum Field {
     ClipboardAsKeystrokes,
     Cursor,
     Look,
+    Dither,
+    PixelSize,
+    DitherStrength,
     Quality,
+    Yuv,
     DirtyRects,
     PadSlots,
+    Overlay,
     OutputDevice,
     ShareDevice,
     Network,
     Language,
+    BetaReleases,
 }
 
 impl Field {
-    pub const ALL: [Field; 15] = [
+    pub const ALL: [Field; 21] = [
         Self::Scale,
         Self::SizeMatch,
         Self::Look,
+        Self::Dither,
+        Self::PixelSize,
+        Self::DitherStrength,
         Self::Quality,
+        Self::Yuv,
         Self::DirtyRects,
         Self::SendKeyboard,
         Self::SendMouse,
@@ -111,26 +128,36 @@ impl Field {
         Self::ClipboardAsKeystrokes,
         Self::Cursor,
         Self::PadSlots,
+        Self::Overlay,
         Self::OutputDevice,
         Self::ShareDevice,
         Self::Network,
         Self::Language,
+        Self::BetaReleases,
     ];
 
     pub fn section(self) -> Section {
         match self {
-            Self::Scale | Self::SizeMatch | Self::Look => Section::Appearance,
+            Self::Scale
+            | Self::SizeMatch
+            | Self::Look
+            | Self::Dither
+            | Self::PixelSize
+            | Self::DitherStrength => Section::Appearance,
             Self::Quality => Section::Codecs,
+            Self::Yuv => Section::Codecs,
             Self::DirtyRects => Section::Capture,
             Self::SendKeyboard
             | Self::SendMouse
             | Self::SendPads
             | Self::ClipboardAsKeystrokes
             | Self::Cursor
-            | Self::PadSlots => Section::Input,
+            | Self::PadSlots
+            | Self::Overlay => Section::Input,
             Self::OutputDevice | Self::ShareDevice => Section::Sound,
             Self::Network => Section::Network,
             Self::Language => Section::Language,
+            Self::BetaReleases => Section::Updates,
         }
     }
 }
@@ -147,13 +174,24 @@ pub struct Settings {
     pub cursor: CursorMode,
     /// Host paints this before it encodes. Saved as `look=`.
     pub look: Look,
+    /// Image-to-Pixel dither method. Saved as `dither=`.
+    pub dither: Dither,
+    /// Source pixels per output pixel, 1–32. Saved as `pixel-size=`.
+    pub pixel_size: u8,
+    /// Dither strength 0–100. Saved as `dither-strength=`.
+    pub dither_strength: u8,
     /// Picture quality 1–100. MJPEG JPEG quality, and a scale on other codecs'
     /// default bitrate. Saved as `quality=`.
     pub quality: u8,
-    /// When this PC hosts: skip unchanged pictures, and send MJPEG/MJ2K dirty
-    /// tiles. Saved as `dirty-rects=`.
+    /// Ask the remote host to skip unchanged pictures and send MJPEG/MJ2K dirty
+    /// tiles. Also used when this PC hosts for a player that does not send the
+    /// request. Saved as `dirty-rects=`.
     pub dirty_rects: bool,
+    /// PyroWave colour format asked of the host. Saved as `yuv=`.
+    pub yuv: etherquic::negotiate::YuvFormat,
     pub pad_slots: Vec<PadSlot>,
+    /// On-screen sticks, d-pads, and buttons for the Android player.
+    pub overlay: OverlayLayout,
     /// Where remote sound plays. `None` is the system default.
     pub output_device: Option<String>,
     /// What this computer shares when it hosts. `None` picks desktop audio.
@@ -161,6 +199,8 @@ pub struct Settings {
     pub network: NetworkDriver,
     /// Only `en` exists.
     pub language: String,
+    /// Include GitHub pre-release tags when checking for updates.
+    pub beta_releases: bool,
     /// macOS: hide the “install host service” prompt. The service can still
     /// be installed from Settings.
     pub skip_host_service_prompt: bool,
@@ -178,13 +218,19 @@ impl Default for Settings {
             clipboard_as_keystrokes: false,
             cursor: view.cursor,
             look: view.look,
+            dither: view.dither,
+            pixel_size: view.pixel_size,
+            dither_strength: view.dither_strength,
             quality: view.quality,
             dirty_rects: false,
+            yuv: view.yuv,
             pad_slots: view.pad_slots,
+            overlay: OverlayLayout::default(),
             output_device: view.output_device,
             share_device: None,
             network: NetworkDriver::Automatic,
             language: "en".into(),
+            beta_releases: false,
             skip_host_service_prompt: false,
         }
     }
@@ -201,7 +247,12 @@ impl Settings {
             send_pads: self.send_pads,
             cursor: self.cursor,
             look: self.look,
+            dither: self.dither,
+            pixel_size: self.pixel_size,
+            dither_strength: self.dither_strength,
             quality: self.quality,
+            dirty_rects: self.dirty_rects,
+            yuv: self.yuv,
             pad_slots: self.pad_slots.clone(),
             output_device: self.output_device.clone(),
         }
@@ -231,13 +282,19 @@ impl Settings {
             }
             Field::Cursor => self.cursor == other.cursor,
             Field::Look => self.look == other.look,
+            Field::Dither => self.dither == other.dither,
+            Field::PixelSize => self.pixel_size == other.pixel_size,
+            Field::DitherStrength => self.dither_strength == other.dither_strength,
             Field::Quality => self.quality == other.quality,
+            Field::Yuv => self.yuv == other.yuv,
             Field::DirtyRects => self.dirty_rects == other.dirty_rects,
             Field::PadSlots => self.pad_slots == other.pad_slots,
+            Field::Overlay => self.overlay == other.overlay,
             Field::OutputDevice => self.output_device == other.output_device,
             Field::ShareDevice => self.share_device == other.share_device,
             Field::Network => self.network == other.network,
             Field::Language => self.language == other.language,
+            Field::BetaReleases => self.beta_releases == other.beta_releases,
         }
     }
 
@@ -254,13 +311,19 @@ impl Settings {
             }
             Field::Cursor => self.cursor = from.cursor,
             Field::Look => self.look = from.look,
+            Field::Dither => self.dither = from.dither,
+            Field::PixelSize => self.pixel_size = from.pixel_size,
+            Field::DitherStrength => self.dither_strength = from.dither_strength,
             Field::Quality => self.quality = from.quality,
+            Field::Yuv => self.yuv = from.yuv,
             Field::DirtyRects => self.dirty_rects = from.dirty_rects,
             Field::PadSlots => self.pad_slots = from.pad_slots.clone(),
+            Field::Overlay => self.overlay = from.overlay.clone(),
             Field::OutputDevice => self.output_device = from.output_device.clone(),
             Field::ShareDevice => self.share_device = from.share_device.clone(),
             Field::Network => self.network = from.network,
             Field::Language => self.language = from.language.clone(),
+            Field::BetaReleases => self.beta_releases = from.beta_releases,
         }
     }
 
@@ -353,11 +416,15 @@ fn clean(text: &str) -> String {
 
 pub fn render_settings(settings: &Settings) -> String {
     let mut out = format!(
-        "scale={}\nsize-match={}\nlook={}\nquality={}\ndirty-rects={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nhost-service-prompt={}\n",
+        "scale={}\nsize-match={}\nlook={}\ndither={}\npixel-size={}\ndither-strength={}\nquality={}\nyuv={}\ndirty-rects={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nbeta-releases={}\nhost-service-prompt={}\n",
         settings.scale.token(),
         settings.size_match.token(),
         settings.look.token(),
+        settings.dither.token(),
+        settings.pixel_size,
+        settings.dither_strength,
         settings.quality,
+        settings.yuv.token(),
         flag(settings.dirty_rects),
         flag(settings.send_keyboard),
         flag(settings.send_mouse),
@@ -368,6 +435,7 @@ pub fn render_settings(settings: &Settings) -> String {
         clean(settings.share_device.as_deref().unwrap_or("")),
         settings.network.token(),
         clean(&settings.language),
+        flag(settings.beta_releases),
         if settings.skip_host_service_prompt {
             "skip"
         } else {
@@ -377,6 +445,7 @@ pub fn render_settings(settings: &Settings) -> String {
     for pin in &settings.pad_slots {
         out.push_str(&format!("pad-slot={}={}\n", pin.slot, clean(&pin.name)));
     }
+    out.push_str(&crate::overlay::render_overlay(&settings.overlay));
     out
 }
 
@@ -399,10 +468,33 @@ pub fn parse_settings(text: &str) -> Settings {
             "send-keyboard" => settings.send_keyboard = value != "0",
             "send-mouse" => settings.send_mouse = value != "0",
             "send-pads" => settings.send_pads = value != "0",
+            "overlay" | "overlay-left" | "overlay-mid" | "overlay-right" => {
+                crate::overlay::parse_overlay_line(&mut settings.overlay, key.trim(), value);
+            }
             "clipboard-as-keystrokes" => settings.clipboard_as_keystrokes = value != "0",
             "cursor" => settings.cursor = CursorMode::from_token(value).unwrap_or(settings.cursor),
             "look" => settings.look = Look::from_token(value).unwrap_or(settings.look),
+            "dither" => settings.dither = Dither::from_token(value).unwrap_or(settings.dither),
+            "pixel-size" => {
+                if let Ok(n) = value.parse::<u8>() {
+                    if (1..=32).contains(&n) {
+                        settings.pixel_size = n;
+                    }
+                }
+            }
+            "dither-strength" => {
+                if let Ok(n) = value.parse::<u8>() {
+                    if n <= 100 {
+                        settings.dither_strength = n;
+                    }
+                }
+            }
             "dirty-rects" => settings.dirty_rects = value != "0",
+            "yuv" => {
+                if let Some(yuv) = etherquic::negotiate::YuvFormat::from_token(value) {
+                    settings.yuv = yuv;
+                }
+            }
             "quality" => {
                 if let Ok(q) = value.parse::<u8>() {
                     if (1..=100).contains(&q) {
@@ -416,6 +508,7 @@ pub fn parse_settings(text: &str) -> Settings {
                 settings.network = NetworkDriver::from_token(value).unwrap_or(settings.network)
             }
             "language" if value == "en" => settings.language = value.to_string(),
+            "beta-releases" => settings.beta_releases = value != "0",
             "host-service-prompt" => {
                 settings.skip_host_service_prompt = value == "skip";
             }
@@ -585,6 +678,9 @@ mod tests {
             clipboard_as_keystrokes: true,
             cursor: CursorMode::Copy,
             look: Look::Poster,
+            dither: Dither::BlueNoise,
+            pixel_size: 8,
+            dither_strength: 70,
             quality: 7,
             dirty_rects: true,
             output_device: Some("Speakers (USB)".into()),
@@ -675,16 +771,22 @@ mod tests {
             clipboard_as_keystrokes: true,
             cursor: CursorMode::Remote,
             look: Look::Pico8,
+            dither: Dither::FloydSteinberg,
+            pixel_size: 4,
+            dither_strength: 80,
             quality: 7,
+            yuv: etherquic::negotiate::YuvFormat::YUV420P10,
             dirty_rects: true,
             pad_slots: vec![PadSlot {
                 name: "Pad".into(),
                 slot: 1,
             }],
+            overlay: crate::overlay::preset_game(),
             output_device: Some("A".into()),
             share_device: Some("B".into()),
             network: NetworkDriver::Npcap,
             language: "en-x".into(),
+            beta_releases: true,
             skip_host_service_prompt: false,
         };
         let factory = Settings::default();
