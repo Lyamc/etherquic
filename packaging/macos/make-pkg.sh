@@ -3,6 +3,7 @@
 #
 #   packaging/macos/make-pkg.sh [PYROWAVE_LIB_DIR] [OUT_DIR]
 #
+# PyroWave, Vulkan/KosmicKrisp, ffmpeg, and libopus are required (make-app.sh).
 # The product has two choices. The app is required. The host LaunchDaemon is
 # selected by default (same question the Windows MSI asks). Clearing that
 # choice installs the app only; the app then prompts to install the service.

@@ -535,20 +535,26 @@ pub fn codec_name(id: CodecId) -> &'static str {
         .unwrap_or("codec")
 }
 
-/// Support this process can see. An encode ASIC is recorded only for NVIDIA,
-/// which exposes NVENC and NVDEC. AV1 is left unset. CPU encode is not assumed.
+/// Support this process can see. An encode ASIC is NVIDIA (NVENC/NVDEC) or
+/// VideoToolbox on macOS when ffmpeg is present. AV1 is left unset. MJPEG and
+/// MJ2K run in-process on the CPU.
 pub fn this_computer() -> MachineCodecs {
     let nvidia = etherquic::nvidia_present();
+    let videotoolbox = etherquic::videotoolbox_present();
     let gpu = etherquic::pyrowave_ready(
         etherquic::gpu_compute_present(),
         etherquic::pyrowave_library_present(),
     );
     let pyro_hw = etherquic::pyrowave_hardware_encode();
     let asic = EndSupport {
-        hardware_encode: nvidia,
-        hardware_decode: nvidia,
+        hardware_encode: nvidia || videotoolbox,
+        hardware_decode: nvidia || videotoolbox,
         cpu_can_sustain: false,
         gpu_compute: false,
+    };
+    let cpu = EndSupport {
+        cpu_can_sustain: true,
+        ..EndSupport::default()
     };
     MachineCodecs::from_rows(vec![
         (
@@ -560,8 +566,8 @@ pub fn this_computer() -> MachineCodecs {
                 ..EndSupport::default()
             },
         ),
-        (CodecId::Mjpeg, EndSupport::default()),
-        (CodecId::Mj2k, EndSupport::default()),
+        (CodecId::Mjpeg, cpu),
+        (CodecId::Mj2k, cpu),
         (CodecId::JpegXs, EndSupport::default()),
         (CodecId::OpenApv, EndSupport::default()),
         (CodecId::H264, asic),
@@ -905,6 +911,9 @@ mod tests {
         }
         let mjpeg = machine.get(CodecId::Mjpeg);
         assert!(!mjpeg.hardware_encode && !mjpeg.hardware_decode);
+        assert!(mjpeg.cpu_can_sustain);
+        let mj2k = machine.get(CodecId::Mj2k);
+        assert!(mj2k.cpu_can_sustain);
         let av1 = machine.get(CodecId::Av1);
         assert!(!av1.hardware_encode && !av1.hardware_decode);
     }

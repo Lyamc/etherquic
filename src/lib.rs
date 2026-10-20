@@ -46,6 +46,7 @@ pub use backend::{
     default_backend_order, gpu_compute_present, native_library_dir_from_maps, native_library_dirs,
     nvidia_present, offer_from, offer_media, pick_backend, probe_backends,
     pyrowave_hardware_encode, pyrowave_library_present, pyrowave_ready, pyrowave_ready_with,
+    videotoolbox_present,
     selected_backend, widen_process_path, BackendProbe, MediaBackend,
 };
 pub use capture::{

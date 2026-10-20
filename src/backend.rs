@@ -92,11 +92,37 @@ fn ffmpeg_present() -> bool {
     if tool_runs("ffmpeg", "-version") {
         return true;
     }
-    native_library_dirs().into_iter().any(|dir| {
+    if native_library_dirs().into_iter().any(|dir| {
         ["libffmpeg.so", "ffmpeg"]
             .iter()
             .any(|name| tool_runs_path(&dir.join(name), "-version"))
-    })
+    }) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for path in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+            if tool_runs_path(Path::new(path), "-version") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// VideoToolbox via ffmpeg (`h264_videotoolbox`, `hevc_videotoolbox`).
+///
+/// NVIDIA is a separate check. A Mac without a bundled or Homebrew ffmpeg
+/// cannot run those encoders, so this is false until ffmpeg is on disk.
+pub fn videotoolbox_present() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ffmpeg_present()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// `libopus.dll` or `opus.dll` on Windows. `libopus.so` on other systems.
@@ -118,7 +144,12 @@ fn native_opus_present() -> bool {
         }
         file_named_in(&["libopus.dll", "opus.dll"], &dirs)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        dirs.extend(macos_library_dirs());
+        file_named_in(&["libopus.0.dylib", "libopus.dylib"], &dirs)
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
             dirs.extend(std::env::split_paths(&path));
@@ -428,6 +459,7 @@ pub fn offer_from(
     // Encode and decode are the same GPU. Direct3D 11 feature level 11_0 is
     // that GPU on Windows; a CPU Vulkan driver sets neither bit.
     let pyro_hw = pyrowave_hardware_encode();
+    let asic = nvidia || videotoolbox_present();
     let video = vec![
         row(
             VIDEO_PYROWAVE,
@@ -459,14 +491,10 @@ pub fn offer_from(
             probe.ffmpeg,
             false,
         ),
-        row(VIDEO_MJ2K, false, false, false, false, false, false, false),
-        row(VIDEO_MJPEG, false, false, false, false, false, false, false),
-        row(
-            VIDEO_H264, nvidia, nvidia, false, false, false, false, false,
-        ),
-        row(
-            VIDEO_H265, nvidia, nvidia, false, false, false, false, false,
-        ),
+        row(VIDEO_MJ2K, false, false, true, false, false, false, false),
+        row(VIDEO_MJPEG, false, false, true, false, false, false, false),
+        row(VIDEO_H264, asic, asic, false, false, false, false, false),
+        row(VIDEO_H265, asic, asic, false, false, false, false, false),
         row(VIDEO_AV1, false, false, false, false, false, false, false),
     ];
     let audio = vec![
@@ -1014,6 +1042,13 @@ mod tests {
         assert!(!opus.cpu);
         assert!(!opus.libopus);
         assert!(opus.gstreamer);
+    }
+
+    #[test]
+    fn videotoolbox_is_macos_only() {
+        if !cfg!(target_os = "macos") {
+            assert!(!videotoolbox_present());
+        }
     }
 
     #[test]

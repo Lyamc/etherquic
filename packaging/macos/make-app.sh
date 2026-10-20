@@ -6,11 +6,11 @@
 #   packaging/macos/make-app.sh [PYROWAVE_LIB_DIR] [OUT_DIR]
 #
 # The app carries the GUI (etherquic), the CLI player (etherquic-play), the
-# host service binary (etherquic-host), demo certs, and cjxl for discovery
-# thumbnails, with every Homebrew dylib they load. When
-# PYROWAVE_LIB_DIR holds libpyrowave-shared (packaging/pyrowave/build-macos.sh)
-# the app also carries PyroWave, the Vulkan loader, and Mesa's KosmicKrisp
-# Vulkan driver with its ICD manifest, so PyroWave runs without Homebrew.
+# host service binary (etherquic-host), demo certs, cjxl, ffmpeg, libopus,
+# PyroWave, the Vulkan loader, and Mesa's KosmicKrisp ICD. A Finder-launched
+# app has no Homebrew on PATH, so those files are required in the bundle.
+# The build fails if any of them are missing. PYROWAVE_LIB_DIR defaults to
+# $HOME/Build/pyrowave-mac/src/build, then packaging/pyrowave/build-macos.sh.
 # MoltenVK is not bundled: PyroWave's encoder refuses it (see src/backend.rs).
 #
 # The bundle is signed ad hoc, not with a Developer ID, and not notarized.
@@ -18,7 +18,7 @@ set -eu
 
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
-pyrowave=${1:-}
+pyrowave=${1:-${PYROWAVE_LIB_DIR:-}}
 out=${2:-$root/dist/macos}
 # VERSION=0.1.9 overrides the root package version, like build-msi.ps1 -Version.
 version=${VERSION:-$(awk '
@@ -33,6 +33,27 @@ version=${VERSION:-$(awk '
 ' "$root/Cargo.toml")}
 target=${CARGO_TARGET_DIR:-$root/target}
 brew=${HOMEBREW_PREFIX:-/opt/homebrew}
+
+need() {
+    if [ ! -e "$1" ]; then
+        echo "macos package missing $1" >&2
+        exit 1
+    fi
+}
+
+if [ -z "$pyrowave" ] && [ -f "$HOME/Build/pyrowave-mac/src/build/libpyrowave-shared.1.dylib" ]; then
+    pyrowave=$HOME/Build/pyrowave-mac/src/build
+fi
+if [ -z "$pyrowave" ] || [ ! -f "$pyrowave/libpyrowave-shared.1.dylib" ]; then
+    echo "building libpyrowave-shared with packaging/pyrowave/build-macos.sh" >&2
+    pyrowave=$("$root/packaging/pyrowave/build-macos.sh")
+fi
+need "$pyrowave/libpyrowave-shared.1.dylib"
+need "$brew/opt/opus/lib/libopus.0.dylib"
+need "$brew/bin/ffmpeg"
+need "$brew/lib/libvulkan.1.dylib"
+kk_json=$brew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json
+need "$kk_json"
 
 (cd "$root/ui" && cargo build --release)
 (cd "$root/play" && cargo build --release --bin etherquic-play)
@@ -55,24 +76,31 @@ if [ -x "$brew/bin/cjxl" ]; then
     done
 fi
 
-# libopus (BSD) for Opus audio. The media code dlopens it from Frameworks.
-if [ -f "$brew/opt/opus/lib/libopus.0.dylib" ]; then
-    cp "$(readlink -f "$brew/opt/opus/lib/libopus.0.dylib")" "$app/Contents/Frameworks/libopus.0.dylib"
-    cp "$brew/opt/opus/COPYING" "$app/Contents/Resources/licenses/LICENSE-opus.txt"
-fi
+cp "$brew/bin/ffmpeg" "$app/Contents/MacOS/ffmpeg"
+for f in "$brew"/opt/ffmpeg/LICENSE* "$brew"/opt/ffmpeg/COPYING*; do
+    [ -f "$f" ] && cp "$f" "$app/Contents/Resources/licenses/ffmpeg-$(basename "$f")"
+done
 
-if [ -n "$pyrowave" ]; then
-    cp "$pyrowave/libpyrowave-shared.1.dylib" "$app/Contents/Frameworks/"
-    ln -s libpyrowave-shared.1.dylib "$app/Contents/Frameworks/libpyrowave-shared.dylib"
-    cp "$root/packaging/pyrowave/LICENSE" "$app/Contents/Resources/licenses/LICENSE-pyrowave.txt"
-    loader=$(readlink -f "$brew/lib/libvulkan.1.dylib")
-    cp "$loader" "$app/Contents/Frameworks/libvulkan.1.dylib"
-    kk_json=$brew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json
-    kk_lib=$(sed -n 's/.*"library_path": *"\(.*\)".*/\1/p' "$kk_json")
-    cp "$kk_lib" "$app/Contents/Frameworks/libvulkan_kosmickrisp.dylib"
-    mkdir -p "$app/Contents/Resources/vulkan/icd.d"
-    api=$(sed -n 's/.*"api_version": *"\(.*\)".*/\1/p' "$kk_json")
-    cat > "$app/Contents/Resources/vulkan/icd.d/kosmickrisp_icd.json" <<JSON
+cp "$(readlink -f "$brew/opt/opus/lib/libopus.0.dylib")" "$app/Contents/Frameworks/libopus.0.dylib"
+cp "$brew/opt/opus/COPYING" "$app/Contents/Resources/licenses/LICENSE-opus.txt"
+
+cp "$pyrowave/libpyrowave-shared.1.dylib" "$app/Contents/Frameworks/"
+ln -sf libpyrowave-shared.1.dylib "$app/Contents/Frameworks/libpyrowave-shared.dylib"
+cp "$root/packaging/pyrowave/LICENSE" "$app/Contents/Resources/licenses/LICENSE-pyrowave.txt"
+loader=$(readlink -f "$brew/lib/libvulkan.1.dylib")
+need "$loader"
+cp "$loader" "$app/Contents/Frameworks/libvulkan.1.dylib"
+kk_lib=$(sed -n 's/.*"library_path": *"\(.*\)".*/\1/p' "$kk_json")
+case $kk_lib in
+    /*) ;;
+    *) kk_lib=$(dirname "$kk_json")/$kk_lib ;;
+esac
+need "$kk_lib"
+cp "$kk_lib" "$app/Contents/Frameworks/libvulkan_kosmickrisp.dylib"
+mkdir -p "$app/Contents/Resources/vulkan/icd.d"
+api=$(sed -n 's/.*"api_version": *"\(.*\)".*/\1/p' "$kk_json")
+[ -n "$api" ] || { echo "macos package: KosmicKrisp ICD has no api_version" >&2; exit 1; }
+cat > "$app/Contents/Resources/vulkan/icd.d/kosmickrisp_icd.json" <<JSON
 {
     "file_format_version": "1.0.1",
     "ICD": {
@@ -81,10 +109,9 @@ if [ -n "$pyrowave" ]; then
     }
 }
 JSON
-    for f in "$brew"/opt/vulkan-loader/LICENSE* "$brew"/opt/mesa/license.rst; do
-        [ -f "$f" ] && cp "$f" "$app/Contents/Resources/licenses/$(basename "$(dirname "$(readlink -f "$f")")")-$(basename "$f")"
-    done
-fi
+for f in "$brew"/opt/vulkan-loader/LICENSE* "$brew"/opt/mesa/license.rst; do
+    [ -f "$f" ] && cp "$f" "$app/Contents/Resources/licenses/$(basename "$(dirname "$(readlink -f "$f")")")-$(basename "$f")"
+done
 
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -107,6 +134,13 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 
 python3 "$here/bundle_dylibs.py" "$app"
+need "$app/Contents/MacOS/ffmpeg"
+need "$app/Contents/Frameworks/libopus.0.dylib"
+need "$app/Contents/Frameworks/libpyrowave-shared.1.dylib"
+need "$app/Contents/Frameworks/libpyrowave-shared.dylib"
+need "$app/Contents/Frameworks/libvulkan.1.dylib"
+need "$app/Contents/Frameworks/libvulkan_kosmickrisp.dylib"
+need "$app/Contents/Resources/vulkan/icd.d/kosmickrisp_icd.json"
 codesign --force --deep -s - "$app"
 codesign --verify --deep --strict "$app"
 
