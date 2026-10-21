@@ -45,6 +45,7 @@ pub fn candidates(video: Video) -> &'static [&'static str] {
             }
         }
         Video::Av1Hw => &["av1_nvenc", "av1_amf", "av1_qsv"],
+        Video::Av1Sw => &["libsvtav1"],
         Video::H264Sw => &["libx264"],
         Video::OpenApv => &["liboapv"],
         Video::JpegXs => &["libsvtjpegxs"],
@@ -255,6 +256,12 @@ pub fn encoder_args(name: &str, fps: u32, kbps: u32, long_gop: bool) -> Vec<Stri
             "1",
         ],
         "liboapv" => vec!["-preset", "fastest"],
+        "libsvtav1" => vec![
+            "-preset",
+            "10",
+            "-svtav1-params",
+            "lp=1:hierarchical-levels=0",
+        ],
         n if n.contains("jpegxs") => vec!["-tag:v", "jxs"],
         _ => vec![],
     };
@@ -354,6 +361,7 @@ pub fn working_encoders() -> Vec<EncoderSpec> {
     let list = listing("-encoders");
     let rows = [
         Video::Av1Hw,
+        Video::Av1Sw,
         Video::H265Hw,
         Video::H264Hw,
         Video::H264Sw,
@@ -767,6 +775,11 @@ mod tests {
         );
         assert_eq!(candidates(Video::OpenApv), &["liboapv"]);
         assert_eq!(candidates(Video::JpegXs), &["libsvtjpegxs"]);
+        assert_eq!(candidates(Video::Av1Sw), &["libsvtav1"]);
+        let svt = joined(&encoder_args("libsvtav1", 30, 2000, false));
+        assert!(svt.contains("-preset 10"), "{svt}");
+        assert!(svt.contains("lp=1"), "{svt}");
+        assert!(svt.contains("-threads 1"), "{svt}");
         let raw = joined(&rawvideo_pipe(1280, 720));
         assert!(raw.contains("-threads 1 -f rawvideo"), "{raw}");
         assert!(raw.contains("1280x720"), "{raw}");

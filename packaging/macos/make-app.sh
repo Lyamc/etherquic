@@ -76,7 +76,20 @@ if [ -x "$brew/bin/cjxl" ]; then
     done
 fi
 
-cp "$brew/bin/ffmpeg" "$app/Contents/MacOS/ffmpeg"
+# A build-machine ffmpeg that already has libsvtjpegxs, liboapv, and
+# libsvtav1. Homebrew's ffmpeg does not ship the first two.
+ffmpeg_bin=${FFMPEG_BIN:-}
+if [ -z "$ffmpeg_bin" ] && [ -x "$HOME/Build/ffmpeg-jpegxs/bin/ffmpeg" ]; then
+    ffmpeg_bin=$HOME/Build/ffmpeg-jpegxs/bin/ffmpeg
+fi
+if [ -n "$ffmpeg_bin" ] && "$ffmpeg_bin" -hide_banner -encoders 2>/dev/null | grep -q libsvtjpegxs \
+    && "$ffmpeg_bin" -hide_banner -encoders 2>/dev/null | grep -q liboapv \
+    && "$ffmpeg_bin" -hide_banner -encoders 2>/dev/null | grep -q libsvtav1
+then
+    cp "$ffmpeg_bin" "$app/Contents/MacOS/ffmpeg"
+else
+    cp "$brew/bin/ffmpeg" "$app/Contents/MacOS/ffmpeg"
+fi
 for f in "$brew"/opt/ffmpeg/LICENSE* "$brew"/opt/ffmpeg/COPYING*; do
     [ -f "$f" ] && cp "$f" "$app/Contents/Resources/licenses/ffmpeg-$(basename "$f")"
 done

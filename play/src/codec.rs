@@ -18,9 +18,9 @@ pub enum CodecId {
 
 /// One row in the picture preference list.
 ///
-/// H.264 is two rows: hardware encode, then a CPU encode. AV1 and H.265 are
-/// hardware-only. Pyrowave, JPEG XS, OpenAPV, MJ2K, and MJPEG have no second
-/// path.
+/// H.264 and AV1 each have a hardware row and a CPU row. The CPU row is used
+/// when "Skip when there's no HW encoder" is off. H.265 is hardware-only.
+/// Pyrowave, JPEG XS, OpenAPV, MJ2K, and MJPEG have no second path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PicturePref {
     Av1Hw,
@@ -32,6 +32,8 @@ pub enum PicturePref {
     Mj2k,
     Mjpeg,
     H264Sw,
+    /// CPU AV1 through SVT-AV1. Skipped when software encode is turned off.
+    Av1Sw,
     /// PyroWave on a CPU Vulkan driver (lavapipe, SwiftShader).
     PyrowaveCpu,
 }
@@ -39,7 +41,7 @@ pub enum PicturePref {
 impl PicturePref {
     pub fn codec(self) -> CodecId {
         match self {
-            Self::Av1Hw => CodecId::Av1,
+            Self::Av1Hw | Self::Av1Sw => CodecId::Av1,
             Self::H265Hw => CodecId::H265,
             Self::H264Hw | Self::H264Sw => CodecId::H264,
             Self::Pyrowave | Self::PyrowaveCpu => CodecId::Pyrowave,
@@ -61,13 +63,14 @@ impl PicturePref {
             Self::Mj2k => "MJ2K",
             Self::Mjpeg => "MJPEG",
             Self::H264Sw => "H.264 (SW)",
+            Self::Av1Sw => "AV1 (SW)",
             Self::PyrowaveCpu => "PyroWave (CPU)",
         }
     }
 
     /// Default preference order.
     /// Default preference order. CPU PyroWave is last, below MJPEG and x264.
-    pub fn order() -> [Self; 10] {
+    pub fn order() -> [Self; 11] {
         [
             Self::Av1Hw,
             Self::H265Hw,
@@ -78,6 +81,7 @@ impl PicturePref {
             Self::Mj2k,
             Self::Mjpeg,
             Self::H264Sw,
+            Self::Av1Sw,
             Self::PyrowaveCpu,
         ]
     }
@@ -93,6 +97,7 @@ impl PicturePref {
             Self::Mj2k => "mj2k",
             Self::Mjpeg => "mjpeg",
             Self::H264Sw => "h264-sw",
+            Self::Av1Sw => "av1-sw",
             Self::PyrowaveCpu => "pyrowave-cpu",
         }
     }
@@ -426,10 +431,10 @@ pub struct AudioSkip {
 /// `local_encodes` is true when this PC sends the picture. H.265 (HW) and
 /// AV1 (HW) are skipped when the remote computer has no hardware decode for
 /// them, or when the sender has no hardware encode. H.264 (HW) needs hardware
-/// encode on the sender. H.264 (SW) needs a CPU that can sustain it, and it is
-/// skipped when `skip_without_hardware_encode` is set. That switch also skips
-/// CPU PyroWave. GPU PyroWave stays when the sender can encode it on a GPU.
-/// MJPEG stays.
+/// encode on the sender. H.264 (SW) needs a CPU that can sustain it. H.264 (SW),
+/// AV1 (SW), and CPU PyroWave are skipped when `skip_without_hardware_encode`
+/// is set. GPU PyroWave stays when the sender can encode it on a GPU.
+/// JPEG XS, OpenAPV, MJ2K, and MJPEG stay.
 pub fn choose_codec(
     preference: &[PicturePref],
     local: &MachineCodecs,
@@ -506,6 +511,13 @@ fn codec_gate(
                 Ok(())
             } else {
                 Err("the cpu cannot sustain it")
+            }
+        }
+        PicturePref::Av1Sw => {
+            if skip_without_hardware_encode {
+                Err("no hardware encode")
+            } else {
+                Ok(())
             }
         }
         PicturePref::H265Hw | PicturePref::Av1Hw => {
@@ -996,5 +1008,21 @@ mod tests {
         );
         assert!(recommend(CodecId::JpegXs, &support()));
         assert!(recommend(CodecId::OpenApv, &support()));
+    }
+
+    #[test]
+    fn av1_software_follows_the_hardware_skip_switch() {
+        let local = MachineCodecs::default();
+        let remote = MachineCodecs::default();
+        let order = [PicturePref::Av1Sw, PicturePref::Mjpeg];
+        let (chosen, skipped) = choose_codec(&order, &local, &remote, false, true);
+        assert_eq!(chosen, Some(PicturePref::Mjpeg));
+        assert_eq!(skipped[0].pref, PicturePref::Av1Sw);
+        assert_eq!(skipped[0].reason, "no hardware encode");
+        let (chosen, skipped) = choose_codec(&order, &local, &remote, false, false);
+        assert_eq!(chosen, Some(PicturePref::Av1Sw));
+        assert!(skipped.is_empty());
+        assert_eq!(PicturePref::from_token("av1-sw"), Some(PicturePref::Av1Sw));
+        assert!(!PicturePref::Av1Sw.codec().eq(&CodecId::H264));
     }
 }

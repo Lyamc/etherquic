@@ -86,6 +86,9 @@ pub fn video_hint(pref: PicturePref) -> &'static str {
         PicturePref::Mjpeg => "intra, weak compression, no encode hardware",
         PicturePref::H264Hw => "compresses well. Hardware encode on the side that sends",
         PicturePref::H264Sw => "CPU encode, only when that CPU can sustain it",
+        PicturePref::Av1Sw => {
+            "SVT-AV1 on the CPU. Used when Skip when there's no HW encoder is off"
+        },
         PicturePref::H265Hw => {
             "compresses better than H.264. Hardware encode, and hardware decode on the remote"
         }
@@ -349,7 +352,7 @@ fn videos_for(id: CodecId) -> &'static [Video] {
         CodecId::OpenApv => &[Video::OpenApv],
         CodecId::H264 => &[Video::H264Hw, Video::H264Sw],
         CodecId::H265 => &[Video::H265Hw],
-        CodecId::Av1 => &[Video::Av1Hw],
+        CodecId::Av1 => &[Video::Av1Hw, Video::Av1Sw],
     }
 }
 
@@ -622,10 +625,22 @@ pub struct Predicted {
     pub negotiates: bool,
 }
 
+/// Rows the "Skip when there's no HW encoder" switch leaves out of the offer.
+/// JPEG XS, OpenAPV, MJ2K, and MJPEG stay. A pin of one of these rows is dropped too.
+fn skipped_without_hardware(pref: PicturePref) -> bool {
+    matches!(
+        pref,
+        PicturePref::H264Sw | PicturePref::Av1Sw | PicturePref::PyrowaveCpu
+    )
+}
+
 /// The offer for one connection: the applied order with any pin first.
+///
+/// With "Skip when there's no HW encoder" on, H.264 (SW), AV1 (SW), and
+/// CPU PyroWave are not offered, so the host cannot pick them.
 pub fn codec_choice_for(
     applied: &Applied,
-    video_pin: Option<PicturePref>,
+    mut video_pin: Option<PicturePref>,
     audio_pin: Option<AudioId>,
     quality: u8,
     dirty_rects: bool,
@@ -637,6 +652,12 @@ pub fn codec_choice_for(
     let mut video = applied.video.clone();
     if let Some(pin) = video_pin {
         move_to_front(&mut video, pin);
+    }
+    if applied.skip_without_hw {
+        video.retain(|row| !skipped_without_hardware(*row));
+        if video_pin.is_some_and(skipped_without_hardware) {
+            video_pin = None;
+        }
     }
     let mut audio = applied.audio.clone();
     if let Some(pin) = audio_pin {
@@ -801,8 +822,8 @@ fn clamp_fps(fps: u32) -> u32 {
     etherquic::negotiate::clamp_fps(fps)
 }
 
-/// Hardware-encode rows. GPU PyroWave counts. CPU PyroWave, MJPEG, and
-/// H.264 (SW) do not.
+/// Hardware-encode rows. GPU PyroWave counts. CPU PyroWave, MJPEG, H.264 (SW),
+/// and AV1 (SW) do not.
 pub fn sender_hardware_encode(pref: Option<PicturePref>) -> bool {
     matches!(
         pref,
@@ -1513,6 +1534,47 @@ mod tests {
         assert_eq!(choice.video.len(), applied.video.len());
         assert_eq!(choice.max_width, 0);
         assert_eq!(choice.max_height, 0);
+    }
+
+    #[test]
+    fn skip_without_hardware_drops_software_encode_rows_from_the_offer() {
+        let prefs = Preferences::baseline();
+        let applied = apply_override(&prefs, None);
+        assert!(applied.video.contains(&PicturePref::Av1Sw));
+        let mut skipped = applied.clone();
+        skipped.skip_without_hw = true;
+        let yuv = etherquic::negotiate::YuvFormat::YUV444P8;
+        let choice = codec_choice_for(
+            &skipped,
+            Some(PicturePref::Av1Sw),
+            None,
+            0,
+            false,
+            yuv,
+            false,
+            false,
+            None,
+        );
+        assert!(!choice.video.contains(&PicturePref::Av1Sw));
+        assert!(!choice.video.contains(&PicturePref::H264Sw));
+        assert!(!choice.video.contains(&PicturePref::PyrowaveCpu));
+        assert!(choice.video.contains(&PicturePref::Mjpeg));
+        assert!(choice.video.contains(&PicturePref::JpegXs));
+        assert!(choice.video.contains(&PicturePref::OpenApv));
+        assert_eq!(choice.video_pin, None);
+        let allowed = codec_choice_for(
+            &applied,
+            Some(PicturePref::Av1Sw),
+            None,
+            0,
+            false,
+            yuv,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(allowed.video.first(), Some(&PicturePref::Av1Sw));
+        assert_eq!(allowed.video_pin, Some(PicturePref::Av1Sw));
     }
 
     #[test]

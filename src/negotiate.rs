@@ -373,6 +373,8 @@ pub enum Video {
     Mj2k,
     Mjpeg,
     H264Sw,
+    /// CPU AV1 through SVT-AV1 (`libsvtav1`). Used when software encode is allowed.
+    Av1Sw,
     PyrowaveCpu,
 }
 
@@ -394,7 +396,7 @@ impl Video {
     /// cores and about 40 Mbit/s, so Auto prefers MJ2K, MJPEG, and x264.
     /// JPEG XS and OpenAPV sit after GPU PyroWave: intra ffmpeg rows, no
     /// encode ASIC.
-    pub const ALL: [Video; 10] = [
+    pub const ALL: [Video; 11] = [
         Video::Av1Hw,
         Video::H265Hw,
         Video::H264Hw,
@@ -404,6 +406,7 @@ impl Video {
         Video::Mj2k,
         Video::Mjpeg,
         Video::H264Sw,
+        Video::Av1Sw,
         Video::PyrowaveCpu,
     ];
 
@@ -418,6 +421,7 @@ impl Video {
             Video::Mj2k => "mj2k",
             Video::Mjpeg => "mjpeg",
             Video::H264Sw => "h264-sw",
+            Video::Av1Sw => "av1-sw",
             Video::PyrowaveCpu => "pyrowave-cpu",
         }
     }
@@ -437,13 +441,14 @@ impl Video {
             Video::Mj2k => "MJ2K",
             Video::Mjpeg => "MJPEG",
             Video::H264Sw => "H.264 (SW)",
+            Video::Av1Sw => "AV1 (SW)",
             Video::PyrowaveCpu => "PyroWave (CPU)",
         }
     }
 
     pub fn codec(self) -> VideoCodec {
         match self {
-            Video::Av1Hw => VideoCodec::Av1,
+            Video::Av1Hw | Video::Av1Sw => VideoCodec::Av1,
             Video::H265Hw => VideoCodec::H265,
             Video::H264Hw | Video::H264Sw => VideoCodec::H264,
             Video::Pyrowave | Video::PyrowaveCpu => VideoCodec::Pyrowave,
@@ -457,7 +462,7 @@ impl Video {
     /// Hardware encode on the sender.
     ///
     /// GPU PyroWave counts: a Direct3D 11 device or a non-CPU Vulkan device.
-    /// CPU PyroWave does not. MJPEG and H.264 (SW) do not.
+    /// CPU PyroWave, MJPEG, H.264 (SW), and AV1 (SW) do not.
     pub fn hardware(self) -> bool {
         matches!(
             self,

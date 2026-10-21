@@ -358,7 +358,7 @@ etherquic-play connect --udp IP:PORT
     [--upscale off|auto|fsr|dlss|xess] [--frame-gen off|auto|on]
     [--no-keyboard] [--no-mouse] [--no-pads]
     [--output-device NAME] [--pad SLOT=NAME]... [--parent-pipe]
-    [--video av1-hw,h265-hw,h264-hw,pyrowave,jpegxs,openapv,mjpeg,h264-sw] [--audio opus,pcm]
+    [--video av1-hw,h265-hw,h264-hw,pyrowave,jpegxs,openapv,mjpeg,h264-sw,av1-sw] [--audio opus,pcm]
     [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--max-height PX] [--bitrate KBPS]
     [--quality 1-100] [--dirty-rects] [--debug-dirty-rects] [--yuv 420p8|422p8|444p8|420p10|422p10|444p10]
     [--fps auto|match|N] [--audio-bitrate KBPS] [--audio-channels 0-8]

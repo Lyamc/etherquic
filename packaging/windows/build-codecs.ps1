@@ -42,13 +42,20 @@ function Run([scriptblock]$cmd) {
 
 function Sync-Pin([string]$path, [string]$url, [string]$rev) {
     $rel = $path.Substring($root.Length).TrimStart('\')
+    # The release tree is a tarball. Submodule dirs arrive without .git, and
+    # `git submodule add` refuses a path that already exists.
     if (-not (Test-Path (Join-Path $path '.git'))) {
+        if (Test-Path $path) { Remove-Item -Recurse -Force $path }
         Push-Location $root
         & git submodule add --force $url $rel
         $added = $LASTEXITCODE
         Pop-Location
         if ($added -ne 0 -or -not (Test-Path (Join-Path $path '.git'))) {
-            throw "could not add submodule $url at $rel"
+            if (Test-Path $path) { Remove-Item -Recurse -Force $path }
+            & git clone --depth 1 $url $path
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $path '.git'))) {
+                throw "could not add submodule $url at $rel"
+            }
         }
     }
     & git -C $path fetch --depth 1 origin $rev
