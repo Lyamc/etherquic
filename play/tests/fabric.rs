@@ -11,6 +11,8 @@ use std::time::Duration;
 use etherquic::{
     client_endpoint, install_pure_crypto, peer_to_socket_addr, server_endpoint, Fabric,
 };
+use etherquic_media::host::{EncodeHub, HostOptions, KeyframeBus, Room, SharedEncode};
+use etherquic_media::negotiate::HostCaps;
 use etherquic_input::{Axes, Body, Buttons, Event, KeySource, PAD_SOUTH, PAD_UP};
 use etherquic_play::etherquic_media::host::FrameSlot;
 use etherquic_play::etherquic_media::negotiate::{Audio, Limit, Offer, Video};
@@ -42,6 +44,12 @@ fn mjpeg_offer() -> Offer {
         want_dirty_rects: None,
         yuv: None,
         fps: etherquic::negotiate::FpsWish::Auto,
+        audio_bitrate_kbps: 0,
+        audio_channels: 0,
+        view_only: false,
+        exclusive: false,
+        want_keyframe: false,
+        carrier: None,
     }
 }
 
@@ -125,6 +133,7 @@ fn host_media(frames: FrameSlot, audio: mpsc::Receiver<AudioChunk>) -> HostMedia
         display_hz: None,
         log: Arc::new(|_: &str| {}),
         cursor: tokio::sync::watch::channel(None).1,
+        shared: Default::default(),
     }
 }
 
@@ -147,6 +156,11 @@ fn player_media(offer: Offer, shown: std::sync::mpsc::Sender<Frame>) -> PlayerMe
             dirty_rects: false,
             yuv: etherquic::negotiate::YuvFormat::YUV444P8,
             fps: etherquic::negotiate::FpsWish::Auto,
+            max_width: 0,
+            max_height: 0,
+            video: None,
+            audio: None,
+            carrier: None,
         })
         .1,
     }
@@ -437,5 +451,237 @@ async fn file_clipboard_keystrokes_and_chat_cross_the_fabric(
     timeout(Duration::from_secs(30), desk.player)
         .await??
         .map_err(|error| error)?;
+    Ok(())
+}
+
+const PLAYER_B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x03];
+
+fn key_event(code: u8) -> Event {
+    Event {
+        time_us: u64::from(code),
+        body: Body::Key {
+            down: true,
+            source: KeySource::Keysym,
+            code: u32::from(code),
+        },
+    }
+}
+
+fn shared_host(frames: FrameSlot) -> (HostMedia, Room) {
+    let keyframes = KeyframeBus::default();
+    let options = HostOptions {
+        fps: etherquic::negotiate::FpsWish::Fixed(10),
+        display_hz: None,
+        caps: HostCaps::baseline(),
+        log: Arc::new(|_: &str| {}),
+        cap_kbps: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        carrier_tap: None,
+    };
+    let hub = EncodeHub::new(frames.clone(), keyframes.clone(), &options);
+    let room = Room::default();
+    let (_cursor_tx, cursor) = tokio::sync::watch::channel(None);
+    let (_audio_tx, audio) = mpsc::channel(1);
+    (
+        HostMedia {
+            frames,
+            audio,
+            fps: options.fps,
+            display_hz: None,
+            log: options.log,
+            cursor,
+            shared: SharedEncode {
+                keyframes,
+                hub: Some(hub),
+                room: Some(room.clone()),
+            },
+        },
+        room,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn view_only_player_does_not_inject(
+) -> Result<(), Box<dyn std::error::Error>> {
+    install_pure_crypto();
+    let cert = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../certs/cert.pem");
+    let key_pem = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../certs/key.pem");
+    let fabric = Fabric::new(1500);
+    let server = server_endpoint(fabric.clone(), HOST_MAC, SERVICE_ID, &cert, &key_pem)?;
+    let client_a = client_endpoint(fabric.clone(), CLIENT_MAC, SERVICE_ID)?;
+    let client_b = client_endpoint(fabric, PLAYER_B_MAC, SERVICE_ID)?;
+    let addr = peer_to_socket_addr(HOST_MAC, SERVICE_ID);
+
+    let frames = FrameSlot::new();
+    let host_frames = frames.clone();
+    let (input_tx, mut host_input) = mpsc::channel(8);
+    let (media, _room) = shared_host(host_frames.clone());
+    let host = tokio::spawn(async move {
+        for _ in 0..2 {
+            let incoming = server.accept().await.ok_or("no player")?;
+            let conn = incoming.await.map_err(|error| error.to_string())?;
+            let session = HostMedia {
+                frames: host_frames.clone(),
+                audio: {
+                    let (_tx, rx) = mpsc::channel(1);
+                    rx
+                },
+                fps: media.fps,
+                display_hz: None,
+                log: media.log.clone(),
+                cursor: media.cursor.clone(),
+                shared: media.shared.clone(),
+            };
+            let input = input_tx.clone();
+            tokio::spawn(async move {
+                let _ = serve(conn, session, input, None).await;
+            });
+        }
+        Ok::<(), String>(())
+    });
+
+    let (shown_a, _keep_a) = std::sync::mpsc::channel();
+    let (shown_b, _keep_b) = std::sync::mpsc::channel();
+    let (heard_a, _ha) = mpsc::channel(1);
+    let (heard_b, _hb) = mpsc::channel(1);
+    let (in_a, rx_a) = mpsc::channel(4);
+    let (in_b, rx_b) = mpsc::channel(4);
+    let offer_a = mjpeg_offer();
+    let mut offer_b = mjpeg_offer();
+    offer_b.view_only = true;
+    let player_a = tokio::spawn(async move {
+        let conn = client_a
+            .connect(addr, "localhost")
+            .map_err(|error| error.to_string())?
+            .await
+            .map_err(|error| error.to_string())?;
+        play(conn, player_media(offer_a, shown_a), heard_a, rx_a, None)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let player_b = tokio::spawn(async move {
+        let conn = client_b
+            .connect(addr, "localhost")
+            .map_err(|error| error.to_string())?
+            .await
+            .map_err(|error| error.to_string())?;
+        play(conn, player_media(offer_b, shown_b), heard_b, rx_b, None)
+            .await
+            .map_err(|error| error.to_string())
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    frames.put(red_frame());
+    let typing = key_event(b'a');
+    in_a.send(vec![typing.clone()]).await?;
+    in_b.send(vec![key_event(b'b')]).await?;
+
+    let got = timeout(Duration::from_secs(10), host_input.recv())
+        .await?
+        .ok_or("host got no input")?;
+    assert_eq!(got, vec![typing]);
+    let second = timeout(Duration::from_millis(400), host_input.recv()).await;
+    assert!(
+        second.is_err() || second.ok().flatten().is_none(),
+        "view-only player injected input"
+    );
+
+    frames.close();
+    drop(in_a);
+    drop(in_b);
+    let _ = timeout(Duration::from_secs(5), host).await;
+    let _ = timeout(Duration::from_secs(5), player_a).await;
+    let _ = timeout(Duration::from_secs(5), player_b).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exclusive_player_keeps_later_joins_out() -> Result<(), Box<dyn std::error::Error>> {
+    install_pure_crypto();
+    let cert = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../certs/cert.pem");
+    let key_pem = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../certs/key.pem");
+    let fabric = Fabric::new(1500);
+    let server = server_endpoint(fabric.clone(), HOST_MAC, SERVICE_ID, &cert, &key_pem)?;
+    let client_a = client_endpoint(fabric.clone(), CLIENT_MAC, SERVICE_ID)?;
+    let client_b = client_endpoint(fabric, PLAYER_B_MAC, SERVICE_ID)?;
+    let addr = peer_to_socket_addr(HOST_MAC, SERVICE_ID);
+
+    let frames = FrameSlot::new();
+    let host_frames = frames.clone();
+    let (input_tx, _host_input) = mpsc::channel(8);
+    let (media, room) = shared_host(host_frames.clone());
+    let host = tokio::spawn(async move {
+        loop {
+            let Some(incoming) = server.accept().await else {
+                break;
+            };
+            if room.locked() {
+                incoming.refuse();
+                continue;
+            }
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            let session = HostMedia {
+                frames: host_frames.clone(),
+                audio: {
+                    let (_tx, rx) = mpsc::channel(1);
+                    rx
+                },
+                fps: media.fps,
+                display_hz: None,
+                log: media.log.clone(),
+                cursor: media.cursor.clone(),
+                shared: media.shared.clone(),
+            };
+            let input = input_tx.clone();
+            tokio::spawn(async move {
+                let _ = serve(conn, session, input, None).await;
+            });
+        }
+        Ok::<(), String>(())
+    });
+
+    let (shown_a, _keep_a) = std::sync::mpsc::channel();
+    let (heard_a, _ha) = mpsc::channel(1);
+    let (_in_a, rx_a) = mpsc::channel(1);
+    let mut offer_a = mjpeg_offer();
+    offer_a.exclusive = true;
+    let player_a = tokio::spawn(async move {
+        let conn = client_a
+            .connect(addr, "localhost")
+            .map_err(|error| error.to_string())?
+            .await
+            .map_err(|error| error.to_string())?;
+        play(conn, player_media(offer_a, shown_a), heard_a, rx_a, None)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    frames.put(red_frame());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let late = timeout(Duration::from_secs(5), async {
+        let conn = client_b
+            .connect(addr, "localhost")
+            .map_err(|error| error.to_string())?
+            .await
+            .map_err(|error| error.to_string())?;
+        let (shown, _keep) = std::sync::mpsc::channel();
+        let (heard, _h) = mpsc::channel(1);
+        let (_input, rx) = mpsc::channel(1);
+        play(conn, player_media(mjpeg_offer(), shown), heard, rx, None)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    match late {
+        Ok(Ok(())) => panic!("exclusive session accepted a later player"),
+        Ok(Err(_)) | Err(_) => {}
+    }
+
+    frames.close();
+    player_a.abort();
+    host.abort();
     Ok(())
 }

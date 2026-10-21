@@ -53,6 +53,7 @@ pub fn server_endpoint(
 
     let socket = EtherSocket::open(fabric, mac, service_id);
     let runtime = Arc::new(TokioRuntime);
+    crate::note_quic_bind();
     Ok(Endpoint::new_with_abstract_socket(
         endpoint_config,
         Some(server_config),
@@ -87,6 +88,7 @@ pub fn client_endpoint(
 
     let socket = EtherSocket::open(fabric, mac, service_id);
     let runtime = Arc::new(TokioRuntime);
+    crate::note_quic_bind();
     let endpoint = Endpoint::new_with_abstract_socket(endpoint_config, None, socket, runtime)?;
     endpoint.set_default_client_config(client_config);
     let _ = ALPN_ETHERQUIC; // documented constant; already set on the rustls configs

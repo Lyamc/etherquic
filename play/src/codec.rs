@@ -138,6 +138,14 @@ pub struct CodecInfo {
     pub latency_rank: u8,
     /// How the codec spends bits.
     pub compression: &'static str,
+    /// Typical display-grab to decoded-frame delay in this product.
+    pub display_to_frame: &'static str,
+    /// Relative PSNR per coded byte versus H.264 at similar settings.
+    pub psnr_per_byte: &'static str,
+    pub i_frame: bool,
+    pub p_frame: bool,
+    /// Live encode keeps B-frames off (`zerolatency`).
+    pub b_frame: bool,
     /// Dedicated video-encode ASIC required on the sender.
     pub hardware_encode_required: bool,
     /// Dedicated video-decode ASIC required on the receiver.
@@ -154,6 +162,11 @@ const TABLE: &[CodecInfo] = &[
         name: "Pyrowave",
         latency_rank: 0,
         compression: "spends bandwidth, about 5–10× H.264/HEVC/AV1",
+        display_to_frame: "~1 frame",
+        psnr_per_byte: "~0.15×",
+        i_frame: true,
+        p_frame: false,
+        b_frame: false,
         hardware_encode_required: false,
         hardware_decode_required: false,
         gpu_compute_both_ends: true,
@@ -164,6 +177,11 @@ const TABLE: &[CodecInfo] = &[
         name: "MJPEG",
         latency_rank: 1,
         compression: "intra, weak compression",
+        display_to_frame: "~1 frame",
+        psnr_per_byte: "~0.3×",
+        i_frame: true,
+        p_frame: false,
+        b_frame: false,
         hardware_encode_required: false,
         hardware_decode_required: false,
         gpu_compute_both_ends: false,
@@ -174,6 +192,11 @@ const TABLE: &[CodecInfo] = &[
         name: "JPEG XS",
         latency_rank: 2,
         compression: "intra JPEG XS, visually lossless at modest ratios",
+        display_to_frame: "~1 frame",
+        psnr_per_byte: "~0.6×",
+        i_frame: true,
+        p_frame: false,
+        b_frame: false,
         hardware_encode_required: false,
         hardware_decode_required: false,
         gpu_compute_both_ends: false,
@@ -184,6 +207,11 @@ const TABLE: &[CodecInfo] = &[
         name: "OpenAPV",
         latency_rank: 3,
         compression: "intra APV through ffmpeg liboapv",
+        display_to_frame: "~1–2 frames",
+        psnr_per_byte: "~0.7×",
+        i_frame: true,
+        p_frame: false,
+        b_frame: false,
         hardware_encode_required: false,
         hardware_decode_required: false,
         gpu_compute_both_ends: false,
@@ -194,6 +222,11 @@ const TABLE: &[CodecInfo] = &[
         name: "MJ2K",
         latency_rank: 4,
         compression: "intra JPEG 2000, stronger than MJPEG",
+        display_to_frame: "~1–2 frames",
+        psnr_per_byte: "~0.5×",
+        i_frame: true,
+        p_frame: false,
+        b_frame: false,
         hardware_encode_required: false,
         hardware_decode_required: false,
         gpu_compute_both_ends: false,
@@ -204,6 +237,11 @@ const TABLE: &[CodecInfo] = &[
         name: "H.264",
         latency_rank: 5,
         compression: "compresses well",
+        display_to_frame: "~2 frames",
+        psnr_per_byte: "1×",
+        i_frame: true,
+        p_frame: true,
+        b_frame: false,
         hardware_encode_required: false,
         hardware_decode_required: false,
         gpu_compute_both_ends: false,
@@ -214,6 +252,11 @@ const TABLE: &[CodecInfo] = &[
         name: "H.265",
         latency_rank: 6,
         compression: "compresses better than H.264",
+        display_to_frame: "~2–3 frames",
+        psnr_per_byte: "~1.5×",
+        i_frame: true,
+        p_frame: true,
+        b_frame: false,
         hardware_encode_required: true,
         hardware_decode_required: true,
         gpu_compute_both_ends: false,
@@ -224,6 +267,11 @@ const TABLE: &[CodecInfo] = &[
         name: "AV1",
         latency_rank: 7,
         compression: "compresses best",
+        display_to_frame: "~3–4 frames",
+        psnr_per_byte: "~2×",
+        i_frame: true,
+        p_frame: true,
+        b_frame: false,
         hardware_encode_required: true,
         hardware_decode_required: true,
         gpu_compute_both_ends: false,
@@ -636,10 +684,14 @@ mod tests {
         assert!(pyro.hardware.contains("both ends"));
         assert!(pyro.hardware.contains("not a video-encode ASIC"));
         assert!(pyro.compression.contains("5–10×"));
+        assert_eq!(pyro.display_to_frame, "~1 frame");
+        assert_eq!(pyro.psnr_per_byte, "~0.15×");
+        assert!(pyro.i_frame && !pyro.p_frame && !pyro.b_frame);
 
         let mjpeg = &rows[1];
         assert!(mjpeg.compression.contains("intra"));
         assert!(mjpeg.compression.contains("weak compression"));
+        assert!(mjpeg.i_frame && !mjpeg.p_frame && !mjpeg.b_frame);
         assert!(!mjpeg.hardware_encode_required);
         assert!(!mjpeg.hardware_decode_required);
         assert!(mjpeg
@@ -654,6 +706,8 @@ mod tests {
         assert!(mj2k.compression.contains("JPEG 2000"));
         let h264 = rows.iter().find(|row| row.id == CodecId::H264).unwrap();
         assert!(h264.compression.contains("compresses well"));
+        assert_eq!(h264.psnr_per_byte, "1×");
+        assert!(h264.i_frame && h264.p_frame && !h264.b_frame);
         let h265 = rows.iter().find(|row| row.id == CodecId::H265).unwrap();
         assert!(h265.compression.contains("better than H.264"));
         assert!(h265.hardware_encode_required && h265.hardware_decode_required);

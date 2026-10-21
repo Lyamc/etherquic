@@ -433,6 +433,9 @@ pub struct PipelineContext<'a> {
 pub struct SyncPoint {
     fence: glow::Fence,
 }
+// GLsync is a raw pointer. The fence is only waited on from the thread that
+// holds the atlas lock, and it is safe to move that token between threads.
+unsafe impl Send for SyncPoint {}
 //TODO: destructor
 
 struct ExecutionContext {

@@ -158,6 +158,7 @@ async fn exchange(
             display_hz: None,
             log: Arc::new(|_: &str| {}),
             cursor: tokio::sync::watch::channel(None).1,
+            shared: Default::default(),
         };
         serve(conn, media, input_tx, None).await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -187,6 +188,12 @@ async fn exchange(
                 want_dirty_rects: None,
                 yuv: None,
                 fps: etherquic::negotiate::FpsWish::Auto,
+                audio_bitrate_kbps: 0,
+                audio_channels: 0,
+                view_only: false,
+                exclusive: false,
+                want_keyframe: false,
+                carrier: None,
             },
             frames: sink,
             events,
@@ -199,6 +206,11 @@ async fn exchange(
                 dirty_rects: false,
                 yuv: etherquic::negotiate::YuvFormat::YUV444P8,
                 fps: etherquic::negotiate::FpsWish::Auto,
+                max_width: 0,
+                max_height: 0,
+                video: None,
+                audio: None,
+                carrier: None,
             })
             .1,
         };

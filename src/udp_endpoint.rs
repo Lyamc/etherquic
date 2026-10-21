@@ -9,17 +9,58 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
 
 use crate::endpoint::EndpointError;
 use crate::tls;
 
 fn transport() -> TransportConfig {
     let mut transport = TransportConfig::default();
-    // Typical Ethernet path MTU; keep discovery on for real NICs.
+    // LAN Ethernet. Path MTU discovery stays off. The cap is 1452 bytes.
     transport.initial_mtu(1452);
     transport.min_mtu(1200);
+    transport.mtu_discovery_config(None);
+    // Mode 1, including the next listener after a short sample, stays at
+    // 12,000 bytes and 333 ms. Mode 2 retunes the connection that measured
+    // the RTT in [`apply_agreed_mode`].
+    crate::carrier::apply_mode(
+        &mut transport,
+        crate::carrier::QUIC_STREAMS,
+        false,
+        None,
+    );
+    transport.datagram_receive_buffer_size(Some(1024 * 1024));
+    transport.datagram_send_buffer_size(1024 * 1024);
     transport
+}
+
+/// Mode 2 on UDP takes the short path only when this connection's own RTT is
+/// under 2 ms. Mode 1 is unchanged. A stored sample from another connection
+/// does not widen this one.
+pub(crate) fn apply_agreed_mode(conn: &Connection, mode: u8) {
+    if mode != crate::carrier::QUIC_DATAGRAMS {
+        return;
+    }
+    if conn.congestion_state().initial_window() == crate::carrier::MODE2_WINDOW {
+        return;
+    }
+    // `rtt()` is the smoothed estimate and can sit above 2 ms while the
+    // ack-delay-free minimum is a few hundred microseconds. The minimum is
+    // the first path sample. Before any sample it is still the 333 ms initial.
+    let profile = crate::carrier::profile_for(
+        crate::carrier::QUIC_DATAGRAMS,
+        false,
+        Some(conn.min_rtt()),
+    );
+    if !profile.short {
+        return;
+    }
+    conn.retune_cubic(
+        profile.initial_rtt,
+        profile.initial_window,
+        profile.max_ack_delay,
+        u32::try_from(profile.ack_eliciting).unwrap_or(0),
+    );
 }
 
 /// IPv6 and IPv4 listeners for one play port.
@@ -129,6 +170,7 @@ fn server_on(
     let result = server_config(cert_pem, key_pem).and_then(|config| {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| EndpointError::Other("no async runtime".into()))?;
+        crate::note_quic_bind();
         Ok(Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(config),
@@ -175,6 +217,7 @@ pub fn udp_server_endpoint(
     cert_pem: &Path,
     key_pem: &Path,
 ) -> Result<Endpoint, EndpointError> {
+    crate::note_quic_bind();
     Ok(Endpoint::server(server_config(cert_pem, key_pem)?, addr)?)
 }
 
@@ -200,6 +243,7 @@ pub fn udp_client_endpoint_on(addr: SocketAddr) -> Result<Endpoint, EndpointErro
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
     client_config.transport_config(Arc::new(transport));
 
+    crate::note_quic_bind();
     let endpoint = Endpoint::client(addr)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
@@ -251,6 +295,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_short_sample_does_not_widen_mode_1_and_mode_2_retunes_the_measured_connection() {
+        crate::carrier::reset_udp_rtt();
+        crate::carrier::observe_udp_rtt(Duration::from_micros(800), true);
+        let (cert, key) = certs();
+        let listeners = udp_listeners(free_port(), &cert, &key);
+        let server = listeners.v4.expect("v4 listener");
+        let client = udp_client_endpoint_on("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dial = client
+            .connect(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, listeners.port)),
+                "localhost",
+            )
+            .unwrap();
+        let accept = async {
+            let incoming = server.accept().await.expect("listener open");
+            incoming.await.expect("handshake")
+        };
+        let (dialed, server_conn) = tokio::join!(dial, accept);
+        let client_conn = dialed.expect("client handshake");
+        assert_eq!(
+            client_conn.congestion_state().initial_window(),
+            crate::carrier::MODE1_WINDOW,
+            "mode 1 listener grew after a short sample"
+        );
+        assert_eq!(
+            server_conn.congestion_state().initial_window(),
+            crate::carrier::MODE1_WINDOW
+        );
+        apply_agreed_mode(&server_conn, crate::carrier::QUIC_STREAMS);
+        assert_eq!(
+            server_conn.congestion_state().initial_window(),
+            crate::carrier::MODE1_WINDOW
+        );
+        // One real round trip. A smoothed sample around 5901 µs must not hide
+        // a minimum under 2 ms, and nothing here writes a fake RTT.
+        let mut send = client_conn.open_uni().await.unwrap();
+        send.write_all(&[1u8; 32]).await.unwrap();
+        send.finish().unwrap();
+        let mut recv = server_conn.accept_uni().await.unwrap();
+        let mut buf = [0u8; 32];
+        recv.read_exact(&mut buf).await.unwrap();
+        let smoothed = server_conn.rtt();
+        let fastest = server_conn.min_rtt();
+        assert!(
+            smoothed >= Duration::from_millis(2) && fastest < Duration::from_millis(2),
+            "smoothed {} us min {} us",
+            smoothed.as_micros(),
+            fastest.as_micros()
+        );
+        assert_eq!(
+            server_conn.congestion_state().initial_window(),
+            crate::carrier::MODE1_WINDOW,
+            "smoothed RTT above 2 ms must not by itself leave the built window"
+        );
+        apply_agreed_mode(&server_conn, crate::carrier::QUIC_DATAGRAMS);
+        assert_eq!(
+            server_conn.congestion_state().initial_window(),
+            crate::carrier::MODE2_WINDOW
+        );
+        assert_eq!(server_conn.rtt(), Duration::from_millis(1));
+        assert_eq!(
+            server_conn.configured_max_ack_delay(),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            client_conn.congestion_state().initial_window(),
+            crate::carrier::MODE1_WINDOW,
+            "retuning the server must not widen the client"
+        );
+        client_conn.close(0u32.into(), b"done");
+        crate::carrier::reset_udp_rtt();
+    }
+
+    #[tokio::test]
     async fn ipv4_player_reaches_us_when_another_program_holds_the_port() {
         let (cert, key) = certs();
         let port = free_port();
@@ -297,6 +415,7 @@ mod tests {
         rustls_client.alpn_protocols = vec![tls::ALPN_ETHERQUIC.to_vec()];
         let client_config =
             ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_client).unwrap()));
+        crate::note_quic_bind();
         let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let dial = client
             .connect_with(

@@ -146,7 +146,6 @@ fn capture_loop(
     let mut logged_mode = String::new();
     note_mode(&notes, &capture, &mut logged_mode);
     let fps = desktop::display_hz().unwrap_or(proto::CAPTURE_FPS);
-    let period = Duration::from_millis((1000 / u64::from(fps.max(1))).max(1));
     note(&notes, format!("capture {fps} fps"));
     let mut logged: Option<(u32, u32)> = None;
     let mut logged_desktop = capture.desktop().to_string();
@@ -188,6 +187,10 @@ fn capture_loop(
                 continue;
             }
         }
+        if let Some(fps_now) = etherquic::read_capture_fps(&etherquic::capture_fps_path()) {
+            etherquic_media::host::set_capture_fps(fps_now);
+        }
+        let period = etherquic_media::host::capture_period(fps);
         pace(started, period, stop, || {
             publish_cursor(&mut cursor, &screen, &cursors)
         });
@@ -283,7 +286,12 @@ fn audio_loop(
     let mut last_sent = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         if loopback.is_none() {
-            match desktop::Loopback::open() {
+            let wanted = etherquic::staged_audio_device()
+                .or_else(|| etherquic::read_audio_next(&etherquic::audio_next_path()));
+            let names = desktop::output_names();
+            let label = etherquic::audio_open_label(wanted.as_deref(), &names);
+            note(&notes, format!("audio device {label} on this open"));
+            match desktop::Loopback::open_named(label.as_str()) {
                 Ok(next) => {
                     let format = (next.rate(), next.channels());
                     if logged_format != Some(format) {

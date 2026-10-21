@@ -1,0 +1,12 @@
+[package]
+name = "fresh-consumer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Calls avb and st2110 from outside their unit tests"
+
+[dependencies]
+avb = { path = "../avb" }
+st2110 = { path = "../st2110" }

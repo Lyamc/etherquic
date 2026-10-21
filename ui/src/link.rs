@@ -26,17 +26,126 @@ const MTU: usize = 1500;
 pub struct NicChoice {
     pub name: String,
     pub description: String,
+    /// Advertised link rate in Mbit/s, when the OS reports it.
+    pub speed_mbps: Option<u32>,
 }
 
 pub fn list_nics() -> Result<Vec<NicChoice>, String> {
     let nics = etherquic::pcap_link::list_nics().map_err(|e| e.to_string())?;
     Ok(nics
         .into_iter()
-        .map(|nic| NicChoice {
-            name: nic.name,
-            description: nic.description,
+        .map(|nic| {
+            let speed_mbps = link_speed_mbps(&nic.name, &nic.description);
+            NicChoice {
+                name: nic.name,
+                description: nic.description,
+                speed_mbps,
+            }
         })
         .collect())
+}
+
+fn link_speed_mbps(name: &str, description: &str) -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = description;
+        let text = std::fs::read_to_string(format!("/sys/class/net/{name}/speed")).ok()?;
+        crate::path_budget::parse_sysfs_speed(&text)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = description;
+        let out = std::process::Command::new("/sbin/ifconfig")
+            .arg(name)
+            .output()
+            .ok()?;
+        crate::path_budget::parse_ifconfig_speed(&String::from_utf8_lossy(&out.stdout))
+    }
+    #[cfg(windows)]
+    {
+        windows_link_speed_mbps(name, description)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
+    {
+        let _ = (name, description);
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_link_speed_mbps(name: &str, description: &str) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
+    };
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        if GetIfTable2(&mut table) != 0 || table.is_null() {
+            return None;
+        }
+        let count = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count);
+        let mut found = None;
+        for row in rows {
+            if row_matches_nic(row, name, description) {
+                let bits = row.TransmitLinkSpeed;
+                if bits > 0 {
+                    found = Some(((bits / 1_000_000) as u32).max(1));
+                    break;
+                }
+            }
+        }
+        FreeMibTable(table.cast());
+        found
+    }
+}
+
+#[cfg(windows)]
+fn row_matches_nic(
+    row: &windows_sys::Win32::NetworkManagement::IpHelper::MIB_IF_ROW2,
+    name: &str,
+    description: &str,
+) -> bool {
+    let guid = format_guid(&row.InterfaceGuid);
+    let name_l = name.to_ascii_lowercase();
+    if name_l.contains(&guid.to_ascii_lowercase()) {
+        return true;
+    }
+    let alias = utf16z(&row.Alias);
+    let desc = utf16z(&row.Description);
+    let description = description.trim();
+    (!alias.is_empty()
+        && (alias.eq_ignore_ascii_case(name) || alias.eq_ignore_ascii_case(description)))
+        || (!desc.is_empty()
+            && (desc.eq_ignore_ascii_case(name) || desc.eq_ignore_ascii_case(description)))
+}
+
+#[cfg(windows)]
+fn format_guid(guid: &windows_sys::core::GUID) -> String {
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    )
+}
+
+#[cfg(windows)]
+fn utf16z(buf: &[u16]) -> String {
+    let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
 }
 
 /// Host or player link. Drop stops the worker and joins it.
@@ -155,30 +264,32 @@ impl Link {
         host_l2: u8,
         udp: Option<SocketAddr>,
         codecs: CodecOffer,
+        l2_offer: bool,
+        rtp: Option<SocketAddr>,
     ) -> Result<(), String> {
         self.reap();
         if self.thread.is_some() {
             return Err("stop the current session first".into());
         }
-        let (net, opening) = if let Some(addr) = udp {
-            (None, format!("Opening the view to {addr}…"))
-        } else {
+        let net = etherquic::carrier::connect_net(udp, l2_offer, nic.as_deref(), |name| {
+            L2Net::open(name, MTU, ETHERTYPE_QUIC).map_err(|e| e.to_string())
+        })?;
+        let opening = if let Some(addr) = udp.or(rtp) {
+            format!("Opening the view to {addr}…")
+        } else if net.is_some() {
             let label = nic.clone().unwrap_or_else(|| "default adapter".into());
-            let net =
-                L2Net::open(nic.as_deref(), MTU, ETHERTYPE_QUIC).map_err(|e| e.to_string())?;
             let driver = etherquic::discover::l2_backend_label(host_l2);
             let driver = if driver.is_empty() {
                 String::new()
             } else {
                 format!(" Host L2: {driver}.")
             };
-            (
-                Some(net),
-                format!(
-                    "Opening the view to {} via {label}…{driver}",
-                    crate::format_mac(peer)
-                ),
+            format!(
+                "Opening the view to {} via {label}…{driver}",
+                crate::format_mac(peer)
             )
+        } else {
+            format!("Opening the view to {}…", crate::format_mac(peer))
         };
         self.arm(Role::Client, opening);
         self.picture = Arc::new(AtomicU64::new(0));
@@ -193,6 +304,8 @@ impl Link {
                     nic,
                     peer,
                     udp,
+                    l2_offer,
+                    rtp,
                     trace_input,
                     codecs,
                     stop,
@@ -262,6 +375,7 @@ impl Drop for Link {
     }
 }
 
+#[cfg(not(feature = "ui"))]
 fn announced_media(
     backend: etherquic::MediaBackend,
 ) -> (
@@ -282,6 +396,7 @@ fn announced_media(
 
 /// Capabilities and a desktop thumbnail for version-3 offers, refreshed in
 /// the background until `stop` is set.
+#[cfg(not(feature = "ui"))]
 fn discovery_extras(stop: Arc<AtomicBool>) -> Arc<dyn etherquic::discover::OfferExtras> {
     #[cfg(all(feature = "ui", not(target_os = "android")))]
     {
@@ -306,63 +421,16 @@ fn host_thread(
     peers: Arc<AtomicUsize>,
     status: Arc<Mutex<String>>,
 ) {
-    let discovery_stop = Arc::new(AtomicBool::new(false));
-    let discovery_flag = Arc::clone(&discovery_stop);
-    let l2_backend = net.l2_backend();
-    // Probed before this host binds, so it names the port the listeners take
-    // (the next free one when another program holds the service number).
-    let l3_port = etherquic::udp_port_for(PLAY_SERVICE_ID);
-    let discovery = std::thread::Builder::new()
-        .name("etherquic-announce".into())
-        .spawn(move || {
-            let (video, audio) = announced_media(backend);
-            let card = etherquic::discover::HostCard {
-                name: crate::share::machine_name(),
-                l2_mac: HOST_MAC,
-                l2_service: PLAY_SERVICE_ID,
-                l3_port,
-                video,
-                audio,
-                l2_backend,
-            };
-            let extras = discovery_extras(Arc::clone(&discovery_flag));
-            // UDP answers too, so a player without raw Ethernet still finds this host.
-            let udp = {
-                let (card, extras, flag, nic) = (
-                    card.clone(),
-                    Arc::clone(&extras),
-                    Arc::clone(&discovery_flag),
-                    nic.clone(),
-                );
-                std::thread::Builder::new()
-                    .name("etherquic-announce-udp".into())
-                    .spawn(move || {
-                        if let Err(err) =
-                            etherquic::discover::serve_udp(nic.as_deref(), &card, &*extras, &flag)
-                        {
-                            eprintln!("discovery over UDP: {err}");
-                        }
-                    })
-                    .ok()
-            };
-            if let Err(err) =
-                etherquic::discover::serve_with(nic.as_deref(), &card, &*extras, &discovery_flag)
-            {
-                eprintln!("discovery: {err}");
-            }
-            if let Some(handle) = udp {
-                let _ = handle.join();
-            }
-        })
-        .ok();
+    // The desktop host answers discovery for the life of the share.
+    // While this window is only a player, the system service is the answerer.
+    #[cfg(not(feature = "ui"))]
+    let _announcer = Announcer::start(nic, backend, None);
+    #[cfg(feature = "ui")]
+    let _unused_until_host = (nic, backend);
     #[cfg(all(feature = "ui", target_os = "android"))]
     {
         let _ = (net, cert, key, fps, up, peers, stop);
         write_status(&status, "Android cannot host a desktop.");
-        discovery_stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = discovery {
-            let _ = handle.join();
-        }
         return;
     }
     #[cfg(all(feature = "ui", not(target_os = "android")))]
@@ -391,10 +459,6 @@ fn host_thread(
         if let Err(err) = session_error(outcome) {
             write_status(&status, format!("Host failed: {err}"));
         }
-        discovery_stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = discovery {
-            let _ = handle.join();
-        }
         return;
     }
     #[cfg(not(feature = "ui"))]
@@ -407,10 +471,6 @@ fn host_thread(
             Ok(runtime) => runtime,
             Err(e) => {
                 write_status(&status, format!("Host failed: {e}"));
-                discovery_stop.store(true, Ordering::SeqCst);
-                if let Some(handle) = discovery {
-                    let _ = handle.join();
-                }
                 return;
             }
         };
@@ -476,9 +536,117 @@ fn host_thread(
         endpoint.close(0u32.into(), b"stop");
         let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
         });
-        discovery_stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = discovery {
+    }
+}
+
+/// Answers discovery until dropped. The headless host keeps one for the share.
+#[cfg(not(feature = "ui"))]
+pub(crate) struct Announcer {
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+    port: u16,
+}
+
+#[cfg(not(feature = "ui"))]
+impl Announcer {
+    pub(crate) fn idle() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            threads: Vec::new(),
+            port: 0,
+        }
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// `port` is the play UDP port to advertise. `None` probes for a free one.
+    pub(crate) fn start(
+        nic: Option<String>,
+        backend: etherquic::MediaBackend,
+        port: Option<u16>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let port = port.unwrap_or_else(|| etherquic::udp_port_for(PLAY_SERVICE_ID));
+        let l2_backend = advertised_driver(nic.as_deref());
+        let (video, audio) = announced_media(backend);
+        let card = etherquic::discover::HostCard {
+            name: crate::share::machine_name(),
+            l2_mac: HOST_MAC,
+            l2_service: PLAY_SERVICE_ID,
+            l3_port: port,
+            video,
+            audio,
+            l2_backend,
+        };
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("etherquic-announce".into())
+            .spawn(move || {
+                let extras = discovery_extras(Arc::clone(&flag));
+                let udp = {
+                    let (card, extras, flag, nic) = (
+                        card.clone(),
+                        Arc::clone(&extras),
+                        Arc::clone(&flag),
+                        nic.clone(),
+                    );
+                    std::thread::Builder::new()
+                        .name("etherquic-announce-udp".into())
+                        .spawn(move || {
+                            if let Err(err) = etherquic::discover::serve_udp(
+                                nic.as_deref(),
+                                &card,
+                                &*extras,
+                                &flag,
+                            ) {
+                                eprintln!("discovery over UDP: {err}");
+                            }
+                        })
+                        .ok()
+                };
+                if let Err(err) =
+                    etherquic::discover::serve_with(nic.as_deref(), &card, &*extras, &flag)
+                {
+                    eprintln!("discovery: {err}");
+                }
+                if let Some(handle) = udp {
+                    let _ = handle.join();
+                }
+            })
+            .ok();
+        Self {
+            stop,
+            threads: thread.into_iter().collect(),
+            port,
+        }
+    }
+}
+
+#[cfg(not(feature = "ui"))]
+impl Drop for Announcer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for handle in self.threads.drain(..) {
             let _ = handle.join();
+        }
+    }
+}
+
+/// Driver byte a later host session would open. Off Windows that is libpcap.
+#[cfg(not(feature = "ui"))]
+fn advertised_driver(nic: Option<&str>) -> u8 {
+    #[cfg(not(windows))]
+    {
+        let _ = nic;
+        etherquic::discover::L2_LIBPCAP
+    }
+    #[cfg(windows)]
+    {
+        match L2Net::open(nic, MTU, ETHERTYPE_QUIC) {
+            Ok(net) => net.l2_backend(),
+            Err(_) => 0,
         }
     }
 }
@@ -636,11 +804,53 @@ pub fn set_touch_pointer(on: bool) {
     let _ = on;
 }
 
+#[cfg(feature = "ui")]
+struct Staged {
+    view: etherquic_play::LiveView,
+    tune: etherquic_play::LiveTune,
+    commands: Option<std::sync::mpsc::Receiver<String>>,
+}
+
+#[cfg(feature = "ui")]
+fn pending() -> &'static Mutex<Option<Staged>> {
+    static PENDING: Mutex<Option<Staged>> = Mutex::new(None);
+    &PENDING
+}
+
+/// The next [`Link::connect`] uses this view, so a settings change reaches that
+/// session instead of only the process-wide default.
+#[cfg(feature = "ui")]
+pub fn stage_live(
+    view: etherquic_play::LiveView,
+    tune: etherquic_play::LiveTune,
+    commands: Option<std::sync::mpsc::Receiver<String>>,
+) {
+    let staged = Staged {
+        view,
+        tune,
+        commands,
+    };
+    match pending().lock() {
+        Ok(mut slot) => *slot = Some(staged),
+        Err(poisoned) => *poisoned.into_inner() = Some(staged),
+    }
+}
+
+#[cfg(feature = "ui")]
+fn take_staged() -> Option<Staged> {
+    match pending().lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
 fn client_thread(
     net: Option<Arc<L2Net>>,
     nic: Option<String>,
     peer: [u8; 6],
     udp: Option<SocketAddr>,
+    l2_offer: bool,
+    rtp: Option<SocketAddr>,
     trace_input: bool,
     codecs: CodecOffer,
     stop: Arc<AtomicBool>,
@@ -654,23 +864,39 @@ fn client_thread(
             // The picture window needs the main thread, which GPUI holds.
             drop(net);
             drop(picture);
-            child_view(nic, peer, udp, trace_input, codecs, stop, status);
+            let staged = take_staged();
+            child_view(
+                nic, peer, udp, l2_offer, rtp, trace_input, codecs, stop, status, staged,
+            );
         }
         #[cfg(target_os = "android")]
         {
-            let _ = (net, nic, picture, trace_input);
-            android_join(peer, udp, codecs, stop, status);
+            let _ = (net, nic, picture, trace_input, rtp, take_staged());
+            android_join(peer, udp, l2_offer, codecs, stop, status);
         }
         #[cfg(not(any(target_os = "macos", target_os = "android")))]
         {
             let _ = nic;
-            open_view(net, peer, udp, trace_input, codecs, stop, status, picture);
+            let staged = take_staged();
+            open_view(
+                net,
+                peer,
+                udp,
+                l2_offer,
+                rtp,
+                trace_input,
+                codecs,
+                stop,
+                status,
+                picture,
+                staged,
+            );
         }
     }
     #[cfg(not(feature = "ui"))]
     {
-        let _ = (trace_input, nic, codecs, picture);
-        client_quic(net, peer, udp, stop, status);
+        let _ = (trace_input, nic, codecs, picture, rtp);
+        client_quic(net, peer, udp, l2_offer, stop, status);
     }
 }
 
@@ -680,17 +906,34 @@ fn child_view(
     nic: Option<String>,
     peer: [u8; 6],
     udp: Option<SocketAddr>,
+    l2_offer: bool,
+    rtp: Option<SocketAddr>,
     trace_input: bool,
     codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
+    staged: Option<Staged>,
 ) {
-    let view = match live_view().lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+    let (view, commands) = match staged {
+        Some(staged) => {
+            let view = match staged.view.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            (view, staged.commands)
+        }
+        None => {
+            let view = match live_view().lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            (view, None)
+        }
     };
     let connect = crate::child_view::ChildConnect {
         udp,
+        l2_offer,
+        rtp,
         nic,
         peer_mac: peer,
         local_mac: CLIENT_MAC,
@@ -710,7 +953,7 @@ fn child_view(
             Err(poisoned) => *poisoned.into_inner() = text.to_string(),
         }
     };
-    if let Err(err) = crate::child_view::run(&connect, &stop, &report) {
+    if let Err(err) = crate::child_view::run(&connect, &stop, &report, commands) {
         write_status(&status, format!("Connect failed: {err}"));
         return;
     }
@@ -730,10 +973,13 @@ fn child_view(
 fn android_join(
     peer: [u8; 6],
     udp: Option<SocketAddr>,
+    l2_offer: bool,
     codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 ) {
+    // No raw NIC on Android. The opener must not run, and it does not open Ethernet.
+    let _ = etherquic::carrier::connect_net::<(), ()>(udp, l2_offer, None, |_nic| Err(()));
     let Some(addr) = udp else {
         write_status(
             &status,
@@ -762,6 +1008,11 @@ fn android_join(
         dirty_rects: offer.want_dirty_rects.unwrap_or(false),
         yuv: offer.yuv.unwrap_or_default(),
         fps: offer.fps,
+        max_width: offer.max.width,
+        max_height: offer.max.height,
+        video: None,
+        audio: None,
+        carrier: None,
     });
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<etherquic_play::AudioChunk>(8);
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(32);
@@ -801,11 +1052,14 @@ fn open_view(
     net: Option<Arc<L2Net>>,
     peer: [u8; 6],
     udp: Option<SocketAddr>,
+    l2_offer: bool,
+    rtp: Option<SocketAddr>,
     trace_input: bool,
     codecs: CodecOffer,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     picture: Arc<AtomicU64>,
+    staged: Option<Staged>,
 ) {
     let slot = Arc::clone(&status);
     let last = Arc::new(Mutex::new(String::new()));
@@ -818,13 +1072,23 @@ fn open_view(
             Err(poisoned) => *poisoned.into_inner() = text.to_string(),
         }
     });
+    let (view, tune) = match staged {
+        Some(staged) => (staged.view, staged.tune),
+        None => (
+            live_view(),
+            etherquic_play::live_tune(etherquic_play::SessionTune::default()),
+        ),
+    };
     let session = etherquic_play::ConnectSession {
         local_mac: CLIENT_MAC,
         peer_mac: peer,
         service_id: PLAY_SERVICE_ID,
         trace_input,
         udp,
-        view: live_view(),
+        l2_offer,
+        rtp,
+        view,
+        tune,
         codecs,
         picture,
     };
@@ -877,9 +1141,17 @@ fn client_quic(
     net: Option<Arc<L2Net>>,
     peer: [u8; 6],
     udp: Option<SocketAddr>,
+    l2_offer: bool,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 ) {
+    if !etherquic::carrier::connect_opens_ethernet(udp, l2_offer) && udp.is_none() {
+        write_status(
+            &status,
+            "The carrier session did not deliver picture and audio.",
+        );
+        return;
+    }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1040,11 +1312,7 @@ mod tests {
         let events = rx.try_recv().expect("queued extra key");
         assert_eq!(events.len(), 2);
         match &events[0].body {
-            etherquic_input::Body::Key {
-                down,
-                code,
-                source,
-            } => {
+            etherquic_input::Body::Key { down, code, source } => {
                 assert!(*down);
                 assert_eq!(*code, 0xff1b);
                 assert_eq!(*source, etherquic_input::KeySource::Keysym);

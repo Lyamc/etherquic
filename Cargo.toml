@@ -12,6 +12,9 @@ members = [
     "container",
     "packaging",
     "android",
+    "avb",
+    "st2110",
+    "fresh-consumer",
 ]
 # The root package is this manifest. Listing "." would mark every path under
 # it as an explicit member, and then exclude cannot keep vendor/quinn out.
@@ -40,7 +43,7 @@ blade-graphics = { path = "vendor/blade-graphics" }
 
 [package]
 name = "etherquic"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -49,8 +52,11 @@ publish = false
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 pcap = "2.2"
+# Look compute: ordered / poster / blocks. CPU LUT is the fallback.
+wgpu = { version = "24.0.3", features = ["wgsl"] }
+pollster = "0.4"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
@@ -64,7 +70,13 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dependencies]
+avb = { path = "avb" }
+st2110 = { path = "st2110" }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 bytes = "1"
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 quinn = { path = "vendor/quinn/quinn", default-features = false, features = [
     "runtime-tokio",
     "rustls-pure",

@@ -11,7 +11,7 @@ use cpal::{Sample, SampleFormat};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use etherquic::{install_pure_crypto, l2_server_endpoint, udp_accept, udp_listeners, L2Net};
 use etherquic_input::{Body, Buttons, Event, KeySource};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use xcap::Monitor;
 
 use crate::desk_io::{self, NoteSide};
@@ -52,9 +52,9 @@ pub struct HostSession {
     pub audio_device: Option<String>,
 }
 
-/// Share this desktop and block until `stop` is set or the player leaves.
+/// Share this desktop until `stop` is set.
 ///
-/// `up` is set once the listener exists. `peers` is 1 while that player is connected.
+/// `up` is set once the listener exists. `peers` is the number of connected viewers.
 pub fn host_desktop(
     net: Arc<L2Net>,
     host: HostSession,
@@ -64,7 +64,9 @@ pub fn host_desktop(
     status: Status,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(listen(net, host, stop, up, peers, status))
+    let result = rt.block_on(listen(net, host, stop, up, peers, status));
+    rt.shutdown_timeout(Duration::from_secs(2));
+    result
 }
 
 async fn listen(
@@ -87,11 +89,9 @@ async fn listen(
     let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
     let frames = etherquic_media::host::FrameSlot::new();
     let video_tx = frames.clone();
-    let (audio_tx, audio_rx) = mpsc::channel(8);
+    let (audio_tx, _audio_hold) = broadcast::channel(32);
     etherquic_media::caps::warm();
     let (input_tx, mut input_rx) = mpsc::channel::<Vec<Event>>(32);
-    let mut video_rx = Some(frames);
-    let mut audio_rx = Some(audio_rx);
 
     let capture_stop = Arc::clone(&stop);
     let capture_screen = screen.clone();
@@ -115,116 +115,93 @@ async fn listen(
     );
     let audio_stop = Arc::clone(&stop);
     let audio_device = host.audio_device.clone();
+    let capture_audio_tx = audio_tx.clone();
     let mut audio = Some(
         thread::Builder::new()
             .name("etherquic-play-audio".into())
             .spawn(move || {
-                if let Err(error) = capture_audio(audio_stop, audio_tx, audio_device.as_deref()) {
+                if let Err(error) =
+                    capture_audio(audio_stop, capture_audio_tx, audio_device.as_deref())
+                {
                     eprintln!("etherquic-play: audio capture stopped: {error}");
                 }
             })?,
     );
 
     let endpoint =
-        match l2_server_endpoint(net, host.local_mac, host.service_id, &host.cert, &host.key) {
+        match l2_server_endpoint(
+            Arc::clone(&net),
+            host.local_mac,
+            host.service_id,
+            &host.cert,
+            &host.key,
+        ) {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                release_host(
-                    &stop,
-                    &up,
-                    &peers,
-                    &mut video_rx,
-                    &mut audio_rx,
-                    &mut capture,
-                    &mut audio,
-                );
+                release_host(&stop, &up, &peers, &frames, &mut capture, &mut audio);
                 return Err(error.into());
             }
         };
     up.store(true, Ordering::SeqCst);
     let udp = udp_listeners(host.service_id, &host.cert, &host.key);
-    let udp_note = udp.note;
+    etherquic::carrier::enable_on_host(udp.port);
+    let udp_note = udp.note.clone();
     let udp_v4 = udp.v4;
     let udp_v6 = udp.v6;
+    // Announce the port that actually bound. Another program (RoSE on 4433)
+    // makes that the next free port, and players dial the one in the offer.
+    let discovery = start_discovery(&net, &host, udp.port, Arc::clone(&stop));
     let mac = format_mac(host.local_mac);
     status(&format!(
-        "Sharing this desktop as {mac} on service {}. {udp_note} Waiting for one player.",
+        "Sharing this desktop as {mac} on service {}. {udp_note} Waiting for players.",
         host.service_id
     ));
 
-    let incoming = tokio::select! {
-        incoming = endpoint.accept() => incoming,
-        incoming = udp_accept(udp_v4.as_ref()) => incoming,
-        incoming = udp_accept(udp_v6.as_ref()) => incoming,
-        _ = until_stop(&stop) => {
-            release_host(
-                &stop,
-                &up,
-                &peers,
-                &mut video_rx,
-                &mut audio_rx,
-                &mut capture,
-                &mut audio,
-            );
-            status("Host stopped.");
-            return Ok(());
-        }
-    };
-    let Some(incoming) = incoming else {
-        release_host(
-            &stop,
-            &up,
-            &peers,
-            &mut video_rx,
-            &mut audio_rx,
-            &mut capture,
-            &mut audio,
-        );
-        return Err("endpoint closed before a player connected".into());
-    };
-    let conn = match incoming.await {
-        Ok(conn) => conn,
-        Err(error) => {
-            release_host(
-                &stop,
-                &up,
-                &peers,
-                &mut video_rx,
-                &mut audio_rx,
-                &mut capture,
-                &mut audio,
-            );
-            return Err(error.into());
-        }
-    };
-    peers.store(1, Ordering::SeqCst);
-    status(&format!(
-        "Player connected ({}). This desktop is on their screen.",
-        conn.remote_address()
-    ));
-
     let inject_screen = screen.clone();
+    let inject_stop = Arc::clone(&stop);
     let (ack_tx, ack_rx) = mpsc::channel(64);
-    // macOS input injection holds a CGEventSource, which is not Send, so it
-    // gets a blocking thread there; elsewhere it stays an async task.
-    #[cfg(target_os = "macos")]
-    let inject = tokio::task::spawn_blocking(move || {
-        let mut hands = Hands::open();
-        while let Some(events) = input_rx.blocking_recv() {
-            let width = inject_screen.width.load(Ordering::Relaxed).max(1);
-            let height = inject_screen.height.load(Ordering::Relaxed).max(1);
-            hands.apply(&events, width, height, &ack_tx);
+    let (ack_bcast, _) = broadcast::channel::<crate::ack::InputAck>(64);
+    tokio::spawn({
+        let ack_bcast = ack_bcast.clone();
+        let mut ack_rx = ack_rx;
+        async move {
+            while let Some(ack) = ack_rx.recv().await {
+                let _ = ack_bcast.send(ack);
+            }
         }
     });
-    #[cfg(not(target_os = "macos"))]
-    let inject = tokio::spawn(async move {
-        let mut hands = Hands::open();
-        while let Some(events) = input_rx.recv().await {
-            let width = inject_screen.width.load(Ordering::Relaxed).max(1);
-            let height = inject_screen.height.load(Ordering::Relaxed).max(1);
-            hands.apply(&events, width, height, &ack_tx);
-        }
-    });
+    // Injection holds platform seats (CGEventSource, libei) that must not sit
+    // on the Tokio runtime. A dedicated thread matches capture and audio.
+    let mut inject = Some(
+        thread::Builder::new()
+            .name("etherquic-play-inject".into())
+            .spawn(move || {
+                let mut hands = None;
+                loop {
+                    if inject_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let events = match input_rx.try_recv() {
+                        Ok(events) => events,
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    };
+                    if let Some(slot) = recorded_input() {
+                        slot.lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .extend(events);
+                        continue;
+                    }
+                    let hands = hands.get_or_insert_with(Hands::open);
+                    let width = inject_screen.width.load(Ordering::Relaxed).max(1);
+                    let height = inject_screen.height.load(Ordering::Relaxed).max(1);
+                    hands.apply(&events, width, height, &ack_tx);
+                }
+            })?,
+    );
 
     let codec_status = status.clone();
     let log: etherquic_media::Log = Arc::new(move |line: &str| {
@@ -233,86 +210,338 @@ async fn listen(
             codec_status(&format!("Sending {line}."));
         }
     });
+    let caps = etherquic_media::caps::host_caps();
+    let options = etherquic_media::host::HostOptions {
+        fps: encode_wish,
+        display_hz: display_rate,
+        caps,
+        log: log.clone(),
+        cap_kbps: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        carrier_tap: Some(etherquic::carrier::open_carrier_tap()),
+    };
+    let keyframes = etherquic_media::host::KeyframeBus::default();
+    let hub = etherquic_media::host::EncodeHub::new(frames.clone(), keyframes.clone(), &options);
+    let room = etherquic_media::host::Room::default();
+    let shared = etherquic_media::host::SharedEncode {
+        keyframes,
+        hub: Some(hub),
+        room: Some(room.clone()),
+    };
     let (cmd_tx, pipes, outbound, inbound) = desk_io::open_notes(desk_io::desk_roster());
     desk_io::attach_host(cmd_tx);
     tokio::spawn(desk_io::pump_outbound(outbound));
     tokio::spawn(desk_io::pump_inbound(NoteSide::Host, inbound));
-    let session = serve_session(
-        conn,
-        crate::HostMedia {
-            frames: video_rx.clone().expect("frame slot"),
-            audio: audio_rx.take().expect("audio receiver"),
+    let notes = Arc::new(std::sync::Mutex::new(Some(pipes)));
+
+    let mut sessions: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut carrier_audio = audio_tx.subscribe();
+    let mut carrier_served = false;
+    loop {
+        sessions.retain(|task| !task.is_finished());
+        let wake = tokio::select! {
+            incoming = endpoint.accept() => HostWake::Conn(incoming),
+            incoming = udp_accept(udp_v4.as_ref()) => HostWake::Conn(incoming),
+            incoming = udp_accept(udp_v6.as_ref()) => HostWake::Conn(incoming),
+            _ = until_stop(&stop) => HostWake::Stop,
+            _ = tokio::time::sleep(Duration::from_millis(200)) => HostWake::Tick,
+        };
+        let incoming = match wake {
+            HostWake::Stop => break,
+            HostWake::Tick => {
+                offer_carrier_frame(&frames, &mut carrier_audio, &mut carrier_served);
+                continue;
+            }
+            HostWake::Conn(incoming) => incoming,
+        };
+        let Some(incoming) = incoming else {
+            status("Host endpoint closed.");
+            break;
+        };
+        if room.locked() {
+            incoming.refuse();
+            status("Exclusive session; a later join was refused.");
+            continue;
+        }
+        let conn = tokio::select! {
+            result = incoming => match result {
+                Ok(conn) => conn,
+                Err(error) => {
+                    eprintln!("etherquic-play: handshake failed: {error}");
+                    continue;
+                }
+            },
+            _ = until_stop(&stop) => break,
+        };
+        let n = peers.fetch_add(1, Ordering::SeqCst) + 1;
+        status(&format!(
+            "{n} player{} connected. Last join {}.",
+            if n == 1 { "" } else { "s" },
+            conn.remote_address()
+        ));
+        let media = crate::HostMedia {
+            frames: frames.clone(),
+            audio: subscribe_audio(&audio_tx),
             fps: encode_wish,
             display_hz: display_rate,
-            log,
-            cursor: cursor_rx,
-        },
-        input_tx,
-        Some(ack_rx),
-        pipes,
-    );
-    let asked = tokio::select! {
-        result = session => {
-            let asked = stop.load(Ordering::SeqCst);
+            log: log.clone(),
+            cursor: cursor_rx.clone(),
+            shared: shared.clone(),
+        };
+        let pipes = notes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .unwrap_or_else(crate::Pipes::idle);
+        let input = input_tx.clone();
+        let acks = subscribe_acks(&ack_bcast);
+        let peers = Arc::clone(&peers);
+        let status = status.clone();
+        sessions.push(tokio::spawn(async move {
+            let remote = conn.remote_address();
+            let result = serve_session(conn, media, input, Some(acks), pipes).await;
+            let left = peers.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
             if let Err(error) = result {
-                inject.abort();
-                desk_io::detach_host();
-                release_host(
-                    &stop,
-                    &up,
-                    &peers,
-                    &mut video_rx,
-                    &mut audio_rx,
-                    &mut capture,
-                    &mut audio,
-                );
-                return Err(error.into());
+                eprintln!("etherquic-play: player {remote} left: {error}");
             }
-            asked
-        }
-        _ = until_stop(&stop) => true,
-    };
-    inject.abort();
-    desk_io::detach_host();
-    release_host(
-        &stop,
-        &up,
-        &peers,
-        &mut video_rx,
-        &mut audio_rx,
-        &mut capture,
-        &mut audio,
-    );
-    if asked {
-        status("Host stopped.");
-    } else {
-        status("The player left.");
+            if left == 0 {
+                status("Waiting for players.");
+            } else {
+                status(&format!(
+                    "{left} player{} connected.",
+                    if left == 1 { "" } else { "s" }
+                ));
+            }
+        }));
     }
+    desk_io::detach_host();
+    stop.store(true, Ordering::SeqCst);
+    for task in &sessions {
+        task.abort();
+    }
+    drop(input_tx);
+    for task in sessions {
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+    if let Some(handle) = inject.take() {
+        let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+    }
+    release_host(&stop, &up, &peers, &frames, &mut capture, &mut audio);
+    join_discovery(discovery);
+    status("Host stopped.");
     Ok(())
+}
+
+/// Answers EQDS on UDP 4440 and EtherType 0x88B6 until `stop` is set.
+///
+/// An in-memory link has no driver, and announcing from it would open the
+/// real NIC during tests. A live host always has a backend.
+fn start_discovery(
+    net: &L2Net,
+    host: &HostSession,
+    udp_port: u16,
+    stop: Arc<AtomicBool>,
+) -> Vec<JoinHandle<()>> {
+    if net.l2_backend() == 0 {
+        return Vec::new();
+    }
+    let backend = etherquic::selected_backend(&etherquic::probe_backends());
+    let (video, audio) = etherquic::offer_media(backend);
+    let card = Arc::new(etherquic::discover::HostCard {
+        name: computer_name(),
+        l2_mac: host.local_mac,
+        l2_service: host.service_id,
+        l3_port: udp_port,
+        video: Some(video),
+        audio: Some(audio),
+        l2_backend: net.l2_backend(),
+    });
+    let nic = net.adapter().map(str::to_string);
+    let extras = crate::hostinfo::host_extras(Arc::clone(&stop));
+    eprintln!(
+        "etherquic-play: discovery on UDP 4440, play UDP {udp_port}, service {}",
+        host.service_id
+    );
+    let mut handles = Vec::new();
+    for udp in [false, true] {
+        let nic = nic.clone();
+        let card = Arc::clone(&card);
+        let extras = Arc::clone(&extras);
+        let stop = Arc::clone(&stop);
+        let name = if udp {
+            "etherquic-discover-udp"
+        } else {
+            "etherquic-discover"
+        };
+        match thread::Builder::new().name(name.into()).spawn(move || {
+            let nic = nic.as_deref();
+            let served = if udp {
+                etherquic::discover::serve_udp(nic, &card, &*extras, &stop)
+            } else {
+                etherquic::discover::serve_with(nic, &card, &*extras, &stop)
+            };
+            if let Err(err) = served {
+                let kind = if udp { "udp discovery" } else { "discovery" };
+                eprintln!("etherquic-play: {kind}: {err}");
+            }
+        }) {
+            Ok(handle) => handles.push(handle),
+            Err(err) => eprintln!("etherquic-play: discovery thread: {err}"),
+        }
+    }
+    handles
+}
+
+fn computer_name() -> String {
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+        })
+        .unwrap_or_else(|| "etherquic".into())
+}
+
+fn join_discovery(handles: Vec<JoinHandle<()>>) {
+    for handle in handles {
+        join_or_detach(Some(handle));
+    }
+}
+
+fn subscribe_audio(tx: &broadcast::Sender<AudioChunk>) -> mpsc::Receiver<AudioChunk> {
+    let mut rx = tx.subscribe();
+    let (out_tx, out_rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(chunk) => {
+                    if out_tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    out_rx
+}
+
+fn subscribe_acks(
+    tx: &broadcast::Sender<crate::ack::InputAck>,
+) -> mpsc::Receiver<crate::ack::InputAck> {
+    let mut rx = tx.subscribe();
+    let (out_tx, out_rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ack) => {
+                    if out_tx.send(ack).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    out_rx
 }
 
 fn release_host(
     stop: &AtomicBool,
     up: &AtomicBool,
     peers: &AtomicUsize,
-    video: &mut Option<etherquic_media::host::FrameSlot>,
-    audio_rx: &mut Option<mpsc::Receiver<AudioChunk>>,
+    video: &etherquic_media::host::FrameSlot,
     capture: &mut Option<JoinHandle<()>>,
     audio: &mut Option<JoinHandle<()>>,
 ) {
-    // Close the slot and drop the receiver first. A full queue would otherwise block the join.
-    if let Some(slot) = video.take() {
-        slot.close();
-    }
-    audio_rx.take();
+    video.close();
     stop.store(true, Ordering::SeqCst);
     up.store(false, Ordering::SeqCst);
     peers.store(0, Ordering::SeqCst);
-    if let Some(handle) = capture.take() {
-        let _ = handle.join();
+    join_or_detach(capture.take());
+    join_or_detach(audio.take());
+}
+
+fn join_or_detach(handle: Option<JoinHandle<()>>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = thread::Builder::new()
+        .name("etherquic-play-join".into())
+        .spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+    let _ = rx.recv_timeout(Duration::from_secs(2));
+}
+
+enum HostWake<T> {
+    Conn(T),
+    Tick,
+    Stop,
+}
+
+/// Encode the newest capture once the RTP hello names a carrier. No Quinn socket.
+fn offer_carrier_frame(
+    frames: &etherquic_media::host::FrameSlot,
+    audio: &mut broadcast::Receiver<AudioChunk>,
+    served: &mut bool,
+) {
+    match etherquic::carrier::offered_carrier() {
+        Some(id) if !*served => {
+            let Some(captured) = frames.latest() else {
+                return;
+            };
+            *served = true;
+            let frame = etherquic_media::host::fit_width(&captured, 320);
+            let pcm = pull_carrier_pcm(audio);
+            std::thread::spawn(move || {
+                let _ = etherquic_media::host::serve_carrier(id, &frame, &pcm);
+            });
+        }
+        None => *served = false,
+        Some(_) => {}
     }
-    if let Some(handle) = audio.take() {
-        let _ = handle.join();
+}
+
+fn pull_carrier_pcm(audio: &mut broadcast::Receiver<AudioChunk>) -> etherquic_media::Pcm {
+    let mut latest = None;
+    loop {
+        match audio.try_recv() {
+            Ok(chunk) => latest = Some(chunk),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    if let Some(chunk) = latest {
+        if !chunk.pcm.is_empty() {
+            let start = chunk.pcm.len().saturating_sub(480);
+            let samples = chunk.pcm[start..].to_vec();
+            if !samples.is_empty() {
+                return etherquic_media::Pcm {
+                    sample_rate: chunk.sample_rate.max(1),
+                    channels: chunk.channels.max(1),
+                    samples,
+                };
+            }
+        }
+    }
+    etherquic_media::Pcm {
+        sample_rate: 48_000,
+        channels: 1,
+        samples: vec![0; 480],
     }
 }
 
@@ -340,10 +569,10 @@ fn capture_loop(
     fps: u32,
 ) {
     let mut cursor = etherquic::cursor::Watch::new();
-    let period = Duration::from_millis((1000 / fps.max(1) as u64).max(1));
     let mut frames = 0u64;
     let mut logged = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        let period = etherquic_media::host::capture_period(fps);
         let started = Instant::now();
         match one_frame(&screen, max_width) {
             Ok(frame) => {
@@ -447,7 +676,7 @@ fn one_frame(screen: &Screen, max_width: u32) -> Result<etherquic_media::Frame, 
 
 fn capture_audio(
     stop: Arc<AtomicBool>,
-    audio: mpsc::Sender<AudioChunk>,
+    audio: broadcast::Sender<AudioChunk>,
     wanted: Option<&str>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
@@ -494,9 +723,7 @@ fn capture_audio(
             channels,
             pcm: samples,
         };
-        if audio.blocking_send(chunk).is_err() {
-            break;
-        }
+        let _ = audio.send(chunk);
     }
     Ok(())
 }

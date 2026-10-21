@@ -9,8 +9,17 @@
 //! (<https://github.com/Tezumie/Image-to-Pixel>, MIT). Ordered dither is
 //! stable across video frames. Error diffusion is included for the patterns;
 //! it can flicker between frames.
+//!
+//! Ordered, poster, and block looks run as a GPU compute shader when a
+//! discrete adapter is up. A 64³ palette LUT and reused CPU buffers keep the
+//! fallback under a millisecond at 1080p.
+
+use std::cell::RefCell;
 
 mod dither;
+#[cfg(not(target_os = "android"))]
+mod gpu;
+mod lut;
 mod palettes;
 
 pub use dither::Dither;
@@ -216,6 +225,13 @@ pub fn apply(rgb: &mut [u8], width: u32, height: u32, look: Look) {
     apply_style(rgb, width, height, Style::from_look(look));
 }
 
+/// Build palette tables and start the look compute device off the encode path.
+pub fn warm() {
+    lut::warm();
+    #[cfg(not(target_os = "android"))]
+    gpu::warm();
+}
+
 /// Paint `style` into packed RGB. `Off` does not write. A short buffer is left
 /// alone. Width and height stay the caller's.
 pub fn apply_style(rgb: &mut [u8], width: u32, height: u32, style: Style) {
@@ -232,20 +248,176 @@ pub fn apply_style(rgb: &mut [u8], width: u32, height: u32, style: Style) {
         return;
     }
     let rgb = &mut rgb[..need];
+    #[cfg(not(target_os = "android"))]
+    if gpu::try_apply(rgb, width, height, style) {
+        return;
+    }
+    apply_cpu(rgb, width as usize, height as usize, style);
+}
+
+#[derive(Default)]
+struct Scratch {
+    cells: Vec<u8>,
+    grid: Vec<f32>,
+    acc: Vec<f32>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
+fn apply_cpu(rgb: &mut [u8], width: usize, height: usize, style: Style) {
     let block = style.pixel_size() as usize;
-    let width = width as usize;
-    let height = height as usize;
     let gw = width.div_ceil(block);
     let gh = height.div_ceil(block);
-    let mut grid = vec![0.0f32; gw * gh * 3];
-    downsample(rgb, width, height, block, gw, gh, &mut grid);
-    match style.look {
-        Look::Off => {}
-        Look::Blocks => {}
-        Look::Poster => posterize_grid(&mut grid),
-        _ => quantize_grid(&mut grid, gw, gh, style),
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        if style.dither.is_diffusion() && !style.look.palette().is_empty() {
+            scratch.grid.resize(gw * gh * 3, 0.0);
+            downsample(rgb, width, height, block, gw, gh, &mut scratch.grid);
+            scratch.acc.clear();
+            scratch.acc.resize(gw * gh * 3, 0.0);
+            let Scratch {
+                ref mut grid,
+                ref mut acc,
+                ..
+            } = &mut *scratch;
+            diffuse(grid, gw, gh, style.look.palette(), style, acc);
+            upsample(rgb, width, height, block, gw, gh, grid);
+            return;
+        }
+        scratch.cells.resize(gw * gh * 3, 0);
+        downsample_u8(rgb, width, height, block, gw, gh, &mut scratch.cells);
+        match style.look {
+            Look::Off => {}
+            Look::Blocks => {}
+            Look::Poster => posterize_u8(&mut scratch.cells),
+            _ => ordered_u8(&mut scratch.cells, gw, gh, style),
+        }
+        upsample_u8(rgb, width, height, block, gw, gh, &scratch.cells);
+    });
+}
+
+fn downsample_u8(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    block: usize,
+    gw: usize,
+    gh: usize,
+    grid: &mut [u8],
+) {
+    for gy in 0..gh {
+        let y0 = gy * block;
+        let bh = block.min(height - y0);
+        for gx in 0..gw {
+            let x0 = gx * block;
+            let bw = block.min(width - x0);
+            let mut sr = 0u32;
+            let mut sg = 0u32;
+            let mut sb = 0u32;
+            for row in y0..y0 + bh {
+                let start = (row * width + x0) * 3;
+                for col in 0..bw {
+                    let i = start + col * 3;
+                    sr += u32::from(rgb[i]);
+                    sg += u32::from(rgb[i + 1]);
+                    sb += u32::from(rgb[i + 2]);
+                }
+            }
+            let n = (bw * bh) as u32;
+            let o = (gy * gw + gx) * 3;
+            grid[o] = ((sr + n / 2) / n) as u8;
+            grid[o + 1] = ((sg + n / 2) / n) as u8;
+            grid[o + 2] = ((sb + n / 2) / n) as u8;
+        }
     }
-    upsample(rgb, width, height, block, gw, gh, &grid);
+}
+
+fn upsample_u8(
+    rgb: &mut [u8],
+    width: usize,
+    height: usize,
+    block: usize,
+    gw: usize,
+    gh: usize,
+    grid: &[u8],
+) {
+    if block == 1 && grid.len() == rgb.len() {
+        rgb.copy_from_slice(grid);
+        return;
+    }
+    for gy in 0..gh {
+        let y0 = gy * block;
+        let bh = block.min(height - y0);
+        for gx in 0..gw {
+            let x0 = gx * block;
+            let bw = block.min(width - x0);
+            let o = (gy * gw + gx) * 3;
+            let colour = [grid[o], grid[o + 1], grid[o + 2]];
+            let first = (y0 * width + x0) * 3;
+            for col in 0..bw {
+                let i = first + col * 3;
+                rgb[i] = colour[0];
+                rgb[i + 1] = colour[1];
+                rgb[i + 2] = colour[2];
+            }
+            let row_bytes = bw * 3;
+            for row in 1..bh {
+                let dst = ((y0 + row) * width + x0) * 3;
+                rgb.copy_within(first..first + row_bytes, dst);
+            }
+        }
+    }
+}
+
+fn posterize_u8(grid: &mut [u8]) {
+    for value in grid {
+        let stepped = (u16::from(*value) + 16) / 32 * 32;
+        *value = stepped.min(255) as u8;
+    }
+}
+
+fn ordered_u8(grid: &mut [u8], gw: usize, gh: usize, style: Style) {
+    let palette = style.look.palette();
+    if palette.is_empty() {
+        return;
+    }
+    let table = lut::rgb(style.look);
+    let spread = palette_spread(palette) * style.strength01();
+    let map = dither::threshold_map(style.dither);
+    let spread_q = (spread * 255.0).round() as i32;
+    for y in 0..gh {
+        for x in 0..gw {
+            let o = (y * gw + x) * 3;
+            let (mut r, mut g, mut b) = (
+                i32::from(grid[o]),
+                i32::from(grid[o + 1]),
+                i32::from(grid[o + 2]),
+            );
+            if let Some(map) = &map {
+                if spread_q > 0 {
+                    let t = i32::from(map.values[(y % map.h) * map.w + (x % map.w)]);
+                    let levels = map.levels as i32;
+                    // (map + 0.5) / levels - 0.5, in 8-bit units.
+                    let amt = (t * 2 + 1 - levels) * spread_q / (levels * 2);
+                    r = (r + amt).clamp(0, 255);
+                    g = (g + amt).clamp(0, 255);
+                    b = (b + amt).clamp(0, 255);
+                }
+            }
+            let colour = match table {
+                Some(table) => {
+                    let i = lut::index(r as u8, g as u8, b as u8) * 3;
+                    [table[i], table[i + 1], table[i + 2]]
+                }
+                None => nearest(palette, r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
+            };
+            grid[o] = colour[0];
+            grid[o + 1] = colour[1];
+            grid[o + 2] = colour[2];
+        }
+    }
 }
 
 fn downsample(
@@ -318,63 +490,16 @@ fn upsample(
     }
 }
 
-fn poster_channel(value: f32) -> f32 {
-    let stepped = ((value * 255.0 + 16.0) / 32.0).floor() * 32.0;
-    (stepped / 255.0).clamp(0.0, 1.0)
-}
-
-fn posterize_grid(grid: &mut [f32]) {
-    for chunk in grid.chunks_exact_mut(3) {
-        chunk[0] = poster_channel(chunk[0]);
-        chunk[1] = poster_channel(chunk[1]);
-        chunk[2] = poster_channel(chunk[2]);
-    }
-}
-
-fn quantize_grid(grid: &mut [f32], gw: usize, gh: usize, style: Style) {
-    let palette = style.look.palette();
-    if palette.is_empty() {
-        return;
-    }
-    if style.dither.is_diffusion() {
-        diffuse(grid, gw, gh, palette, style);
-    } else {
-        ordered(grid, gw, gh, palette, style);
-    }
-}
-
-fn ordered(grid: &mut [f32], gw: usize, gh: usize, palette: &[[u8; 3]], style: Style) {
-    let spread = palette_spread(palette) * style.strength01();
-    let map = dither::threshold_map(style.dither);
-    for y in 0..gh {
-        for x in 0..gw {
-            let o = (y * gw + x) * 3;
-            let mut r = grid[o];
-            let mut g = grid[o + 1];
-            let mut b = grid[o + 2];
-            if let Some(map) = &map {
-                if spread > 0.0 {
-                    let t = (f32::from(map.values[(y % map.h) * map.w + (x % map.w)]) + 0.5)
-                        / map.levels as f32
-                        - 0.5;
-                    let amt = t * spread;
-                    r = (r + amt).clamp(0.0, 1.0);
-                    g = (g + amt).clamp(0.0, 1.0);
-                    b = (b + amt).clamp(0.0, 1.0);
-                }
-            }
-            let colour = nearest(palette, r, g, b);
-            grid[o] = f32::from(colour[0]) / 255.0;
-            grid[o + 1] = f32::from(colour[1]) / 255.0;
-            grid[o + 2] = f32::from(colour[2]) / 255.0;
-        }
-    }
-}
-
-fn diffuse(grid: &mut [f32], gw: usize, gh: usize, palette: &[[u8; 3]], style: Style) {
+fn diffuse(
+    grid: &mut [f32],
+    gw: usize,
+    gh: usize,
+    palette: &[[u8; 3]],
+    style: Style,
+    acc: &mut [f32],
+) {
     let kernel = dither::kernel(style.dither);
     let strength = style.strength01();
-    let mut acc = vec![0.0f32; gw * gh * 3];
     for y in 0..gh {
         for x in 0..gw {
             let p = y * gw + x;
@@ -647,6 +772,58 @@ mod tests {
             }
         }
         assert!(saw_dark && saw_light, "{rgb:?}");
+    }
+
+    #[test]
+    fn hd_ordered_look_stays_under_a_frame() {
+        lut::warm();
+        let width = 1280u32;
+        let height = 720u32;
+        let mut rgb = vec![0u8; (width * height * 3) as usize];
+        for (i, byte) in rgb.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        let start = std::time::Instant::now();
+        apply_style(
+            &mut rgb,
+            width,
+            height,
+            Style {
+                look: Look::Pico8,
+                dither: Dither::Bayer4,
+                pixel_size: 2,
+                strength: 60,
+            },
+        );
+        let elapsed = start.elapsed();
+        let budget = if cfg!(debug_assertions) {
+            std::time::Duration::from_millis(80)
+        } else {
+            std::time::Duration::from_millis(8)
+        };
+        assert!(
+            elapsed < budget,
+            "look paint took {elapsed:?} (budget {budget:?})"
+        );
+        assert!(PICO8.contains(&[rgb[0], rgb[1], rgb[2]]));
+    }
+
+    #[test]
+    fn palette_lut_snaps_to_the_look() {
+        lut::warm();
+        for look in Look::ALL {
+            let palette = look.palette();
+            if palette.is_empty() {
+                continue;
+            }
+            let table = lut::rgb(look).expect(look.token());
+            let i = lut::index(255, 0, 0) * 3;
+            let colour = [table[i], table[i + 1], table[i + 2]];
+            assert!(
+                palette.iter().any(|entry| entry == &colour),
+                "{look:?} lut left the palette at {colour:?}"
+            );
+        }
     }
 
     #[test]

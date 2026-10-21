@@ -2,8 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-mod args;
-
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -24,8 +22,8 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _capture = StopCapture;
     let stop = Arc::new(AtomicBool::new(false));
     watch_ctrl_c(Arc::clone(&stop));
-    match args::parse(std::env::args().skip(1))? {
-        args::Command::Host(host) => {
+    match etherquic_play::args::parse(std::env::args().skip(1))? {
+        etherquic_play::args::Command::Host(host) => {
             let net = L2Net::open(host.nic.as_deref(), 1500, ETHERTYPE_QUIC)?;
             etherquic_play::host_desktop(
                 net,
@@ -44,14 +42,22 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 etherquic_play::stderr_status(),
             )
         }
-        args::Command::Connect(connect) => {
-            if connect.parent_pipe {
-                watch_stdin(Arc::clone(&stop));
+        etherquic_play::args::Command::Connect(connect) => {
+            if let Some(profile) = connect.profile.as_deref() {
+                let plain = profile == "plain";
+                etherquic::carrier::choose_profile(plain, !plain);
             }
-            let net = match connect.udp {
-                Some(_) => None,
-                None => Some(L2Net::open(connect.nic.as_deref(), 1500, ETHERTYPE_QUIC)?),
-            };
+            let view = etherquic_play::live(connect.view);
+            let tune = etherquic_play::live_tune(etherquic_play::SessionTune::default());
+            if connect.parent_pipe {
+                etherquic_play::parent_ctl::watch_stdin(Arc::clone(&stop), view.clone(), tune.clone());
+            }
+            let net = etherquic::carrier::connect_net(
+                connect.udp,
+                connect.l2_offer,
+                connect.nic.as_deref(),
+                |nic| L2Net::open(nic, 1500, ETHERTYPE_QUIC),
+            )?;
             etherquic_play::connect_view(
                 net,
                 etherquic_play::ConnectSession {
@@ -60,7 +66,10 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     service_id: connect.service_id,
                     trace_input: connect.trace_input,
                     udp: connect.udp,
-                    view: etherquic_play::live(connect.view),
+                    l2_offer: connect.l2_offer,
+                    rtp: connect.rtp,
+                    view,
+                    tune,
                     codecs: connect.codecs,
                     picture: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 },
@@ -77,23 +86,6 @@ impl Drop for StopCapture {
     fn drop(&mut self) {
         let _ = etherquic::capture_stop();
     }
-}
-
-/// `--parent-pipe`: the parent closes stdin (or exits) to end the session.
-fn watch_stdin(stop: Arc<AtomicBool>) {
-    let _ = thread::Builder::new()
-        .name("etherquic-play-parent".into())
-        .spawn(move || {
-            let mut sink = [0u8; 64];
-            let mut stdin = std::io::stdin();
-            loop {
-                match std::io::Read::read(&mut stdin, &mut sink) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-            stop.store(true, Ordering::SeqCst);
-        });
 }
 
 /// Ctrl-C sets the flag the desktop session already watches.

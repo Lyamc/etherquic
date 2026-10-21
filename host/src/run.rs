@@ -1,4 +1,4 @@
-//! One player at a time on the configured MAC and service id.
+//! Players on the configured MAC and service id.
 //!
 //! The NIC opens on this thread. The Quinn endpoint is created inside the
 //! Tokio runtime, same as the host console. Certificates come from
@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -99,20 +99,8 @@ pub fn serve(stop: &AtomicBool, log: &Log, mut note: impl FnMut(Note)) -> Result
         Some(cfg.nic.as_str())
     };
     let net = L2Net::open(nic, MTU, ETHERTYPE_QUIC).map_err(|err| err.to_string())?;
-    let discovery_stop = Arc::new(AtomicBool::new(false));
     let picture: crate::extras::Picture = Arc::new(std::sync::Mutex::new(None));
-    let discovery = spawn_discovery(
-        &cfg,
-        &paths.log,
-        Arc::clone(&discovery_stop),
-        net.l2_backend(),
-        Arc::clone(&picture),
-    );
     if stop.load(Ordering::SeqCst) {
-        discovery_stop.store(true, Ordering::SeqCst);
-        for handle in discovery {
-            let _ = handle.join();
-        }
         return Ok(());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -120,13 +108,57 @@ pub fn serve(stop: &AtomicBool, log: &Log, mut note: impl FnMut(Note)) -> Result
         .build()
         .map_err(|err| err.to_string())?;
     let control = paths.control_dir();
-    let result = runtime.block_on(accept_loop(
-        net, cfg, cert, key, control, stop, log, &mut note, picture,
-    ));
-    discovery_stop.store(true, Ordering::SeqCst);
-    for handle in discovery {
-        let _ = handle.join();
-    }
+    let presence = paths.dir().join("presence.txt");
+    let mut net = net;
+    let mut cfg = cfg;
+    let result = loop {
+        let discovery_stop = Arc::new(AtomicBool::new(false));
+        let discovery = spawn_discovery(
+            &cfg,
+            &paths.log,
+            Arc::clone(&discovery_stop),
+            net.l2_backend(),
+            Arc::clone(&picture),
+        );
+        let reopen = Arc::new(AtomicBool::new(false));
+        let result = runtime.block_on(accept_loop(
+            Arc::clone(&net),
+            cfg.clone(),
+            cert.clone(),
+            key.clone(),
+            control.clone(),
+            presence.clone(),
+            stop,
+            log,
+            &mut note,
+            picture.clone(),
+            Arc::clone(&reopen),
+        ));
+        discovery_stop.store(true, Ordering::SeqCst);
+        for handle in discovery {
+            let _ = handle.join();
+        }
+        if stop.load(Ordering::SeqCst) || !reopen.load(Ordering::SeqCst) {
+            break result;
+        }
+        let existing = fs::read_to_string(&paths.config).ok();
+        cfg = config::resolve(existing.as_deref(), &identity::machine_id())?;
+        let nic = if cfg.nic.is_empty() {
+            None
+        } else {
+            Some(cfg.nic.as_str())
+        };
+        net = L2Net::open(nic, MTU, ETHERTYPE_QUIC).map_err(|err| err.to_string())?;
+        log.line(&format!("reopened listener on {}", cfg.nic));
+    };
+    let _ = etherquic::store_presence(
+        &presence,
+        &etherquic::Presence {
+            running: false,
+            hosting: false,
+            guests: Vec::new(),
+        },
+    );
     result
 }
 
@@ -292,14 +324,16 @@ pub fn signal(approve: bool) -> Result<(), String> {
 
 async fn accept_loop(
     net: std::sync::Arc<L2Net>,
-    cfg: HostConfig,
+    mut cfg: HostConfig,
     cert: PathBuf,
     key: PathBuf,
     control: PathBuf,
+    presence: PathBuf,
     stop: &AtomicBool,
     log: &Log,
     note: &mut impl FnMut(Note),
     picture: crate::extras::Picture,
+    reopen: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let endpoint = l2_server_endpoint(net, cfg.mac, cfg.service, &cert, &key)
         .map_err(|err| err.to_string())?;
@@ -309,6 +343,7 @@ async fn accept_loop(
         "Confirmation required. Run etherquic-host --approve."
     };
     let udp = udp_listeners(cfg.service, &cert, &key);
+    etherquic::carrier::enable_on_host(udp.port);
     log.line(&format!(
         "listening. This PC is {} on service {}, UDP port {}. {} {access}",
         config::format_mac(cfg.mac),
@@ -317,13 +352,16 @@ async fn accept_loop(
         udp.note
     ));
     note(Note::Ready);
+    let guests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    publish_presence(&presence, true, true, &guests);
     #[cfg(windows)]
-    let desk = crate::bridge::Desk::spawn(log, picture);
+    let desk = std::sync::Arc::new(crate::bridge::Desk::spawn(log, picture));
     #[cfg(not(windows))]
     drop(picture);
     let mut udp_v4 = udp.v4;
     let mut udp_v6 = udp.v6;
     let mut closed_by_endpoint = false;
+    let mut carrier_served = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -335,7 +373,16 @@ async fn accept_loop(
             _ = tokio::time::sleep(Duration::from_millis(200)) => Arrival::Tick,
         };
         let incoming = match arrival {
-            Arrival::Tick => continue,
+            Arrival::Tick => {
+                if let Some(adjust) = etherquic::take_adjust(&control.join("host-settings")) {
+                    apply_host_adjust(&adjust, &mut cfg, &presence, log, &reopen);
+                    if reopen.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                push_carrier_frame(&mut carrier_served);
+                continue;
+            }
             Arrival::L2(None) => {
                 log.line("host endpoint closed");
                 closed_by_endpoint = true;
@@ -356,6 +403,12 @@ async fn accept_loop(
             | Arrival::Udp6(Some(incoming)) => incoming,
         };
         let remote = incoming.remote_address().to_string();
+        #[cfg(windows)]
+        if desk.locked() {
+            log.line(&format!("exclusive session; refused {remote}"));
+            incoming.refuse();
+            continue;
+        }
         match wait_for_player(cfg.unattended, &control, stop, log, &remote).await {
             Verdict::Stop => {
                 incoming.refuse();
@@ -379,17 +432,22 @@ async fn accept_loop(
                 match accepted {
                     Ok(conn) => {
                         log.line(&format!("player connected ({remote})"));
+                        remember_guest(&guests, &presence, &remote, true);
                         #[cfg(windows)]
                         {
                             log.line("serving picture, audio, and input");
-                            tokio::select! {
-                                result = desk.serve_player(conn) => {
-                                    if let Err(err) = result {
-                                        log.line(&format!("play session: {err}"));
-                                    }
+                            let desk = std::sync::Arc::clone(&desk);
+                            let log = log.clone();
+                            let guests = Arc::clone(&guests);
+                            let presence = presence.clone();
+                            let remote = remote.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = desk.serve_player(conn).await {
+                                    log.line(&format!("play session: {err}"));
                                 }
-                                _ = until_stop(stop) => {}
-                            }
+                                log.line("player disconnected");
+                                remember_guest(&guests, &presence, &remote, false);
+                            });
                         }
                         #[cfg(not(windows))]
                         {
@@ -398,11 +456,12 @@ async fn accept_loop(
                                 _ = until_stop(stop) => {}
                             }
                             drop(conn);
+                            log.line("player disconnected");
+                            remember_guest(&guests, &presence, &remote, false);
                         }
                         if stop.load(Ordering::SeqCst) {
                             break;
                         }
-                        log.line("player disconnected");
                     }
                     Err(err) => log.line(&format!("handshake failed: {err}")),
                 }
@@ -411,7 +470,10 @@ async fn accept_loop(
     }
     #[cfg(windows)]
     drop(desk);
-    note(Note::Stopping);
+    if !reopen.load(Ordering::SeqCst) {
+        note(Note::Stopping);
+    }
+    publish_presence(&presence, false, false, &guests);
     endpoint.close(0u32.into(), b"stop");
     if let Some(endpoint) = udp_v4.as_ref() {
         endpoint.close(0u32.into(), b"stop");
@@ -425,6 +487,121 @@ async fn accept_loop(
     }
     log.line("host stopped");
     Ok(())
+}
+
+fn publish_presence(path: &Path, running: bool, hosting: bool, guests: &Mutex<Vec<String>>) {
+    let guests = match guests.lock() {
+        Ok(guests) => guests.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let _ = etherquic::store_presence(
+        path,
+        &etherquic::Presence {
+            running,
+            hosting,
+            guests,
+        },
+    );
+}
+
+fn remember_guest(guests: &Mutex<Vec<String>>, presence: &Path, remote: &str, add: bool) {
+    {
+        let mut list = match guests.lock() {
+            Ok(list) => list,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if add {
+            if !list.iter().any(|item| item == remote) {
+                list.push(remote.to_string());
+            }
+        } else {
+            list.retain(|item| item != remote);
+        }
+    }
+    publish_presence(presence, true, true, guests);
+}
+
+fn apply_host_adjust(
+    adjust: &etherquic::HostAdjust,
+    cfg: &mut HostConfig,
+    presence: &Path,
+    log: &Log,
+    reopen: &AtomicBool,
+) {
+    let effect = etherquic::host_effect(&cfg.nic, adjust);
+    if let Some(on) = effect.dirty_rects {
+        etherquic_media::host::set_dirty_rects(on);
+        log.line(&format!("dirty-rects {}", if on { "on" } else { "off" }));
+    }
+    if let Some(fps) = effect.capture_fps {
+        etherquic_media::host::set_capture_fps(fps);
+        if etherquic::write_capture_fps(&etherquic::capture_fps_path(), fps).is_ok() {
+            log.line(&format!("capture fps {fps}"));
+        } else {
+            log.line(&format!("capture fps {fps} (this process only)"));
+        }
+    }
+    if let Some(name) = effect.audio_on_next_open.clone() {
+        etherquic::stage_audio_device(Some(name.clone()));
+        let _ = etherquic::write_audio_next(&etherquic::audio_next_path(), Some(&name));
+        log.line("audio device applies when capture opens again");
+    }
+    let Some(nic) = effect.reopen_nic else {
+        return;
+    };
+    cfg.nic = nic.clone();
+    if let Some(dir) = presence.parent() {
+        let path = dir.join("host.conf");
+        if let Ok(text) = fs::read_to_string(&path) {
+            if let Ok(mut next) = config::resolve(Some(&text), &identity::machine_id()) {
+                next.nic = nic.clone();
+                if write_text(&path, &config::render(&next)).is_ok() {
+                    log.line(&format!("host nic is now {nic}; reopening the listener"));
+                    reopen.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
+
+/// One encoded frame on the carrier the player hello selected. No Quinn socket.
+fn push_carrier_frame(served: &mut bool) {
+    match etherquic::carrier::offered_carrier() {
+        Some(id) if !*served => {
+            *served = true;
+            std::thread::spawn(move || {
+                let frame = carrier_stand_in();
+                let pcm = etherquic_media::Pcm {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    samples: vec![0; 480],
+                };
+                let _ = etherquic_media::host::serve_carrier(id, &frame, &pcm);
+            });
+        }
+        None => *served = false,
+        Some(_) => {}
+    }
+}
+
+/// This service has no capture loop on the pre-Quinn path. The raster is real
+/// RGB so the JPEG encoder runs; it is not a stored picture byte string.
+fn carrier_stand_in() -> etherquic_media::Frame {
+    let width = 16u32;
+    let height = 16u32;
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            rgb.push((x * 15) as u8);
+            rgb.push((y * 15) as u8);
+            rgb.push(96);
+        }
+    }
+    etherquic_media::Frame {
+        width,
+        height,
+        rgb,
+    }
 }
 
 enum Arrival {

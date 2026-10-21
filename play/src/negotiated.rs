@@ -15,6 +15,8 @@ pub struct CodecChoice {
     pub audio_pin: Option<AudioId>,
     /// Largest picture width to ask for. Zero is the host's choice.
     pub max_width: u32,
+    /// Largest picture height to ask for. Zero is the host's choice.
+    pub max_height: u32,
     pub bitrate_kbps: u32,
     /// Picture quality 1–100. Zero is the host default (40).
     pub quality: u8,
@@ -24,6 +26,16 @@ pub struct CodecChoice {
     pub yuv: etherquic::negotiate::YuvFormat,
     /// Pictures per second. Auto is 15 software / 30 hardware on the host.
     pub fps: etherquic::negotiate::FpsWish,
+    /// Stereo-equivalent audio bitrate in kbit/s. Zero is Auto (96 stereo).
+    pub audio_bitrate_kbps: u32,
+    /// Max audio channels. Zero is Auto (2-channel stereo).
+    pub audio_channels: u16,
+    /// Watch without injecting input.
+    pub view_only: bool,
+    /// Kick other viewers and refuse later joins.
+    pub exclusive: bool,
+    /// Pinned carrier. `None` omits `carrier N` from the offer.
+    pub carrier: Option<u8>,
 }
 
 pub fn video_row(pref: PicturePref) -> Video {
@@ -60,7 +72,7 @@ impl CodecChoice {
             self.audio_pin.map(audio_row),
             Limit {
                 width: self.max_width,
-                height: 0,
+                height: self.max_height,
                 fps: 0,
             },
             self.bitrate_kbps,
@@ -68,6 +80,11 @@ impl CodecChoice {
             self.dirty_rects,
             self.yuv,
             self.fps,
+            self.audio_bitrate_kbps,
+            self.audio_channels,
+            self.view_only,
+            self.exclusive,
+            self.carrier,
         )
     }
 
@@ -91,6 +108,9 @@ impl CodecChoice {
         if self.max_width > 0 {
             out.extend(["--max-width".to_string(), self.max_width.to_string()]);
         }
+        if self.max_height > 0 {
+            out.extend(["--max-height".to_string(), self.max_height.to_string()]);
+        }
         if self.bitrate_kbps > 0 {
             out.extend(["--bitrate".to_string(), self.bitrate_kbps.to_string()]);
         }
@@ -102,6 +122,30 @@ impl CodecChoice {
         }
         if self.yuv != etherquic::negotiate::YuvFormat::YUV444P8 {
             out.extend(["--yuv".to_string(), self.yuv.token().to_string()]);
+        }
+        if self.fps != etherquic::negotiate::FpsWish::Auto {
+            out.extend(["--fps".to_string(), self.fps.token()]);
+        }
+        if self.audio_bitrate_kbps > 0 {
+            out.extend([
+                "--audio-bitrate".to_string(),
+                self.audio_bitrate_kbps.to_string(),
+            ]);
+        }
+        if self.audio_channels > 0 {
+            out.extend([
+                "--audio-channels".to_string(),
+                self.audio_channels.to_string(),
+            ]);
+        }
+        if self.view_only {
+            out.push("--view-only".to_string());
+        }
+        if self.exclusive {
+            out.push("--exclusive".to_string());
+        }
+        if let Some(carrier) = self.carrier {
+            out.extend(["--carrier".to_string(), carrier.to_string()]);
         }
         out
     }
@@ -294,5 +338,19 @@ mod tests {
         let text = line.text();
         assert!(!text.contains("patches"), "{text}");
         assert!(!text.contains("pskip"), "{text}");
+    }
+
+    #[test]
+    fn a_pinned_carrier_is_on_the_next_offer() {
+        let mut choice = CodecChoice::default();
+        assert!(choice.offer().carrier.is_none());
+        choice.carrier = Some(etherquic::carrier::UDP_RTP);
+        let offer = choice.offer();
+        assert_eq!(offer.carrier, Some(etherquic::carrier::UDP_RTP));
+        let text = String::from_utf8(offer.encode()).expect("offer text");
+        assert!(text.contains("carrier 3\n"), "{text}");
+        choice.carrier = None;
+        let text = String::from_utf8(choice.offer().encode()).expect("offer text");
+        assert!(!text.contains("carrier "), "{text}");
     }
 }

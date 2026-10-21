@@ -16,13 +16,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    active_layer, apply_override, audio_for, audio_hint, audio_match_line, backend_hint,
-    backend_label, backend_line, capture_rate, dial_target, format_mac, lanes, list_nics,
-    listed_top, load_connections, load_preferences, local_video_line, mac_key, qr_grid,
-    remote_backend_line, remote_hardware_line, store_connections, store_preferences, swap_earlier,
-    swap_later, this_pc, top_selection, video_hint, video_match_line, Applied, ConnectionOverride,
-    ConnectionPrefs, ConnectionTabs, DialTarget, FrameRate, HexMac, Layer, Link, NicChoice,
-    Preferences, QrGrid, Role, Share, CLIENT_MAC, FPS_CHOICES, HARDWARE_FPS, HOST_MAC,
+    active_layer, apply_override, audio_for, audio_hint, audio_layout_name, audio_match_line,
+    backend_hint, backend_label, backend_line, capture_rate, codec_table_text, dial_target,
+    format_mac, lanes, list_nics, listed_top, load_connections, load_preferences, local_codec_rows,
+    mac_key, qr_grid, remote_backend_line, remote_hardware_line, scale_audio_kbps,
+    store_connections, store_preferences, swap_earlier, swap_later, this_pc, top_selection,
+    video_hint, video_match_line, Applied, ConnectionOverride, ConnectionPrefs, ConnectionTabs,
+    DialTarget, FrameRate, HexMac, Layer, Link, NicChoice, Preferences, QrGrid, Role, Share,
+    AUDIO_BITRATE_CHOICES, AUDIO_LAYOUTS, CLIENT_MAC, FPS_CHOICES, HARDWARE_FPS, HOST_MAC,
     SOFTWARE_FPS,
 };
 use crate::{
@@ -41,17 +42,17 @@ use etherquic::{BackendProbe, MediaBackend};
 use etherquic_play::{
     choose_codec, display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
 };
-use etherquic_play::{CursorMode, Dither, Look, ScaleMode, SizeMatch, PAD_SLOTS};
+use etherquic_play::{CursorMode, Dither, FrameGen, Look, ScaleMode, SizeMatch, Upscale, PAD_SLOTS};
 
 use crate::badge::os_badge;
 use crate::extra_keys::{self, ExtraKey, ExtraMods, Tap};
 use crate::overlay::{self, Dir, OverlayItem, OverlayRuntime, Side};
-use crate::update::{self, Status as UpdateStatus};
 use crate::scan::Scan;
+use crate::update::{self, Status as UpdateStatus};
 use gpui::{
     anchored, canvas, deferred, div, fill, img, point, prelude::*, px, relative, rgb, size,
-    AnyElement, AnyView, App, AppContext, Application, Bounds, ClickEvent, Context, Div,
-    FocusHandle, FontWeight, ImageSource, KeyDownEvent, MouseButton, MouseDownEvent,
+    AnyElement, AnyView, App, AppContext, Application, Bounds, ClickEvent, ClipboardItem, Context,
+    Div, FocusHandle, FontWeight, ImageSource, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, RenderImage, ScrollHandle, ScrollWheelEvent,
     SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
@@ -368,6 +369,10 @@ struct Desk {
     trace_input: bool,
     /// Default rate, and the rate this PC captures at while hosting.
     fps: FrameRate,
+    /// Stereo-equivalent audio bitrate. Zero is Auto (96 kbps stereo).
+    audio_bitrate_kbps: u32,
+    /// Max audio channels. Zero is Auto (2-channel stereo).
+    audio_channels: u16,
     /// Display refresh, when it can be read. This is the server rate for Auto.
     display_hz: Option<u32>,
     /// Per-computer pins. Missing fields use the defaults above.
@@ -449,13 +454,40 @@ struct Desk {
     preview_key: Option<crate::quality_preview::Key>,
     preview_image: Option<Arc<RenderImage>>,
     preview_line: String,
-    preview_rates: Vec<(String, String)>,
+    preview_rates: Vec<(String, u32)>,
+    preview_anchors: Vec<(u32, u32, u32)>,
     /// Phone IME is requested open. Extra-keys sit above it while connected.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     ime_open: bool,
     extra_mods: ExtraMods,
     overlay_run: OverlayRuntime,
     update: UpdateStatus,
+    /// Last Copy chip pressed, so the label can read "Copied" for a moment.
+    copied: Option<(String, Instant)>,
+    /// Adapters this desk discovers and hosts on. Default is every real and
+    /// virtual link.
+    listen: crate::desk_model::ListenSet,
+    layout: crate::desk_model::TabLayout,
+    outbound: Vec<crate::desk_model::Outbound>,
+    /// Left-clicked session whose live settings are on screen.
+    inspect: Option<u64>,
+    quick: bool,
+    trace_log: crate::desk_model::TraceLog,
+    session_live: HashMap<u64, SessionLive>,
+    host_face_at: Instant,
+    host_summary: String,
+    service_guests: Vec<String>,
+    service_running: bool,
+    service_hosting: bool,
+    shelves: Vec<u64>,
+}
+
+struct SessionLive {
+    view: etherquic_play::LiveView,
+    tune: etherquic_play::LiveTune,
+    tx: std::sync::mpsc::Sender<String>,
+    peer: [u8; 6],
+    udp: Option<std::net::SocketAddr>,
 }
 
 impl Desk {
@@ -497,6 +529,8 @@ impl Desk {
             skip_without_hw: saved.skip_without_hw,
             trace_input: saved.trace_input,
             fps: saved.fps,
+            audio_bitrate_kbps: saved.audio_bitrate_kbps,
+            audio_channels: saved.audio_channels,
             display_hz: display_hz(),
             connections: load_connections(),
             capturing: etherquic::capture_active(),
@@ -550,11 +584,33 @@ impl Desk {
             preview_image: None,
             preview_line: String::new(),
             preview_rates: Vec::new(),
+            preview_anchors: Vec::new(),
             ime_open: false,
             extra_mods: ExtraMods::default(),
             overlay_run: OverlayRuntime::default(),
             update: UpdateStatus::Idle,
+            copied: None,
+            listen: listen_set(),
+            layout: crate::desk_model::TabLayout::new(),
+            outbound: Vec::new(),
+            inspect: None,
+            quick: false,
+            trace_log: crate::desk_model::TraceLog::default(),
+            session_live: HashMap::new(),
+            host_face_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            host_summary: "Not hosting".into(),
+            service_guests: Vec::new(),
+            service_running: false,
+            service_hosting: false,
+            shelves: Vec::new(),
         };
+        if let Some(name) = desk.nic.clone() {
+            if !desk.listen.select_only(&name) {
+                desk.nic = None;
+            }
+        }
         desk.refresh_devices(cx);
         desk.apply_settings(false);
         desk.refresh_share();
@@ -569,7 +625,16 @@ impl Desk {
         desk.message = match launch.command {
             Command::Host => {
                 let fps = desk.fps.wish();
-                desk.link.host(launch.nic, desk.backend, fps).err()
+                let nic = desk.nic.clone();
+                let backend = desk.backend;
+                let id = desk.begin_tab("This computer".into());
+                match desk.link.host(nic, backend, fps) {
+                    Ok(()) => None,
+                    Err(err) => {
+                        desk.abort_tab(id);
+                        Some(err)
+                    }
+                }
             }
             Command::Connect => match (launch.udp, desk.peer.parse()) {
                 (Some(addr), peer) => {
@@ -583,17 +648,44 @@ impl Desk {
                     ));
                     let trace = desk.applied(peer).trace_input;
                     let codecs = desk.codec_offer(Some(peer));
-                    desk.link
-                        .connect(launch.nic, peer, trace, 0, Some(addr), codecs)
-                        .err()
+                    let nic = desk.nic.clone();
+                    let id = desk.begin_tab(addr.to_string());
+                    desk.stage_session(id, peer, Some(addr));
+                    match desk
+                        .link
+                        .connect(nic, peer, trace, 0, Some(addr), codecs, false, None)
+                    {
+                        Ok(()) => None,
+                        Err(err) => {
+                            desk.abort_tab(id);
+                            Some(err)
+                        }
+                    }
                 }
                 (None, Some(peer)) => {
                     desk.pending_recent = Some((format_mac(peer), HostAddr::Mac(peer)));
                     let trace = desk.applied(peer).trace_input;
                     let codecs = desk.codec_offer(Some(peer));
-                    desk.link
-                        .connect(launch.nic, peer, trace, 0, None, codecs)
-                        .err()
+                    let nic = desk.nic.clone();
+                    let id = desk.begin_tab(format_mac(peer));
+                    desk.stage_session(id, peer, None);
+                    let device = desk
+                        .scan
+                        .board()
+                        .devices
+                        .into_iter()
+                        .find(|device| device.l2_mac == peer);
+                    let (l2_offer, rtp) = desk.carrier_dial(None, device.as_ref());
+                    match desk
+                        .link
+                        .connect(nic, peer, trace, 0, None, codecs, l2_offer, rtp)
+                    {
+                        Ok(()) => None,
+                        Err(err) => {
+                            desk.abort_tab(id);
+                            Some(err)
+                        }
+                    }
                 }
                 (None, None) => Some("Peer address needs 12 hex digits.".into()),
             },
@@ -720,6 +812,7 @@ impl Desk {
 
     /// The new tab did not start. Put the previous session back.
     fn abort_tab(&mut self, id: u64) {
+        self.drop_session(id);
         let _ = self.tabs.close(id);
         self.link = Link::idle();
         if let Some(prev) = self.tabs.active_id() {
@@ -748,6 +841,7 @@ impl Desk {
         if !self.tabs.close(id) {
             return;
         }
+        self.drop_session(id);
         if active == Some(id) {
             self.link.release();
             let closing = std::mem::replace(&mut self.link, Link::idle());
@@ -903,9 +997,13 @@ impl Desk {
                             ExtraKey::Keyboard => ime_open,
                             other => mods.lit(other),
                         };
-                        extra_key_chip(key, on, cx.listener(move |desk, _, _, cx| {
-                            desk.on_extra_key(key, cx);
-                        }))
+                        extra_key_chip(
+                            key,
+                            on,
+                            cx.listener(move |desk, _, _, cx| {
+                                desk.on_extra_key(key, cx);
+                            }),
+                        )
                     }))
             }))
             .child(
@@ -929,7 +1027,11 @@ impl Desk {
                     ))
                     .child(extra_session_chip(
                         "ek-edit-pad",
-                        if self.overlay_run.edit { "DONE" } else { "EDIT" },
+                        if self.overlay_run.edit {
+                            "DONE"
+                        } else {
+                            "EDIT"
+                        },
                         self.overlay_run.edit,
                         cx.listener(|desk, _, _, cx| {
                             desk.toggle_overlay_edit();
@@ -940,8 +1042,7 @@ impl Desk {
     }
 
     fn overlay_active(&self) -> bool {
-        self.link.role() == Role::Client
-            && (self.settings.overlay.visible || self.overlay_run.edit)
+        self.link.role() == Role::Client && (self.settings.overlay.visible || self.overlay_run.edit)
     }
 
     fn sync_touch_pointer(&self) {
@@ -1072,9 +1173,7 @@ impl Desk {
             .flex()
             .flex_col()
             .justify_end()
-            .when(edit, |layer| {
-                layer.child(self.overlay_editor(add_side, cx))
-            })
+            .when(edit, |layer| layer.child(self.overlay_editor(add_side, cx)))
             .child(
                 div()
                     .flex()
@@ -1085,7 +1184,13 @@ impl Desk {
                     .p_2()
                     .gap_2()
                     .child(overlay_column(Side::Left, &layout.left, edit, stick, cx))
-                    .child(overlay_column(Side::Middle, &layout.middle, edit, stick, cx))
+                    .child(overlay_column(
+                        Side::Middle,
+                        &layout.middle,
+                        edit,
+                        stick,
+                        cx,
+                    ))
                     .child(overlay_column(Side::Right, &layout.right, edit, stick, cx)),
             )
     }
@@ -1191,6 +1296,28 @@ impl Desk {
             )
     }
 
+    /// Carriers 3–5 on an L2 dial use the scanned host IP and RTP port.
+    fn carrier_dial(
+        &self,
+        udp: Option<std::net::SocketAddr>,
+        device: Option<&Found>,
+    ) -> (bool, Option<std::net::SocketAddr>) {
+        let (ip, rtp_port, quic_port) = match device {
+            Some(device) => (
+                device
+                    .ipv4
+                    .first()
+                    .copied()
+                    .map(std::net::IpAddr::V4)
+                    .or_else(|| device.ipv6.first().copied().map(std::net::IpAddr::V6)),
+                device.rtp_port,
+                device.l3_port,
+            ),
+            None => (None, 0, 0),
+        };
+        etherquic::carrier::l2_media_target(self.selected_carrier(), udp, ip, rtp_port, quic_port)
+    }
+
     /// Start another player connection. A host session that is already open
     /// stays open on its own tab.
     fn open_typed_connection(&mut self, cx: &mut Context<Self>) {
@@ -1218,14 +1345,7 @@ impl Desk {
         };
         let layer = active_layer(self.layer, &v4, &v6);
         let udp = match dial_target(layer, port, ipv6_scope(self.nic.as_deref(), &self.nics)) {
-            DialTarget::L2 => {
-                if let Some(why) = etherquic::l2_unavailable_reason() {
-                    self.message = Some(why.into());
-                    cx.notify();
-                    return;
-                }
-                None
-            }
+            DialTarget::L2 => None,
             DialTarget::Udp(addr) => Some(addr),
             DialTarget::NeedsNic => {
                 self.message =
@@ -1234,6 +1354,16 @@ impl Desk {
                 return;
             }
         };
+        let (l2_offer, rtp) = self.carrier_dial(udp, device.as_ref());
+        // Carriers 1 and 2 still need the raw dial. Carriers 3–5 offer on the
+        // scanned RTP socket and do not open a QUIC or Ethernet socket.
+        if udp.is_none() && !l2_offer {
+            if let Some(why) = etherquic::l2_unavailable_reason() {
+                self.message = Some(why.into());
+                cx.notify();
+                return;
+            }
+        }
         let used = match layer {
             Layer::L2 => HostAddr::Mac(peer),
             Layer::V4(ip) => HostAddr::Ip {
@@ -1254,9 +1384,19 @@ impl Desk {
         });
         let codecs = self.codec_offer(Some(peer));
         let id = self.begin_tab(name.clone());
+        self.stage_session(id, peer, udp);
         match self
             .link
-            .connect(self.nic.clone(), peer, trace, host_l2, udp, codecs)
+            .connect(
+                self.nic.clone(),
+                peer,
+                trace,
+                host_l2,
+                udp,
+                codecs,
+                l2_offer,
+                rtp,
+            )
         {
             Ok(()) => {
                 self.message = None;
@@ -1306,9 +1446,10 @@ impl Desk {
             .unwrap_or_else(|| addr.display());
         let codecs = self.codec_offer((peer != [0; 6]).then_some(peer));
         let id = self.begin_tab(name.clone());
+        self.stage_session(id, peer, udp);
         match self
             .link
-            .connect(self.nic.clone(), peer, trace, 0, udp, codecs)
+            .connect(self.nic.clone(), peer, trace, 0, udp, codecs, false, None)
         {
             Ok(()) => {
                 self.message = None;
@@ -1379,6 +1520,76 @@ impl Desk {
         self.message.clone().unwrap_or_else(|| self.link.status())
     }
 
+    fn copy_text(&mut self, id: &str, text: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        let id = id.to_string();
+        self.copied = Some((id.clone(), Instant::now()));
+        cx.spawn(async move |this, cx| {
+            gpui::Timer::after(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |desk, cx| {
+                if desk.copied.as_ref().map(|(got, _)| got.as_str()) == Some(id.as_str()) {
+                    desk.copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn copy_chip_label(&self, id: &str) -> &'static str {
+        match &self.copied {
+            Some((got, at)) if got == id && at.elapsed() < Duration::from_secs(2) => "Copied",
+            _ => "Copy",
+        }
+    }
+
+    /// Wrapping text with a Copy chip. GPUI labels cannot be selected.
+    fn copyable_line(
+        &mut self,
+        id: impl Into<String>,
+        text: String,
+        color: u32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = id.into();
+        let label = self.copy_chip_label(&id);
+        let body = text.clone();
+        let text_id = SharedString::from(format!("{id}-text"));
+        let copy_id = SharedString::from(format!("{id}-copy"));
+        div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .id(text_id)
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(rgb(color))
+                    .whitespace_normal()
+                    .cursor_pointer()
+                    .on_click({
+                        let id = id.clone();
+                        let body = body.clone();
+                        cx.listener(move |desk, _, _, cx| {
+                            desk.copy_text(&id, &body, cx);
+                        })
+                    })
+                    .child(text),
+            )
+            .child(small_chip(copy_id, label, None, true, {
+                let id = id.clone();
+                cx.listener(move |desk, _, _, cx| {
+                    cx.stop_propagation();
+                    desk.copy_text(&id, &body, cx);
+                })
+            }))
+    }
+
     fn status_color(&self) -> u32 {
         if self.link.shows_taskbar() {
             return HOST_GREEN;
@@ -1433,8 +1644,8 @@ impl Desk {
                             .child(title)
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |desk, _, _, cx| {
-                                    desk.switch_connection(id);
+                                cx.listener(move |desk, ev: &MouseDownEvent, window, cx| {
+                                    desk.on_session_click(id, ev.click_count, window);
                                     cx.notify();
                                 }),
                             ),
@@ -1512,36 +1723,184 @@ impl Desk {
         format!("IPv4 {v4} · IPv6 {v6}")
     }
 
-    /// Codec probe for this computer, including whether PyroWave loaded.
-    fn this_pc_codecs(&self) -> String {
+    fn this_pc_audio_line(&self) -> String {
         let audio = if self.local_audio.opus {
             "PCM, Opus"
         } else {
             "PCM"
         };
-        let library = if self.pyrowave_library {
-            "found"
-        } else {
-            "not found"
-        };
-        let mut line = format!(
-            "This computer: {}. Audio: {audio}. Pyrowave library: {library}.",
-            local_video_line(&self.local_video)
-        );
-        if let Some(probe) = etherquic_play::etherquic_media::caps::ready() {
-            let notes: Vec<&str> = probe
-                .notes
-                .iter()
-                .filter(|note| note.contains("pyrowave"))
-                .map(String::as_str)
-                .collect();
-            if !notes.is_empty() {
-                line.push(' ');
-                line.push_str(&notes.join("; "));
-                line.push('.');
-            }
+        format!("Audio: {audio}")
+    }
+
+    fn codec_rows(&self) -> Vec<crate::CodecSupportRow> {
+        local_codec_rows(
+            &self.local_video,
+            etherquic_play::etherquic_media::caps::ready(),
+            self.pyrowave_library,
+        )
+    }
+
+    fn codec_support_table(&mut self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        const COLS: [(&str, f32, &'static str); 10] = [
+            ("Codec", 80., "Codec"),
+            ("SW", 32., "Software encode on this computer"),
+            ("HW", 32., "Hardware encode on this computer"),
+            ("Backend", 110., "Encoder the probe opened"),
+            (
+                "Error",
+                44.,
+                "Library error. Click to copy, hover for the full text",
+            ),
+            (
+                "Latency",
+                78.,
+                "Typical display-grab to decoded frame in this product",
+            ),
+            (
+                "PSNR/B",
+                54.,
+                "Relative PSNR per coded byte versus H.264. Higher compresses better",
+            ),
+            ("I", 22., "I-frames"),
+            ("P", 22., "P-frames"),
+            ("B", 22., "B-frames. Live encode keeps these off"),
+        ];
+        let table_w: f32 = COLS.iter().map(|col| col.1).sum();
+        let rows = self.codec_rows();
+        let copy_id = format!("{id}-copy");
+        let copy_label = self.copy_chip_label(&copy_id);
+        let table_text = codec_table_text(&rows);
+        let mut header = div().flex().flex_row().items_center().w(px(table_w)).pb_1();
+        for (label, width, why) in COLS {
+            header = header.child(
+                div()
+                    .id(SharedString::from(format!("{id}-h-{label}")))
+                    .flex_none()
+                    .w(px(width))
+                    .px_1()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(MUTED))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .tooltip(why_tip(why))
+                    .child(label),
+            );
         }
-        line
+        let mut body = div().flex().flex_col().w(px(table_w));
+        for row in &rows {
+            let err_id = format!("{id}-err-{}", row.name);
+            let err_copied = self.copy_chip_label(&err_id) == "Copied";
+            let software_color = if row.software { TEXT } else { MUTED };
+            let hardware_color = if row.hardware { TEXT } else { MUTED };
+            let error_text = row.error.clone();
+            let line = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w(px(table_w))
+                .py(px(2.))
+                .child(codec_cell(COLS[0].1, TEXT, row.name))
+                .child(codec_cell(COLS[1].1, software_color, row.software_label()))
+                .child(codec_cell(COLS[2].1, hardware_color, row.hardware_label()))
+                .child(codec_cell(COLS[3].1, TEXT, row.backend.clone()))
+                .child(
+                    div()
+                        .id(SharedString::from(err_id.clone()))
+                        .flex_none()
+                        .w(px(COLS[4].1))
+                        .px_1()
+                        .text_xs()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .when_some(error_text.clone(), |cell, err| {
+                            cell.text_color(rgb(if err_copied { HOST_GREEN } else { DANGER }))
+                                .cursor_pointer()
+                                .tooltip(shared_tip(err.clone()))
+                                .on_click({
+                                    let err_id = err_id.clone();
+                                    cx.listener(move |desk, _, _, cx| {
+                                        desk.copy_text(&err_id, &err, cx);
+                                    })
+                                })
+                                .child(if err_copied { "copied" } else { "error" })
+                        })
+                        .when(error_text.is_none(), |cell| {
+                            cell.text_color(rgb(MUTED)).child("—")
+                        }),
+                )
+                .child(codec_cell(COLS[5].1, MUTED, row.latency))
+                .child(codec_cell(COLS[6].1, MUTED, row.psnr_per_byte))
+                .child(codec_cell(
+                    COLS[7].1,
+                    MUTED,
+                    crate::CodecSupportRow::frame_label(row.i_frame),
+                ))
+                .child(codec_cell(
+                    COLS[8].1,
+                    MUTED,
+                    crate::CodecSupportRow::frame_label(row.p_frame),
+                ))
+                .child(codec_cell(
+                    COLS[9].1,
+                    MUTED,
+                    crate::CodecSupportRow::frame_label(row.b_frame),
+                ));
+            body = body.child(line);
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(rgb(MUTED))
+                            .whitespace_normal()
+                            .child(
+                                "Encode support on this computer. Latency and PSNR/B are catalog typical values.",
+                            ),
+                    )
+                    .child(small_chip(
+                        SharedString::from(format!("{id}-copy")),
+                        copy_label,
+                        None,
+                        true,
+                        {
+                            let copy_id = copy_id.clone();
+                            cx.listener(move |desk, _, _, cx| {
+                                cx.stop_propagation();
+                                desk.copy_text(&copy_id, &table_text, cx);
+                            })
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-scroll")))
+                    .w_full()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w(px(table_w))
+                            .child(header)
+                            .child(body),
+                    ),
+            )
     }
 
     fn host_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1568,9 +1927,13 @@ impl Desk {
             .border_color(rgb(edge))
             .rounded_md()
             .child(card_title("Host", HOST_GREEN))
+            .child(muted_line(self.host_summary.clone()))
+            .child(self.guest_lines())
             .child(muted_line("Share this desktop and its audio.".into()))
-            .child(muted_line(self.this_pc_addresses()))
-            .child(muted_line(self.this_pc_codecs()))
+            .child(self.listen_block(cx))
+            .child(self.copyable_line("host-addr", self.this_pc_addresses(), MUTED, cx))
+            .child(muted_line(self.this_pc_audio_line()))
+            .child(self.codec_support_table("host-codecs", cx))
             .child(action_button(
                 "host-btn",
                 label,
@@ -1652,6 +2015,7 @@ impl Desk {
         let open = self.open.connect;
         let selection = open.then(|| self.connection_selection());
         let path = open.then(|| self.path_row(cx));
+        let carriers = open.then(|| self.carrier_row(cx));
         let typed = match self.direct {
             Some(addr) => addr.display(),
             None => self.peer.display(),
@@ -1666,7 +2030,10 @@ impl Desk {
         let via = self.via_label();
         let tabs = self.transport_tabs(cx);
         let video = self.codec_row(Menu::Video, cx);
+        let fps = self.side_pick(Menu::Fps, cx);
         let audio = self.codec_row(Menu::Audio, cx);
+        let kbps = self.side_pick(Menu::AudioBitrate, cx);
+        let channels = self.side_pick(Menu::AudioChannels, cx);
         let dirty_on = self.settings.dirty_rects;
         let quality = self.picture_quality_slider("connect-quality", cx);
         div()
@@ -1736,8 +2103,31 @@ impl Desk {
                         cx.notify();
                     })),
             )
-            .child(video)
-            .child(audio)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(video)
+                    .child(fps),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(audio)
+                    .child(kbps)
+                    .child(channels),
+            )
             .child(quality)
             .child(self.yuv_pick_row("connect-yuv", cx))
             .child(muted_line(
@@ -1755,6 +2145,30 @@ impl Desk {
             ))
             .child(muted_line(
                 "Asked of the host, like the codec. If it supports dirty rectangles it skips an unchanged picture, and with MJPEG or MJ2K it encodes only the tiles that moved.".into(),
+            ))
+            .child(toggle_row(
+                "connect-view-only",
+                "View only",
+                self.settings.view_only,
+                cx.listener(|desk, _, _, cx| {
+                    desk.edit_settings(|settings| settings.view_only = !settings.view_only);
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "Watch the desktop without sending keyboard, mouse, or controllers. Other players can still inject.".into(),
+            ))
+            .child(toggle_row(
+                "connect-exclusive",
+                "Exclusive session",
+                self.settings.exclusive,
+                cx.listener(|desk, _, _, cx| {
+                    desk.edit_settings(|settings| settings.exclusive = !settings.exclusive);
+                    cx.notify();
+                }),
+            ))
+            .child(muted_line(
+                "Kick everyone already watching and refuse later joins, including view-only.".into(),
             ))
             .child(action_button(
                 "connect-btn",
@@ -1810,6 +2224,7 @@ impl Desk {
                     ))
                 })
                 .when_some(path, |card, path| card.child(path))
+                .when_some(carriers, |card, carriers| card.child(carriers))
             })
     }
 
@@ -1871,24 +2286,58 @@ impl Desk {
     }
 
     fn via_label(&self) -> String {
-        if let Some(addr) = self.direct {
-            return format!("via {}", addr.kind());
-        }
-        let row = self
-            .peer
+        let path = if let Some(addr) = self.direct {
+            format!("via {}", addr.kind())
+        } else {
+            let row = self
+                .peer
+                .parse()
+                .and_then(|mac| self.roster.find(&HostAddr::Mac(mac)));
+            let (v4, v6) = row
+                .map(|row| (row.ipv4.clone(), row.ipv6.clone()))
+                .unwrap_or_default();
+            match active_layer(self.layer, &v4, &v6) {
+                Layer::L2 => match etherquic::l2_unavailable_reason() {
+                    Some(why) => format!("L2 unavailable: {why}"),
+                    None => "via Ethernet (L2)".into(),
+                },
+                Layer::V4(ip) => format!("via IPv4 {ip}"),
+                Layer::V6(ip) => format!("via IPv6 {ip}"),
+            }
+        };
+        format!("{path} · {}", self.carrier_summary())
+    }
+
+    fn selected_carrier(&self) -> u8 {
+        self.peer
             .parse()
-            .and_then(|mac| self.roster.find(&HostAddr::Mac(mac)));
-        let (v4, v6) = row
-            .map(|row| (row.ipv4.clone(), row.ipv6.clone()))
-            .unwrap_or_default();
-        match active_layer(self.layer, &v4, &v6) {
-            Layer::L2 => match etherquic::l2_unavailable_reason() {
-                Some(why) => format!("L2 unavailable: {why}"),
-                None => "via Ethernet (L2)".into(),
-            },
-            Layer::V4(ip) => format!("via IPv4 {ip}"),
-            Layer::V6(ip) => format!("via IPv6 {ip}"),
+            .and_then(|mac| self.connections.get(&mac_key(mac)))
+            .and_then(|over| over.carrier)
+            .unwrap_or(etherquic::carrier::QUIC_STREAMS)
+    }
+
+    fn saved_profile(&self) -> Option<String> {
+        self.peer
+            .parse()
+            .and_then(|mac| self.connections.get(&mac_key(mac)))
+            .and_then(|over| over.profile.clone())
+    }
+
+    /// A saved `plain` or `gcm` selects both UDP/RTP and ST 2110. No pin restores the defaults.
+    fn apply_saved_profile(&self, peer: [u8; 6]) {
+        match self
+            .connections
+            .get(&mac_key(peer))
+            .and_then(|over| over.profile.as_deref())
+        {
+            Some("plain") => etherquic::carrier::choose_profile(true, false),
+            Some("gcm") => etherquic::carrier::choose_profile(false, true),
+            _ => etherquic::carrier::choose_profile(false, false),
         }
+    }
+
+    fn carrier_summary(&self) -> String {
+        etherquic::carrier::connect_row_now(self.selected_carrier())
     }
 
     fn path_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1972,8 +2421,635 @@ impl Desk {
             .child(chips)
     }
 
+    fn carrier_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected_carrier();
+        let choices = [
+            ("carrier-quic", "QUIC streams", etherquic::carrier::QUIC_STREAMS),
+            (
+                "carrier-dgram",
+                "QUIC datagrams",
+                etherquic::carrier::QUIC_DATAGRAMS,
+            ),
+            ("carrier-rtp", "UDP/RTP", etherquic::carrier::UDP_RTP),
+            ("carrier-avb", "AVB", etherquic::carrier::AVB),
+            ("carrier-st", "ST 2110", etherquic::carrier::ST2110),
+        ];
+        let mut chips = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .w_full()
+            .min_w_0();
+        for (id, label, value) in choices {
+            chips = chips.child(path_chip(
+                id,
+                label,
+                selected == value,
+                true,
+                None,
+                cx.listener(move |desk, _, _, cx| {
+                    if let Some(mac) = desk.peer.parse() {
+                        desk.edit_connection(mac, |over| over.carrier = Some(value));
+                    } else {
+                        desk.message =
+                            Some("Type a host address before choosing a carrier.".into());
+                    }
+                    cx.notify();
+                }),
+            ));
+        }
+        let latency_open = self.open.latency;
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("Carrier"))
+                    .child(crate::latency_help::button(
+                        latency_open,
+                        cx.listener(|desk, _, _, cx| {
+                            desk.open.latency = !desk.open.latency;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(chips)
+            .when(latency_open, |column| column.child(crate::latency_help::panel()));
+        if selected == etherquic::carrier::UDP_RTP || selected == etherquic::carrier::ST2110 {
+            let saved = self.saved_profile();
+            let plain_on = if selected == etherquic::carrier::ST2110 {
+                saved.as_deref() != Some("gcm")
+            } else {
+                saved.as_deref() == Some("plain")
+            };
+            let mut profiles = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_2()
+                .w_full()
+                .min_w_0();
+            for (id, label, on, plain) in [
+                ("profile-plain", "Plain", plain_on, true),
+                ("profile-gcm", "GCM", !plain_on, false),
+            ] {
+                profiles = profiles.child(path_chip(
+                    id,
+                    label,
+                    on,
+                    true,
+                    None,
+                    cx.listener(move |desk, _, _, cx| {
+                        if let Some(mac) = desk.peer.parse() {
+                            desk.edit_connection(mac, |over| {
+                                over.profile = Some(if plain { "plain" } else { "gcm" }.into());
+                            });
+                            etherquic::carrier::choose_profile(plain, !plain);
+                        } else {
+                            desk.message =
+                                Some("Type a host address before choosing a profile.".into());
+                        }
+                        cx.notify();
+                    }),
+                ));
+            }
+            column = column
+                .child(section_label("Profile"))
+                .child(profiles);
+        }
+        column.child(muted_line(self.carrier_summary()))
+    }
+
+    fn guest_lines(&self) -> impl IntoElement {
+        let mut col = div().flex().flex_col().gap_1().w_full().min_w_0();
+        if self.service_guests.is_empty() {
+            col = col.child(muted_line(
+                "No computers are connected to the host service.".into(),
+            ));
+        } else {
+            for guest in &self.service_guests {
+                col = col.child(muted_line(crate::desk_model::guest_line(guest)));
+            }
+        }
+        col
+    }
+
+    fn listen_block(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut col = div().flex().flex_col().gap_1().w_full().min_w_0();
+        col = col.child(section_label("Listen on"));
+        col = col.child(muted_line(
+            "All physical and virtual adapters start on. Loopback stays off. A capture device such as any is not a link.".into(),
+        ));
+        let mut list = div().flex().flex_col().items_start().gap_1().w_full().min_w_0();
+        list = list.child(listen_row(
+            "listen-all",
+            "All".into(),
+            self.listen.is_all().then_some(HOST_GREEN),
+            true,
+            cx.listener(|desk, _, _, cx| {
+                desk.listen.set_all();
+                desk.apply_listen();
+                cx.notify();
+            }),
+        ));
+        let rows: Vec<_> = self
+            .listen
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.name.clone(),
+                    row.label(),
+                    row.listen,
+                    row.kind == etherquic::IfaceKind::Capture,
+                )
+            })
+            .collect();
+        for (index, (name, label, on, capture)) in rows.into_iter().enumerate() {
+            list = list.child(listen_row(
+                SharedString::from(format!("listen-{index}")),
+                label.into(),
+                on.then_some(if capture { MUTED } else { HOST_GREEN }),
+                !capture,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.toggle_listen(name.clone());
+                    cx.notify();
+                }),
+            ));
+        }
+        col.child(list)
+    }
+
+    fn active_block(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<_> = self
+            .outbound
+            .iter()
+            .map(|row| {
+                (
+                    row.id,
+                    row.label.clone(),
+                    row.phase.clone(),
+                    row.group,
+                )
+            })
+            .collect();
+        let mut list = div().flex().flex_col().gap_1().w_full().min_w_0();
+        if rows.is_empty() {
+            list = list.child(muted_line(
+                "No active connections. A connection leaves this list when it closes.".into(),
+            ));
+        }
+        for (id, label, phase, group) in rows {
+            let selected = self.inspect == Some(id);
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("active-{id}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(if selected { 0x243044 } else { CARD }))
+                    .cursor_pointer()
+                    .child(div().flex_1().min_w_0().child(crate::desk_model::outbound_line(
+                        &label, &phase, group,
+                    )))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |desk, ev: &MouseDownEvent, window, cx| {
+                            desk.on_session_click(id, ev.click_count, window);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        if self.trace_log.on {
+            list = list.child(section_label("Trace"));
+            let lines: Vec<String> = self.trace_log.lines().iter().rev().take(8).cloned().collect();
+            if lines.is_empty() {
+                list = list.child(muted_line(
+                    "Network trace is on. Latency, loss, and packet errors show up here.".into(),
+                ));
+            }
+            for line in lines {
+                list = list.child(muted_line(line));
+            }
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w_0()
+            .child(section_label("Active connections"))
+            .child(list)
+            .child(self.quick_panel(cx))
+    }
+
+    fn quick_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let shown = self.quick;
+        let inspect = self.inspect;
+        let mut panel = div().flex().flex_col().gap_1().w_full().min_w_0();
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(small_chip(
+                    "quick-toggle",
+                    if shown {
+                        "Hide quick settings"
+                    } else {
+                        "Quick settings"
+                    },
+                    Some(PLAYER_BLUE),
+                    true,
+                    cx.listener(|desk, _, _, cx| {
+                        desk.quick = !desk.quick;
+                        cx.notify();
+                    }),
+                ))
+                .child(small_chip(
+                    "quick-detach",
+                    "New window",
+                    None,
+                    self.tabs.active_id().is_some(),
+                    cx.listener(|desk, _, _, cx| {
+                        desk.detach_current(cx);
+                    }),
+                ))
+                .child(muted_line("Ctrl+Alt+S".into())),
+        );
+        if !shown {
+            return panel.into_any_element();
+        }
+        let Some(id) = inspect else {
+            return panel
+                .child(muted_line(
+                    "Left-click an active connection to change it. Double-click focuses its window."
+                        .into(),
+                ))
+                .into_any_element();
+        };
+        let snap = self.session_live.get(&id).map(|slot| {
+            (
+                etherquic_play::snapshot(&slot.view),
+                etherquic_play::snapshot_tune(&slot.tune),
+            )
+        });
+        let Some((view, tune)) = snap else {
+            return panel
+                .child(muted_line(
+                    "This connection has no live settings yet.".into(),
+                ))
+                .into_any_element();
+        };
+        let mut scales = div().flex().flex_row().flex_wrap().gap_1();
+        for mode in etherquic_play::ScaleMode::ALL {
+            let on = view.scale == mode;
+            scales = scales.child(small_chip(
+                SharedString::from(format!("live-scale-{}", mode.token())),
+                mode.label(),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |view, _| view.scale = mode);
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut codecs = div().flex().flex_row().flex_wrap().gap_1();
+        for pref in PicturePref::order() {
+            let on = tune
+                .video
+                .and_then(|video| PicturePref::from_token(video.token()))
+                == Some(pref);
+            codecs = codecs.child(small_chip(
+                SharedString::from(format!("live-video-{}", pref.token())),
+                pref.name(),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |_, tune| {
+                        tune.video = etherquic::negotiate::Video::from_token(pref.token());
+                    });
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut carriers = div().flex().flex_row().flex_wrap().gap_1();
+        for carrier in 1..=5 {
+            let on = tune.carrier == Some(carrier);
+            carriers = carriers.child(small_chip(
+                SharedString::from(format!("live-carrier-{carrier}")),
+                format!("Carrier {carrier}"),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |_, tune| tune.carrier = Some(carrier));
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut audio = div().flex().flex_row().flex_wrap().gap_1();
+        for codec in etherquic::negotiate::Audio::ALL {
+            let on = tune.audio == Some(codec);
+            audio = audio.child(small_chip(
+                SharedString::from(format!("live-audio-{}", codec.token())),
+                codec.name(),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |_, tune| tune.audio = Some(codec));
+                    cx.notify();
+                }),
+            ));
+        }
+        let wishes = [
+            etherquic::negotiate::FpsWish::Auto,
+            etherquic::negotiate::FpsWish::Match,
+            etherquic::negotiate::FpsWish::Fixed(15),
+            etherquic::negotiate::FpsWish::Fixed(30),
+            etherquic::negotiate::FpsWish::Fixed(60),
+        ];
+        let mut rates = div().flex().flex_row().flex_wrap().gap_1();
+        for wish in wishes {
+            let on = tune.fps == Some(wish);
+            let label = match wish {
+                etherquic::negotiate::FpsWish::Auto => "FPS auto".to_string(),
+                etherquic::negotiate::FpsWish::Match => "FPS display".to_string(),
+                etherquic::negotiate::FpsWish::Fixed(fps) => format!("FPS {fps}"),
+            };
+            rates = rates.child(small_chip(
+                SharedString::from(format!("live-fps-{}", wish.token())),
+                label,
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |_, tune| tune.fps = Some(wish));
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut yuvs = div().flex().flex_row().flex_wrap().gap_1();
+        for format in etherquic::negotiate::YuvFormat::ALL {
+            let on = view.yuv == format;
+            yuvs = yuvs.child(small_chip(
+                SharedString::from(format!("live-yuv-{}", format.token())),
+                format.label(),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |view, _| view.yuv = format);
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut looks = div().flex().flex_row().flex_wrap().gap_1();
+        for look in etherquic_play::Look::ALL {
+            let on = view.look == look;
+            looks = looks.child(small_chip(
+                SharedString::from(format!("live-look-{}", look.token())),
+                look.label(),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |view, _| view.look = look);
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut dithers = div().flex().flex_row().flex_wrap().gap_1();
+        for dither in etherquic_play::Dither::ALL {
+            let on = view.dither == dither;
+            dithers = dithers.child(small_chip(
+                SharedString::from(format!("live-dither-{}", dither.token())),
+                dither.label(),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |view, _| view.dither = dither);
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut cursors = div().flex().flex_row().flex_wrap().gap_1();
+        for cursor in etherquic_play::CursorMode::ALL {
+            let on = view.cursor == cursor;
+            cursors = cursors.child(small_chip(
+                SharedString::from(format!("live-cursor-{}", cursor.token())),
+                cursor.label(),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |view, _| view.cursor = cursor);
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut upscales = div().flex().flex_row().flex_wrap().gap_1();
+        for mode in etherquic_play::Upscale::ALL {
+            let on = view.upscale == mode;
+            upscales = upscales.child(small_chip(
+                SharedString::from(format!("live-upscale-{}", mode.token())),
+                format!("Upscale {}", mode.label()),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |view, _| view.upscale = mode);
+                    cx.notify();
+                }),
+            ));
+        }
+        let mut frames = div().flex().flex_row().flex_wrap().gap_1();
+        for mode in etherquic_play::FrameGen::ALL {
+            let on = view.frame_gen == mode;
+            frames = frames.child(small_chip(
+                SharedString::from(format!("live-fruc-{}", mode.token())),
+                format!("Frame gen {}", mode.label()),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, move |view, _| view.frame_gen = mode);
+                    cx.notify();
+                }),
+            ));
+        }
+        let layer_peer = self.session_live.get(&id).map(|slot| slot.peer);
+        let (v4s, v6s) = layer_peer
+            .and_then(|mac| {
+                self.scan.board().devices.iter().find(|device| device.l2_mac == mac).map(
+                    |device| (device.ipv4.clone(), device.ipv6.clone()),
+                )
+            })
+            .unwrap_or_default();
+        let mut layers = div().flex().flex_row().flex_wrap().gap_1();
+        let l2_on = matches!(self.layer, Layer::L2);
+        layers = layers.child(small_chip(
+            "live-layer-l2",
+            "L2",
+            l2_on.then_some(PLAYER_BLUE),
+            true,
+            cx.listener(|desk, _, _, cx| {
+                desk.layer = Layer::L2;
+                cx.notify();
+            }),
+        ));
+        for (index, ip) in v4s.into_iter().enumerate() {
+            let on = matches!(self.layer, Layer::V4(chosen) if chosen == ip);
+            layers = layers.child(small_chip(
+                SharedString::from(format!("live-layer-v4-{index}")),
+                format!("IPv4 {ip}"),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.layer = Layer::V4(ip);
+                    cx.notify();
+                }),
+            ));
+        }
+        for (index, ip) in v6s.into_iter().enumerate() {
+            let on = matches!(self.layer, Layer::V6(chosen) if chosen == ip);
+            layers = layers.child(small_chip(
+                SharedString::from(format!("live-layer-v6-{index}")),
+                format!("IPv6 {ip}"),
+                on.then_some(PLAYER_BLUE),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.layer = Layer::V6(ip);
+                    cx.notify();
+                }),
+            ));
+        }
+        panel
+            .child(section_label("This connection"))
+            .child(scales)
+            .child(codecs)
+            .child(audio)
+            .child(rates)
+            .child(carriers)
+            .child(yuvs)
+            .child(looks)
+            .child(dithers)
+            .child(cursors)
+            .child(upscales)
+            .child(frames)
+            .child(layers)
+            .child({
+                let mut quality = div().flex().flex_row().flex_wrap().gap_1();
+                for value in [40u8, 70, 90] {
+                    let on = view.quality == value;
+                    quality = quality.child(small_chip(
+                        SharedString::from(format!("live-quality-{value}")),
+                        format!("Quality {value}"),
+                        on.then_some(PLAYER_BLUE),
+                        true,
+                        cx.listener(move |desk, _, _, cx| {
+                            desk.edit_session(id, move |view, _| view.quality = value);
+                            cx.notify();
+                        }),
+                    ));
+                }
+                quality.child(small_chip(
+                    "live-keyboard",
+                    if view.send_keyboard {
+                        "Keyboard on"
+                    } else {
+                        "Keyboard off"
+                    },
+                    view.send_keyboard.then_some(HOST_GREEN),
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_session(id, |view, _| view.send_keyboard = !view.send_keyboard);
+                        cx.notify();
+                    }),
+                ))
+                .child(small_chip(
+                    "live-mouse",
+                    if view.send_mouse {
+                        "Mouse on"
+                    } else {
+                        "Mouse off"
+                    },
+                    view.send_mouse.then_some(HOST_GREEN),
+                    true,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_session(id, |view, _| view.send_mouse = !view.send_mouse);
+                        cx.notify();
+                    }),
+                ))
+            })
+            .child(small_chip(
+                "live-dirty",
+                if view.dirty_rects {
+                    "Dirty rects on"
+                } else {
+                    "Dirty rects off"
+                },
+                view.dirty_rects.then_some(HOST_GREEN),
+                true,
+                cx.listener(move |desk, _, _, cx| {
+                    desk.edit_session(id, |view, _| view.dirty_rects = !view.dirty_rects);
+                    cx.notify();
+                }),
+            ))
+            .child(small_chip(
+                "live-redial",
+                "Apply interface / layer",
+                Some(DANGER),
+                true,
+                cx.listener(|desk, _, _, cx| {
+                    desk.redial_inspected(cx);
+                }),
+            ))
+            .child(muted_line(
+                "Scale, filters, and dirty rects change the open view. Codec and carrier are sent again on the same connection. Interface and L2/L3 open the connection again.".into(),
+            ))
+            .into_any_element()
+    }
+
+    fn detach_current(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let group = self.layout.detach(id);
+        if self.shelves.contains(&group) {
+            return;
+        }
+        self.shelves.push(group);
+        cx.open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(format!("etherquic · window {group}").into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| Shelf { group }),
+        )
+        .ok();
+        cx.notify();
+    }
+
     fn nic_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.nic.clone();
+        let all = self.listen.is_all();
+        let listening: Vec<String> = self
+            .listen
+            .rows()
+            .iter()
+            .filter(|row| row.listen)
+            .map(|row| row.name.clone())
+            .collect();
         let mut row = div()
             .flex()
             .flex_row()
@@ -1981,14 +3057,13 @@ impl Desk {
             .gap_2()
             .w_full()
             .min_w_0();
-        let auto_on = selected.is_none();
         row = row.child(nic_chip(
             "nic-auto",
             "Auto",
-            auto_on,
+            all,
             cx.listener(|desk, _, _, cx| {
-                desk.nic = None;
-                desk.refresh_share();
+                desk.listen.set_all();
+                desk.apply_listen();
                 cx.notify();
             }),
         ));
@@ -1997,15 +3072,16 @@ impl Desk {
                 continue;
             }
             let name = nic.name.clone();
-            let on = selected.as_deref() == Some(nic.name.as_str());
+            let on = !all && listening.iter().any(|row| row == &nic.name);
             let label = nic_label(nic);
             row = row.child(nic_chip(
                 SharedString::from(format!("nic-{index}")),
                 label,
                 on,
                 cx.listener(move |desk, _, _, cx| {
-                    desk.nic = Some(name.clone());
-                    desk.refresh_share();
+                    if desk.listen.select_only(&name) {
+                        desk.apply_listen();
+                    }
                     cx.notify();
                 }),
             ));
@@ -2306,26 +3382,20 @@ impl Desk {
             MUTED
         };
         if shown == 0 {
-            list = list.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .py_2()
-                    .text_color(rgb(empty_color))
-                    .whitespace_normal()
-                    .child(empty),
-            );
+            list = list.child(div().w_full().min_w_0().py_2().child(self.copyable_line(
+                "scan-empty",
+                empty,
+                empty_color,
+                cx,
+            )));
         } else if self.tab == HostTab::Discovered {
             if let Some(err) = scan_error.clone() {
-                list = list.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .py_1()
-                        .text_color(rgb(DANGER))
-                        .whitespace_normal()
-                        .child(err),
-                );
+                list = list.child(div().w_full().min_w_0().py_1().child(self.copyable_line(
+                    "scan-error",
+                    err,
+                    DANGER,
+                    cx,
+                )));
             }
         }
         let tabs = div()
@@ -2735,14 +3805,15 @@ impl Desk {
                     )),
             )
             .child(match self.add_error.clone() {
-                Some(err) => div()
+                Some(err) => self.copyable_line("add-error", err, DANGER, cx).into_any_element(),
+                None => div()
                     .w_full()
-                    .text_color(rgb(DANGER))
+                    .text_color(rgb(MUTED))
                     .whitespace_normal()
-                    .child(err),
-                None => div().w_full().text_color(rgb(MUTED)).whitespace_normal().child(
+                    .child(
                     "A MAC address connects over Ethernet. An IP address, with an optional port, connects over UDP.",
-                ),
+                )
+                    .into_any_element(),
             })
     }
 
@@ -3032,14 +4103,118 @@ impl Desk {
             ))
     }
 
+    fn chosen_nic(&self) -> Option<&NicChoice> {
+        if let Some(name) = self.nic.as_deref() {
+            return self.nics.iter().find(|nic| nic.name == name);
+        }
+        self.nics
+            .iter()
+            .find(|nic| nic_shown(nic) && nic.speed_mbps.is_some())
+            .or_else(|| self.nics.iter().find(|nic| nic_shown(nic)))
+    }
+
+    fn path_peer_stats(&self) -> (String, f32, f32) {
+        if let Some(mac) = self.peer.parse() {
+            let device = self
+                .scan
+                .board()
+                .devices
+                .into_iter()
+                .find(|device| device.l2_mac == mac);
+            let computer = self
+                .target_name
+                .clone()
+                .or_else(|| device.as_ref().map(|device| device.name.clone()))
+                .or_else(|| self.roster.find(&HostAddr::Mac(mac)).map(|row| row.title()))
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format_mac(mac));
+            let (latency_ms, jitter_ms) = device
+                .map(|device| (device.stats.avg_ms, device.stats.jitter_ms))
+                .unwrap_or((0.0, 0.0));
+            return (computer, latency_ms, jitter_ms);
+        }
+        let computer = if self.share.name.trim().is_empty() {
+            "this computer".into()
+        } else {
+            self.share.name.clone()
+        };
+        (computer, 0.0, 0.0)
+    }
+
+    fn estimate_path(&self) -> Option<crate::path_budget::Path> {
+        let nic = self.chosen_nic()?;
+        let bandwidth_mbps = nic.speed_mbps?;
+        let (computer, latency_ms, jitter_ms) = self.path_peer_stats();
+        Some(crate::path_budget::Path {
+            nic: nic_label(nic),
+            bandwidth_mbps,
+            latency_ms,
+            jitter_ms,
+            computer,
+        })
+    }
+
+    fn path_resolution(&self) -> (u32, u32) {
+        if let Some(caps) = self.selected_row().and_then(|row| row.caps) {
+            let monitor = caps
+                .monitors
+                .iter()
+                .find(|monitor| monitor.primary)
+                .or_else(|| caps.monitors.first());
+            if let Some(monitor) = monitor {
+                if monitor.width > 0 && monitor.height > 0 {
+                    return (u32::from(monitor.width), u32::from(monitor.height));
+                }
+            }
+        }
+        (1920, 1080)
+    }
+
+    fn refresh_preview(&mut self) {
+        let key = crate::quality_preview::Key {
+            pref: self.preview_picture_pref(),
+            quality: self.settings.quality.clamp(1, 100),
+            yuv: self.settings.yuv,
+            fps: self.preview_fps(),
+        };
+        if self.preview_key == Some(key) {
+            return;
+        }
+        let sample = crate::quality_preview::simulate(key);
+        self.preview_image = preview_render_image(&sample.rgb, sample.width, sample.height);
+        self.preview_line = sample.line;
+        self.preview_anchors = sample.rates.to_vec();
+        self.preview_rates = sample
+            .rates
+            .iter()
+            .map(|(w, h, kbps)| (format!("{w}×{h}"), *kbps))
+            .collect();
+        self.preview_key = Some(key);
+    }
+
     fn picture_quality_slider(
         &mut self,
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        self.refresh_preview();
         let quality = self.settings.quality.clamp(1, 100);
         let track = Rc::new(Cell::new((0f32, 1f32)));
         let mark = Rc::clone(&track);
+        let (width, height) = self.path_resolution();
+        let kbps = crate::quality_preview::interpolate_kbps(&self.preview_anchors, width, height);
+        let path = self.estimate_path();
+        let load = path.as_ref().map(|path| path.load(kbps));
+        let quality_color = load.as_ref().map(|load| load.color).unwrap_or(TEXT);
+        let fill = load.as_ref().map(|load| load.color).unwrap_or(PLAYER_BLUE);
+        let warn = load.and_then(|load| match load.level {
+            crate::path_budget::WarnLevel::Ok => None,
+            level => load.tip.map(|tip| (level, tip)),
+        });
+        let estimate = format!(
+            "{width}×{height} · {}",
+            crate::quality_preview::format_kbps(kbps)
+        );
         div()
             .flex()
             .flex_col()
@@ -3054,9 +4229,16 @@ impl Desk {
                     .gap_2()
                     .child(
                         div()
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(quality_color))
                             .child(format!("Quality {quality}%")),
                     )
+                    .when_some(warn.clone(), |row, (level, tip)| {
+                        row.child(warn_triangle(
+                            SharedString::from(format!("{id}-warn")),
+                            level,
+                            tip,
+                        ))
+                    })
                     .child(choice_chip(
                         SharedString::from(format!("{id}-minus")),
                         "−",
@@ -3131,8 +4313,28 @@ impl Desk {
                             .left_0()
                             .w(relative(quality as f32 / 100.))
                             .rounded_full()
-                            .bg(rgb(PLAYER_BLUE)),
+                            .bg(rgb(fill)),
                     ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(quality_color))
+                            .child(estimate),
+                    )
+                    .when_some(warn, |row, (level, tip)| {
+                        row.child(warn_triangle(
+                            SharedString::from(format!("{id}-rate-warn")),
+                            level,
+                            tip,
+                        ))
+                    }),
             )
     }
 
@@ -3166,31 +4368,11 @@ impl Desk {
     }
 
     fn quality_preview_row(&mut self) -> impl IntoElement {
-        let key = crate::quality_preview::Key {
-            pref: self.preview_picture_pref(),
-            quality: self.settings.quality.clamp(1, 100),
-            yuv: self.settings.yuv,
-            fps: self.preview_fps(),
-        };
-        if self.preview_key != Some(key) {
-            let sample = crate::quality_preview::simulate(key);
-            self.preview_image = preview_render_image(&sample.rgb, sample.width, sample.height);
-            self.preview_line = sample.line;
-            self.preview_rates = sample
-                .rates
-                .iter()
-                .map(|(w, h, kbps)| {
-                    (
-                        format!("{w}×{h}"),
-                        crate::quality_preview::format_kbps(*kbps),
-                    )
-                })
-                .collect();
-            self.preview_key = Some(key);
-        }
+        self.refresh_preview();
         let picture = self.preview_image.clone();
         let line = self.preview_line.clone();
         let rates = self.preview_rates.clone();
+        let path = self.estimate_path();
         div()
             .flex()
             .flex_row()
@@ -3236,16 +4418,42 @@ impl Desk {
                             .flex_wrap()
                             .gap_x_4()
                             .gap_y_0()
-                            .children(rates.into_iter().map(|(size, rate)| {
+                            .children(rates.into_iter().enumerate().map(|(index, (size, kbps))| {
+                                let load = path.as_ref().map(|path| path.load(kbps));
+                                let color = load.as_ref().map(|load| load.color).unwrap_or(TEXT);
+                                let warn = load.and_then(|load| match load.level {
+                                    crate::path_budget::WarnLevel::Ok => None,
+                                    level => load.tip.map(|tip| (level, tip)),
+                                });
                                 div()
                                     .flex()
                                     .flex_row()
-                                    .w(px(168.))
+                                    .w(px(188.))
+                                    .items_center()
                                     .justify_between()
                                     .text_xs()
-                                    .text_color(rgb(TEXT))
                                     .child(div().text_color(rgb(MUTED)).child(size))
-                                    .child(rate)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(color))
+                                                    .child(crate::quality_preview::format_kbps(kbps)),
+                                            )
+                                            .when_some(warn, |row, (level, tip)| {
+                                                row.child(warn_triangle(
+                                                    SharedString::from(format!(
+                                                        "rate-warn-{index}"
+                                                    )),
+                                                    level,
+                                                    tip,
+                                                ))
+                                            }),
+                                    )
                             })),
                     )
                     .child(muted_line(
@@ -3322,6 +4530,8 @@ impl Desk {
             skip_without_hw: self.skip_without_hw,
             trace_input: self.trace_input,
             fps: self.fps,
+            audio_bitrate_kbps: self.audio_bitrate_kbps,
+            audio_channels: self.audio_channels,
         }
     }
 
@@ -3723,6 +4933,7 @@ impl Desk {
         } else {
             match etherquic::capture_start(None) {
                 Ok(dir) => {
+                    etherquic::set_capture_carrier(self.selected_carrier());
                     self.message = Some(format!("Capturing to {}", dir.display()));
                     self.capturing = true;
                 }
@@ -3835,10 +5046,350 @@ impl Desk {
         }
         crate::set_host_audio_device(self.settings.share_device.clone());
         etherquic_play::etherquic_media::host::set_dirty_rects(self.settings.dirty_rects);
-        etherquic::set_l2_preference(self.settings.network.l2_id());
+        let driver = self.settings.network.l2_id();
+        etherquic::set_l2_preference(driver);
+        let capture = match self.fps.wish() {
+            etherquic::negotiate::FpsWish::Fixed(fps) => fps,
+            _ => 0,
+        };
+        etherquic_play::etherquic_media::host::set_capture_fps(capture);
+        if let Some(id) = self.tabs.active_id() {
+            if self.link.role() == Role::Client {
+                self.push_session(id, true);
+            }
+        }
+        self.write_host_adjust();
         if persist {
             if let Err(err) = store_settings(&self.settings) {
                 self.message = Some(format!("Settings were not saved: {err}"));
+            }
+        }
+    }
+
+    fn tune_now(&self) -> etherquic_play::SessionTune {
+        etherquic_play::SessionTune {
+            video: self
+                .session_video
+                .and_then(|pref| etherquic::negotiate::Video::from_token(pref.token())),
+            audio: self
+                .session_audio
+                .and_then(|audio| etherquic::negotiate::Audio::from_token(audio.token())),
+            carrier: None,
+            fps: Some(self.fps.wish()),
+        }
+    }
+
+    fn stage_session(&mut self, id: u64, peer: [u8; 6], udp: Option<std::net::SocketAddr>) {
+        self.apply_saved_profile(peer);
+        let view = etherquic_play::live(self.settings.view());
+        let tune = etherquic_play::live_tune(self.tune_now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send_live(&view, &tune, &tx);
+        self.session_live.insert(
+            id,
+            SessionLive {
+                view: view.clone(),
+                tune: tune.clone(),
+                tx,
+                peer,
+                udp,
+            },
+        );
+        crate::stage_live(view, tune, Some(rx));
+    }
+
+    fn send_live(
+        &self,
+        view: &etherquic_play::LiveView,
+        tune: &etherquic_play::LiveTune,
+        tx: &std::sync::mpsc::Sender<String>,
+    ) {
+        let view = etherquic_play::snapshot(view);
+        let tune = etherquic_play::snapshot_tune(tune);
+        let yes = |on: bool| if on { "yes" } else { "no" };
+        let mut lines = vec![
+            format!("set scale={}", view.scale.token()),
+            format!("set look={}", view.look.token()),
+            format!("set dither={}", view.dither.token()),
+            format!("set quality={}", view.quality),
+            format!("set dirty-rects={}", yes(view.dirty_rects)),
+            format!("set debug-dirty-rects={}", yes(view.debug_dirty_rects)),
+            format!("set cursor={}", view.cursor.token()),
+            format!("set keyboard={}", yes(view.send_keyboard)),
+            format!("set mouse={}", yes(view.send_mouse)),
+            format!("set pads={}", yes(view.send_pads)),
+            format!("set upscale={}", view.upscale.token()),
+            format!("set frame-gen={}", view.frame_gen.token()),
+            format!("set yuv={}", view.yuv.token()),
+        ];
+        if let Some(video) = tune.video {
+            lines.push(format!("set video={}", video.token()));
+        }
+        if let Some(audio) = tune.audio {
+            lines.push(format!("set audio={}", audio.token()));
+        }
+        if let Some(carrier) = tune.carrier {
+            lines.push(format!("set carrier={carrier}"));
+        }
+        if let Some(fps) = tune.fps {
+            lines.push(format!("set fps={}", fps.token()));
+        }
+        if self.trace_log.on {
+            lines.push("set debug-trace=yes".into());
+        }
+        for line in lines {
+            let _ = tx.send(line);
+        }
+    }
+
+    fn push_session(&mut self, id: u64, from_settings: bool) {
+        let Some(slot) = self.session_live.get(&id) else {
+            return;
+        };
+        if from_settings {
+            let next = self.settings.view();
+            let tune = self.tune_now();
+            match slot.view.lock() {
+                Ok(mut guard) => *guard = next,
+                Err(poisoned) => *poisoned.into_inner() = next,
+            }
+            match slot.tune.lock() {
+                Ok(mut guard) => *guard = tune,
+                Err(poisoned) => *poisoned.into_inner() = tune,
+            }
+        }
+        let view = slot.view.clone();
+        let tune = slot.tune.clone();
+        let tx = slot.tx.clone();
+        self.send_live(&view, &tune, &tx);
+    }
+
+    fn edit_session(
+        &mut self,
+        id: u64,
+        edit: impl FnOnce(&mut etherquic_play::ViewOptions, &mut etherquic_play::SessionTune),
+    ) {
+        let Some(slot) = self.session_live.get(&id) else {
+            return;
+        };
+        {
+            let mut view = match slot.view.lock() {
+                Ok(view) => view,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut tune = match slot.tune.lock() {
+                Ok(tune) => tune,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            edit(&mut view, &mut tune);
+        }
+        self.push_session(id, false);
+    }
+
+    fn drop_session(&mut self, id: u64) {
+        self.session_live.remove(&id);
+        if self.inspect == Some(id) {
+            self.inspect = None;
+        }
+    }
+
+    fn write_host_adjust(&self) {
+        let adjust = etherquic::HostAdjust {
+            dirty_rects: Some(self.settings.dirty_rects),
+            capture_fps: match self.fps.wish() {
+                etherquic::negotiate::FpsWish::Fixed(fps) => Some(fps),
+                _ => None,
+            },
+            // Empty is Auto. All and any multi-select clear a nic the service already bound.
+            nic: Some(self.listen.dial_nic().unwrap_or_default()),
+            audio_device: self.settings.share_device.clone(),
+        };
+        let path = etherquic::adjust_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, etherquic::render_adjust(&adjust));
+    }
+
+    fn refresh_host_face(&mut self) {
+        if self.host_face_at.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.host_face_at = Instant::now();
+        let presence = etherquic::load_presence();
+        self.service_running = presence.running;
+        self.service_hosting = presence.hosting;
+        self.service_guests = presence.guests;
+        let installed = crate::desk_model::service_is_installed(
+            cfg!(target_os = "macos") && crate::macos_service::service_installed(),
+            etherquic::host_conf_installed(),
+            self.service_running,
+        );
+        let peers = if self.link.role() == Role::Host {
+            self.link.peers()
+        } else {
+            self.parked
+                .values()
+                .find(|link| link.role() == Role::Host)
+                .map(|link| link.peers())
+                .unwrap_or(0)
+        };
+        self.host_summary = crate::desk_model::HostFace {
+            process_up: self.link.role() == Role::Host || self.parked.values().any(|link| link.role() == Role::Host),
+            process_peers: peers,
+            service_installed: installed,
+            service_running: self.service_running,
+            service_hosting: self.service_hosting,
+            guests: self.service_guests.clone(),
+        }
+        .summary();
+    }
+
+    fn sync_outbound(&mut self) {
+        let active = self.tabs.active_id();
+        let mut open = Vec::new();
+        for tab in self.tabs.iter() {
+            let status = if Some(tab.id) == active {
+                self.link.status()
+            } else {
+                self.parked
+                    .get(&tab.id)
+                    .map(|link| link.status())
+                    .unwrap_or_else(|| "closed".into())
+            };
+            if self.trace_log.on {
+                self.trace_log.observe(&status);
+            }
+            open.push((tab.id, tab.label.clone(), status));
+        }
+        for line in etherquic_play::debug_lines() {
+            self.trace_log.observe(&line);
+        }
+        self.outbound = crate::desk_model::sync_outbound(&open, &mut self.layout);
+    }
+
+    fn on_session_click(&mut self, id: u64, clicks: usize, window: &mut Window) {
+        match crate::desk_model::click_action(clicks) {
+            crate::desk_model::Click::Select => {
+                self.switch_connection(id);
+                self.inspect = Some(id);
+                self.quick = true;
+            }
+            crate::desk_model::Click::Focus => {
+                self.switch_connection(id);
+                let picture = self.link.picture_id();
+                if picture != 0 {
+                    etherquic_play::switch_picture(picture);
+                }
+                etherquic_play::request_raise();
+                window.activate_window();
+            }
+        }
+    }
+
+    fn apply_shelf_cmds(&mut self, window: &mut Window) {
+        for cmd in crate::desk_model::take_cmds() {
+            match cmd {
+                crate::desk_model::ShareCmd::Select(id) => {
+                    self.switch_connection(id);
+                    self.inspect = Some(id);
+                    self.quick = true;
+                }
+                crate::desk_model::ShareCmd::Focus(id) => {
+                    self.on_session_click(id, 2, window);
+                }
+                crate::desk_model::ShareCmd::Close(id) => self.close_connection(id),
+                crate::desk_model::ShareCmd::ToggleQuick => self.quick = !self.quick,
+            }
+        }
+    }
+
+    fn publish_shelf(&self) {
+        let active = self.tabs.active_id();
+        let tabs = self
+            .outbound
+            .iter()
+            .map(|row| crate::desk_model::TabSnap {
+                id: row.id,
+                label: row.label.clone(),
+                badge: crate::desk_model::phase_badge(&row.phase),
+                current: Some(row.id) == active,
+                group: row.group,
+            })
+            .collect();
+        crate::desk_model::publish_tabs(tabs, self.quick);
+    }
+
+    fn apply_listen(&mut self) {
+        let nic = self.listen.dial_nic();
+        let changed = self.nic != nic;
+        self.nic = nic.clone();
+        self.scan.refresh_nics(&self.listen.probe_names());
+        self.refresh_share();
+        self.write_host_adjust();
+        if changed {
+            self.restart_window_host(nic);
+        }
+    }
+
+    fn restart_window_host(&mut self, nic: Option<String>) {
+        let host_id = if self.link.role() == Role::Host {
+            self.tabs.active_id()
+        } else {
+            self.parked
+                .iter()
+                .find(|(_, link)| link.role() == Role::Host)
+                .map(|(id, _)| *id)
+        };
+        let Some(id) = host_id else {
+            return;
+        };
+        self.close_connection(id);
+        let id = self.begin_tab("This computer".into());
+        if let Err(err) = self.link.host(nic, self.backend, self.fps.wish()) {
+            self.abort_tab(id);
+            self.message = Some(err);
+        }
+    }
+
+    fn toggle_listen(&mut self, name: String) {
+        if !self.listen.toggle(&name) {
+            self.message = Some("At least one adapter stays on.".into());
+            return;
+        }
+        self.apply_listen();
+    }
+
+    /// Open the inspected player again with the current adapter and layer.
+    fn redial_inspected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.inspect.or_else(|| self.tabs.active_id()) else {
+            return;
+        };
+        let (peer, udp) = match self.session_live.get(&id) {
+            Some(slot) => (slot.peer, slot.udp),
+            None => {
+                self.open_typed_connection(cx);
+                return;
+            }
+        };
+        match crate::desk_model::plan_redial(self.link.role() == Role::Client, peer, udp) {
+            crate::desk_model::Redial::NotClient => {
+                self.message = Some("Interface and layer apply to a player connection.".into());
+                cx.notify();
+            }
+            crate::desk_model::Redial::Address(addr) => {
+                if let Some(current) = self.tabs.active_id() {
+                    self.close_connection(current);
+                }
+                self.connect_direct(addr.ip(), addr.port(), cx);
+            }
+            crate::desk_model::Redial::Peer(peer) => {
+                if let Some(current) = self.tabs.active_id() {
+                    self.close_connection(current);
+                }
+                self.direct = None;
+                self.peer = HexMac::from_bytes(peer);
+                self.open_typed_connection(cx);
             }
         }
     }
@@ -3857,7 +5408,9 @@ impl Desk {
         }
         self.update = UpdateStatus::Checking;
         let beta = self.settings.beta_releases;
-        let task = cx.background_executor().spawn(async move { update::check(beta) });
+        let task = cx
+            .background_executor()
+            .spawn(async move { update::check(beta) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |desk, cx| {
@@ -3877,7 +5430,9 @@ impl Desk {
         };
         let tag = offer.tag.clone();
         self.update = UpdateStatus::Downloading { tag: tag.clone() };
-        let task = cx.background_executor().spawn(async move { update::install(&offer) });
+        let task = cx
+            .background_executor()
+            .spawn(async move { update::install(&offer) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |desk, cx| {
@@ -3933,6 +5488,8 @@ impl Desk {
                 Section::Sound => {
                     self.backend_pref = etherquic::default_backend_order().to_vec();
                     self.apply_backend_order();
+                    self.audio_bitrate_kbps = 0;
+                    self.audio_channels = 0;
                 }
                 Section::Codecs => {
                     self.video_pref = default_video();
@@ -4177,6 +5734,9 @@ impl Desk {
             self.settings.quality,
             self.settings.dirty_rects,
             self.settings.yuv,
+            self.settings.view_only,
+            self.settings.exclusive,
+            saved.carrier,
         )
     }
 
@@ -4253,6 +5813,13 @@ impl Desk {
                 self.session_audio.is_some(),
                 pinned_a,
             ),
+            Menu::Fps
+            | Menu::AudioBitrate
+            | Menu::AudioChannels
+            | Menu::QuickFps
+            | Menu::Look
+            | Menu::Upscale
+            | Menu::FrameGen => ("", "none", false, false),
         };
         let shown = if overridden {
             value.to_string()
@@ -4265,6 +5832,13 @@ impl Desk {
         let id = match which {
             Menu::Video => "codec-video",
             Menu::Audio => "codec-audio",
+            Menu::Fps => "connect-fps",
+            Menu::AudioBitrate => "connect-audio-kbps",
+            Menu::AudioChannels => "connect-audio-ch",
+            Menu::QuickFps => "quick-fps",
+            Menu::Look => "quick-look",
+            Menu::Upscale => "quick-upscale",
+            Menu::FrameGen => "quick-frame-gen",
         };
         let mac = self.peer.parse();
         let name = self.target_label();
@@ -4285,6 +5859,13 @@ impl Desk {
                         .map(|(i, codec)| (codec.name().to_string(), Some(i))),
                 )
                 .collect(),
+            Menu::Fps
+            | Menu::AudioBitrate
+            | Menu::AudioChannels
+            | Menu::QuickFps
+            | Menu::Look
+            | Menu::Upscale
+            | Menu::FrameGen => Vec::new(),
         };
         let mut menu = div()
             .id(SharedString::from(format!("{id}-menu")))
@@ -4310,6 +5891,7 @@ impl Desk {
                 (Some(i), Menu::Audio) => {
                     overridden && self.session_audio == AudioId::order().get(i).copied()
                 }
+                (Some(_), _) => false,
             };
             menu = menu.child(
                 div()
@@ -4347,6 +5929,7 @@ impl Desk {
                             (Menu::Audio, Some(i)) => {
                                 desk.session_audio = AudioId::order().get(i).copied()
                             }
+                            _ => {}
                         }
                         desk.menu = None;
                         cx.notify();
@@ -4395,6 +5978,7 @@ impl Desk {
                                         let pick = desk.session_audio.take();
                                         desk.edit_connection(mac, |over| over.audio = pick);
                                     }
+                                    _ => {}
                                 }
                                 cx.notify();
                             }))
@@ -4418,6 +6002,7 @@ impl Desk {
                                     move_to_front(&mut desk.audio_pref, pick);
                                 }
                             }
+                            _ => {}
                         }
                         desk.persist();
                         cx.notify();
@@ -4429,7 +6014,7 @@ impl Desk {
             .flex_row()
             .items_center()
             .gap_2()
-            .w_full()
+            .flex_1()
             .min_w_0()
             .h(px(30.))
             .child(
@@ -4484,6 +6069,310 @@ impl Desk {
                     }),
             )
             .when_some(save_for, |row, save| row.child(save))
+    }
+
+    fn side_pick_shown(&self, which: Menu) -> (String, f32) {
+        match which {
+            Menu::Fps | Menu::QuickFps => {
+                let shown = match self.fps {
+                    FrameRate::Auto => "Auto".to_string(),
+                    FrameRate::Match => "Match".to_string(),
+                    FrameRate::Fixed(fps) => format!("{fps}"),
+                };
+                (shown, 88.)
+            }
+            Menu::AudioBitrate => {
+                let shown = if self.audio_bitrate_kbps == 0 {
+                    "Auto".to_string()
+                } else {
+                    format!(
+                        "{} kbps",
+                        scale_audio_kbps(self.audio_bitrate_kbps, self.audio_channels)
+                    )
+                };
+                (shown, 108.)
+            }
+            Menu::AudioChannels => {
+                let shown = if self.audio_channels == 0 {
+                    "Auto".to_string()
+                } else {
+                    audio_layout_name(self.audio_channels).to_string()
+                };
+                (shown, 88.)
+            }
+            Menu::Video | Menu::Audio => ("Auto".to_string(), 88.),
+            Menu::Look => (self.settings.look.label().to_string(), 140.),
+            Menu::Upscale => (self.settings.upscale.label().to_string(), 88.),
+            Menu::FrameGen => (self.settings.frame_gen.label().to_string(), 72.),
+        }
+    }
+
+    fn side_pick_items(&self, which: Menu) -> Vec<(String, bool, bool)> {
+        match which {
+            Menu::Fps | Menu::QuickFps => {
+                let mut items = vec![
+                    ("Auto".to_string(), self.fps == FrameRate::Auto, true),
+                    (
+                        "Match remote".to_string(),
+                        self.fps == FrameRate::Match,
+                        false,
+                    ),
+                ];
+                for fps in FPS_CHOICES {
+                    items.push((format!("{fps}"), self.fps == FrameRate::Fixed(fps), false));
+                }
+                if let FrameRate::Fixed(fps) = self.fps {
+                    if !FPS_CHOICES.contains(&fps) {
+                        items.push((format!("{fps}"), true, false));
+                    }
+                }
+                items
+            }
+            Menu::AudioBitrate => {
+                let mut items = vec![(
+                    format!("Auto · {} kbps", scale_audio_kbps(0, self.audio_channels)),
+                    self.audio_bitrate_kbps == 0,
+                    true,
+                )];
+                for kbps in AUDIO_BITRATE_CHOICES {
+                    let shown = scale_audio_kbps(kbps, self.audio_channels);
+                    items.push((
+                        format!("{shown} kbps"),
+                        self.audio_bitrate_kbps == kbps,
+                        false,
+                    ));
+                }
+                if self.audio_bitrate_kbps != 0
+                    && !AUDIO_BITRATE_CHOICES.contains(&self.audio_bitrate_kbps)
+                {
+                    let shown = scale_audio_kbps(self.audio_bitrate_kbps, self.audio_channels);
+                    items.push((format!("{shown} kbps"), true, false));
+                }
+                items
+            }
+            Menu::AudioChannels => AUDIO_LAYOUTS
+                .iter()
+                .map(|layout| {
+                    let label = if layout.channels == 0 {
+                        "Auto · Stereo".to_string()
+                    } else {
+                        layout.name.to_string()
+                    };
+                    (
+                        label,
+                        self.audio_channels == layout.channels,
+                        layout.channels == 0,
+                    )
+                })
+                .collect(),
+            Menu::Video | Menu::Audio => Vec::new(),
+            Menu::Look => Look::ALL
+                .into_iter()
+                .map(|look| {
+                    (
+                        look.label().to_string(),
+                        self.settings.look == look,
+                        look == Look::Off,
+                    )
+                })
+                .collect(),
+            Menu::Upscale => Upscale::ALL
+                .into_iter()
+                .map(|mode| {
+                    (
+                        mode.label().to_string(),
+                        self.settings.upscale == mode,
+                        mode == Upscale::Off,
+                    )
+                })
+                .collect(),
+            Menu::FrameGen => FrameGen::ALL
+                .into_iter()
+                .map(|mode| {
+                    (
+                        mode.label().to_string(),
+                        self.settings.frame_gen == mode,
+                        mode == FrameGen::Off,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn apply_side_pick(&mut self, which: Menu, index: usize) {
+        match which {
+            Menu::Fps | Menu::QuickFps => {
+                self.fps = match index {
+                    0 => FrameRate::Auto,
+                    1 => FrameRate::Match,
+                    i => {
+                        let extra = if let FrameRate::Fixed(fps) = self.fps {
+                            (!FPS_CHOICES.contains(&fps)).then_some(fps)
+                        } else {
+                            None
+                        };
+                        if let Some(fps) = FPS_CHOICES.get(i.saturating_sub(2)).copied() {
+                            FrameRate::Fixed(fps)
+                        } else if let Some(fps) = extra {
+                            FrameRate::Fixed(fps)
+                        } else {
+                            self.fps
+                        }
+                    }
+                };
+            }
+            Menu::AudioBitrate => {
+                self.audio_bitrate_kbps = if index == 0 {
+                    0
+                } else {
+                    AUDIO_BITRATE_CHOICES
+                        .get(index - 1)
+                        .copied()
+                        .unwrap_or(self.audio_bitrate_kbps)
+                };
+            }
+            Menu::AudioChannels => {
+                if let Some(layout) = AUDIO_LAYOUTS.get(index) {
+                    self.audio_channels = layout.channels;
+                }
+            }
+            Menu::Video | Menu::Audio => {}
+            Menu::Look => {
+                if let Some(look) = Look::ALL.get(index).copied() {
+                    self.edit_settings(|settings| settings.look = look);
+                }
+                self.menu = None;
+                return;
+            }
+            Menu::Upscale => {
+                if let Some(mode) = Upscale::ALL.get(index).copied() {
+                    self.edit_settings(|settings| settings.upscale = mode);
+                }
+                self.menu = None;
+                return;
+            }
+            Menu::FrameGen => {
+                if let Some(mode) = FrameGen::ALL.get(index).copied() {
+                    self.edit_settings(|settings| settings.frame_gen = mode);
+                }
+                self.menu = None;
+                return;
+            }
+        }
+        self.menu = None;
+        self.persist();
+    }
+
+    fn side_pick(&mut self, which: Menu, cx: &mut Context<Self>) -> impl IntoElement {
+        let (shown, width) = self.side_pick_shown(which);
+        let items = self.side_pick_items(which);
+        let open = self.menu == Some(which);
+        let id = match which {
+            Menu::Fps => "connect-fps",
+            Menu::AudioBitrate => "connect-audio-kbps",
+            Menu::AudioChannels => "connect-audio-ch",
+            Menu::Video => "codec-video",
+            Menu::Audio => "codec-audio",
+            Menu::QuickFps => "quick-fps",
+            Menu::Look => "quick-look",
+            Menu::Upscale => "quick-upscale",
+            Menu::FrameGen => "quick-frame-gen",
+        };
+        let mut menu = div()
+            .id(SharedString::from(format!("{id}-menu")))
+            .flex()
+            .flex_col()
+            .w(px(width.max(140.)))
+            .p_1()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(PLAYER_BLUE))
+            .rounded_md()
+            .shadow_lg()
+            .when(which == Menu::Look, |menu| {
+                menu.max_h(px(320.)).overflow_y_scroll()
+            })
+            .on_mouse_down_out(cx.listener(|desk, _, _, cx| {
+                desk.menu = None;
+                cx.notify();
+            }));
+        for (index, (text, on, is_default)) in items.into_iter().enumerate() {
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("{id}-item-{index}")))
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(on, |item| {
+                        item.bg(rgb(0x243044)).font_weight(FontWeight::BOLD)
+                    })
+                    .hover(|item| item.bg(rgb(0x2a3242)))
+                    .justify_between()
+                    .child(text)
+                    .when(is_default, |item| item.child(faint_default()))
+                    .on_click(cx.listener(move |desk, _, _, cx| {
+                        desk.apply_side_pick(which, index);
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .relative()
+            .flex_none()
+            .child(
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w(px(width))
+                    .h(px(28.))
+                    .px_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(CARD_EDGE))
+                    .bg(rgb(BG))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .h(px(18.))
+                            .line_height(px(18.))
+                            .overflow_hidden()
+                            .whitespace_normal()
+                            .child(shown),
+                    )
+                    .child(chevron(open))
+                    .on_click(cx.listener(move |desk, _, _, cx| {
+                        desk.menu = if desk.menu == Some(which) {
+                            None
+                        } else {
+                            Some(which)
+                        };
+                        cx.notify();
+                    })),
+            )
+            .when(open, |anchor| {
+                anchor.child(
+                    div()
+                        .absolute()
+                        .top(px(30.))
+                        .left_0()
+                        .child(deferred(anchored().snap_to_window().child(menu)).with_priority(1)),
+                )
+            })
+    }
+
+    fn quick_label(&self, text: &'static str) -> impl IntoElement {
+        div()
+            .flex_none()
+            .text_xs()
+            .text_color(rgb(MUTED))
+            .child(text)
     }
 
     /// A Settings section: title, the backend this part runs on, and Reset.
@@ -4753,12 +6642,16 @@ impl Desk {
         let render = self.backend_row(Part::Render, cx);
         let scale = self.settings.scale;
         let size_match = self.settings.size_match;
+        let upscale = self.settings.upscale;
+        let frame_gen = self.settings.frame_gen;
         let look = self.settings.look;
         let dither = self.settings.dither;
         let pixel_size = self.settings.pixel_size;
         let dither_strength = self.settings.dither_strength;
         let default_scale = self.defaults.scale;
         let default_size = self.defaults.size_match;
+        let default_upscale = self.defaults.upscale;
+        let default_frame_gen = self.defaults.frame_gen;
         let default_look = self.defaults.look;
         let default_dither = self.defaults.dither;
         let default_pixel_size = self.defaults.pixel_size;
@@ -4798,6 +6691,38 @@ impl Desk {
                     .when(!choice.available(), |chip| chip.opacity(0.45))
                     .child(chip),
                 default_size == choice,
+            ));
+        }
+        let mut upscales = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for mode in Upscale::ALL {
+            upscales = upscales.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("upscale-{}", mode.token())),
+                    mode.label(),
+                    upscale == mode,
+                    88.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.upscale = mode);
+                        cx.notify();
+                    }),
+                ),
+                default_upscale == mode,
+            ));
+        }
+        let mut frame_gens = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
+        for mode in FrameGen::ALL {
+            frame_gens = frame_gens.child(with_default(
+                choice_chip(
+                    SharedString::from(format!("frame-gen-{}", mode.token())),
+                    mode.label(),
+                    frame_gen == mode,
+                    88.,
+                    cx.listener(move |desk, _, _, cx| {
+                        desk.edit_settings(|settings| settings.frame_gen = mode);
+                        cx.notify();
+                    }),
+                ),
+                default_frame_gen == mode,
             ));
         }
         let mut looks = div().flex().flex_row().flex_wrap().gap_2().min_w_0();
@@ -4866,6 +6791,8 @@ impl Desk {
         }
         let scale_head = self.field_head("Scale to fit", &[Field::Scale], cx);
         let size_head = self.field_head("Resolution matching", &[Field::SizeMatch], cx);
+        let upscale_head = self.field_head("Client upscale", &[Field::Upscale], cx);
+        let frame_gen_head = self.field_head("Frame generation", &[Field::FrameGen], cx);
         let look_head = self.field_head("Picture look", &[Field::Look], cx);
         let dither_head = self.field_head("Dither", &[Field::Dither], cx);
         let pixel_head = self.field_head("Pixel size", &[Field::PixelSize], cx);
@@ -4880,6 +6807,10 @@ impl Desk {
             .child(scales)
             .child(size_head)
             .child(sizes)
+            .child(upscale_head)
+            .child(upscales)
+            .child(frame_gen_head)
+            .child(frame_gens)
             .child(look_head)
             .child(looks)
             .child(pixel_head)
@@ -4892,7 +6823,13 @@ impl Desk {
                 "Scale and resolution matching apply to an open view at once. Host matches window is not available: hosts do not change their resolution yet.".into(),
             ))
             .child(muted_line(
-                "Picture look is painted by the host before it encodes, and it applies to an open view at once. Off leaves the capture. Blocks only downsamples. Poster flattens each channel. The other names are Lospec palettes from Image-to-Pixel. Pixel size is source pixels per block. Ordered dither (Bayer, cluster, lines, blue noise) is stable on video; error diffusion (Floyd–Steinberg and the rest) can flicker between frames.".into(),
+                "Client upscale asks the host for 720p and fills this window on the player. Auto is FSR, DLSS on NVIDIA, or XeSS on Intel. DLSS and XeSS use the FSR spatial path until those runtimes are present. Upscale also sits in the top-right of this window.".into(),
+            ))
+            .child(muted_line(
+                "Frame generation synthesises one extra picture between arrivals so a 30 fps stream can paint at 60. Auto turns on when a discrete GPU is present. The player warps the latest picture along motion from the one before it; it does not wait for the next real frame. NVIDIA Vulkan FRUC (fruc_vulkan) needs FFmpeg master and Ampere optical flow; this path is a Vulkan compute interpolator that runs on Turing and later.".into(),
+            ))
+            .child(muted_line(
+                "Picture look is painted by the host before it encodes, and it applies to an open view at once. Off leaves the capture. Blocks only downsamples. Poster flattens each channel. The other names are Lospec palettes from Image-to-Pixel. Pixel size is source pixels per block. Ordered dither (Bayer, cluster, lines, blue noise) is stable on video; error diffusion (Floyd–Steinberg and the rest) can flicker between frames. Ordered looks run as a GPU compute shader when a discrete adapter is present; a palette LUT keeps the CPU path under a millisecond. FPS and Shader also sit in the top-right of this window.".into(),
             ));
         let appearance = self.section(Section::Appearance, Some(render), appearance_body, cx);
 
@@ -5131,7 +7068,12 @@ impl Desk {
                     }),
             )
             .child(section_label("Opus tools"))
-            .child(muted_line(backend_line(self.backends, self.backend)))
+            .child(self.copyable_line(
+                "opus-tools",
+                backend_line(self.backends, self.backend),
+                MUTED,
+                cx,
+            ))
             .child(tools)
             .child(muted_line(
                 "The first installed tool in this order is announced, and used the next time this computer shares.".into(),
@@ -5139,7 +7081,6 @@ impl Desk {
         let sound = self.section(Section::Sound, Some(media), sound_body, cx);
 
         // Codecs
-        let codec_line = self.this_pc_codecs();
         let mut video = div().flex().flex_col().gap_2().w_full().min_w_0();
         for (index, codec) in self.video_pref.iter().copied().enumerate() {
             let off = self.video_off.contains(&codec);
@@ -5219,7 +7160,8 @@ impl Desk {
             .child(muted_line(
                 "The default order for every computer. The first row both sides can run is the match. A computer can have its own pick: use Save for in the Connect card.".into(),
             ))
-            .child(muted_line(codec_line))
+            .child(muted_line(self.this_pc_audio_line()))
+            .child(self.codec_support_table("settings-codecs", cx))
             .child(two_columns(column("Video", video), column("Audio", audio)))
             .child(toggle_row(
                 "skip-without-hw",
@@ -5234,11 +7176,6 @@ impl Desk {
             .child(muted_line(
                 "A codec without a hardware encoder is skipped. MJPEG stays available. The desktop picture stays MJPEG, and desktop audio stays PCM.".into(),
             ))
-            .child(muted_line(if self.pyrowave_library {
-                "Pyrowave library: found.".into()
-            } else {
-                "Pyrowave library: not found.".into()
-            }))
             .child(quality_head)
             .child(quality_slider)
             .child(muted_line(
@@ -5377,6 +7314,15 @@ impl Desk {
                     .child(toggle_chip("trace-input", "Trace input timing", trace_input, Some(false), cx.listener(|desk, _, _, cx| {
                         desk.trace_input = !desk.trace_input;
                         desk.persist();
+                        cx.notify();
+                    })))
+                    .child(toggle_chip("net-trace", "Network trace", self.trace_log.on, Some(false), cx.listener(|desk, _, _, cx| {
+                        desk.trace_log.toggle();
+                        etherquic_play::set_debug_trace(desk.trace_log.on);
+                        let on = if desk.trace_log.on { "yes" } else { "no" };
+                        for slot in desk.session_live.values() {
+                            let _ = slot.tx.send(format!("set debug-trace={on}"));
+                        }
                         cx.notify();
                     }))),
             )
@@ -5546,7 +7492,11 @@ impl Desk {
             UpdateStatus::Idle => format!("This build is {}.", etherquic::RELEASE),
             UpdateStatus::Checking => "Checking GitHub tagged releases…".into(),
             UpdateStatus::Current { latest } => {
-                format!("This build is {}. {} is the latest tag.", etherquic::RELEASE, latest)
+                format!(
+                    "This build is {}. {} is the latest tag.",
+                    etherquic::RELEASE,
+                    latest
+                )
             }
             UpdateStatus::Available(offer) => {
                 let kind = if offer.prerelease { "beta" } else { "release" };
@@ -5573,7 +7523,16 @@ impl Desk {
             .gap_2()
             .w_full()
             .min_w_0()
-            .child(muted_line(update_line))
+            .child(self.copyable_line(
+                "update-line",
+                update_line,
+                if matches!(self.update, UpdateStatus::Failed(_)) {
+                    DANGER
+                } else {
+                    MUTED
+                },
+                cx,
+            ))
             .child(toggle_chip(
                 "beta-releases",
                 "Beta releases",
@@ -5703,8 +7662,13 @@ impl Desk {
                     })
                     .when(!details.is_empty(), |col| {
                         let mut lines = div().flex().flex_col().w_full().min_w_0();
-                        for line in details.clone() {
-                            lines = lines.child(muted_line(line));
+                        for (index, line) in details.clone().into_iter().enumerate() {
+                            lines = lines.child(self.copyable_line(
+                                format!("host-detail-{index}"),
+                                line,
+                                MUTED,
+                                cx,
+                            ));
                         }
                         col.child(section_label("What it reported")).child(lines)
                     })
@@ -5716,6 +7680,13 @@ impl Desk {
 impl Render for Desk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reap_links();
+        self.refresh_host_face();
+        self.sync_outbound();
+        self.apply_shelf_cmds(window);
+        self.publish_shelf();
+        if !self.shelves.is_empty() {
+            window.request_animation_frame();
+        }
         install_tray(window, cx);
         if crate::tray::take_hide() {
             window.minimize_window();
@@ -5784,15 +7755,10 @@ impl Render for Desk {
                     .child(connect),
             )
             .when_some(nic_error.clone(), |col, err| {
-                col.child(
-                    div()
-                        .w_full()
-                        .text_color(rgb(DANGER))
-                        .whitespace_normal()
-                        .child(err),
-                )
+                col.child(self.copyable_line("nic-error", err, DANGER, cx))
             })
             .child(picker)
+            .child(self.active_block(cx))
             .child(
                 div()
                     .flex()
@@ -5868,10 +7834,9 @@ impl Render for Desk {
             );
 
         let playing = self.link.role() == Role::Client;
-        let extra_keys = (cfg!(target_os = "android") && playing)
-            .then(|| self.extra_keys_bar(cx));
-        let overlay = (cfg!(target_os = "android") && self.overlay_active())
-            .then(|| self.overlay_layer(cx));
+        let extra_keys = (cfg!(target_os = "android") && playing).then(|| self.extra_keys_bar(cx));
+        let overlay =
+            (cfg!(target_os = "android") && self.overlay_active()).then(|| self.overlay_layer(cx));
         self.sync_touch_pointer();
         div()
             .flex()
@@ -5880,7 +7845,25 @@ impl Render for Desk {
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .text_sm()
-            .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|desk, ev: &KeyDownEvent, window, cx| {
+                let key = &ev.keystroke;
+                let typing = desk.filter_focus.is_focused(window)
+                    || desk.add_name_focus.is_focused(window)
+                    || desk.add_addr_focus.is_focused(window)
+                    || desk.rename_focus.is_focused(window);
+                if !typing
+                    && crate::desk_model::quick_hotkey(
+                        key.modifiers.control,
+                        key.modifiers.alt,
+                        key.modifiers.shift,
+                        &key.key,
+                    )
+                {
+                    desk.quick = !desk.quick;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if desk.forward_session_key(ev) {
                     cx.stop_propagation();
                     cx.notify();
@@ -5962,21 +7945,37 @@ impl Render for Desk {
                                             .child("Share this desktop, or open a remote one."),
                                     ),
                             )
-                            .child(prefs_button(
-                                settings_open,
-                                cx.listener(|desk, _, _, cx| {
-                                    // Open Settings and bring it into view; a second
-                                    // press closes it. Scroll after layout, not here:
-                                    // request_animation_frame is only legal during paint.
-                                    if desk.open.settings {
-                                        desk.open.settings = false;
-                                    } else {
-                                        desk.open.settings = true;
-                                        desk.scroll_to_settings = 2;
-                                    }
-                                    cx.notify();
-                                }),
-                            )),
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .flex_none()
+                                    .child(self.quick_label("FPS"))
+                                    .child(self.side_pick(Menu::QuickFps, cx))
+                                    .child(self.quick_label("Shader"))
+                                    .child(self.side_pick(Menu::Look, cx))
+                                    .child(self.quick_label("Upscale"))
+                                    .child(self.side_pick(Menu::Upscale, cx))
+                                    .child(self.quick_label("Frame gen"))
+                                    .child(self.side_pick(Menu::FrameGen, cx))
+                                    .child(prefs_button(
+                                        settings_open,
+                                        cx.listener(|desk, _, _, cx| {
+                                            // Open Settings and bring it into view; a second
+                                            // press closes it. Scroll after layout, not here:
+                                            // request_animation_frame is only legal during paint.
+                                            if desk.open.settings {
+                                                desk.open.settings = false;
+                                            } else {
+                                                desk.open.settings = true;
+                                                desk.scroll_to_settings = 2;
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )),
+                            ),
                     )
                     .child(
                         div()
@@ -5986,10 +7985,7 @@ impl Render for Desk {
                             .h(px(STATUS_H))
                             .flex_none()
                             .overflow_hidden()
-                            .text_color(rgb(status_color))
-                            .whitespace_normal()
-                            .line_clamp(2)
-                            .child(status),
+                            .child(self.copyable_line("status", status, status_color, cx)),
                     ),
             )
             .child(
@@ -6027,12 +8023,21 @@ struct Panels {
     /// Every sound device, not only the first few.
     all_devices: bool,
     details: bool,
+    /// Link, carrier, and codec comparison under the Carrier heading.
+    latency: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     Video,
     Audio,
+    Fps,
+    AudioBitrate,
+    AudioChannels,
+    QuickFps,
+    Look,
+    Upscale,
+    FrameGen,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6276,7 +8281,11 @@ fn extra_key_chip_label(
         .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
         .bg(rgb(if on { 0x243044 } else { 0x12141a }))
         .text_color(rgb(if on { PLAYER_BLUE } else { TEXT }))
-        .font_weight(if on { FontWeight::BOLD } else { FontWeight::NORMAL })
+        .font_weight(if on {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        })
         .cursor_pointer()
         .child(label)
         .on_click(on_click)
@@ -6348,7 +8357,10 @@ fn overlay_stick(
     let thumb_x = 56.0 + nx * 36.0 - 18.0;
     let thumb_y = 56.0 - ny * 36.0 - 18.0;
     div()
-        .id(SharedString::from(format!("ov-stick-{}-{index}", side.token())))
+        .id(SharedString::from(format!(
+            "ov-stick-{}-{index}",
+            side.token()
+        )))
         .relative()
         .w(px(112.))
         .h(px(112.))
@@ -6466,7 +8478,9 @@ fn overlay_hold_cell(
         .child(label.into())
         .on_mouse_down(MouseButton::Left, on_down)
         .on_mouse_up(MouseButton::Left, move |ev, window, cx| up(ev, window, cx))
-        .on_mouse_up_out(MouseButton::Left, move |ev, window, cx| on_up(ev, window, cx))
+        .on_mouse_up_out(MouseButton::Left, move |ev, window, cx| {
+            on_up(ev, window, cx)
+        })
 }
 
 fn extra_key_chip(
@@ -6496,15 +8510,51 @@ fn extra_key_chip(
         .border_color(rgb(if on { PLAYER_BLUE } else { CARD_EDGE }))
         .bg(rgb(if on { 0x243044 } else { 0x12141a }))
         .text_color(rgb(if on { PLAYER_BLUE } else { TEXT }))
-        .font_weight(if on { FontWeight::BOLD } else { FontWeight::NORMAL })
+        .font_weight(if on {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        })
         .cursor_pointer()
         .child(label)
         .on_click(on_click)
 }
 
+/// One full-width listen row. The name, addresses, and kind share a left edge.
+fn listen_row(
+    id: impl Into<gpui::ElementId>,
+    label: SharedString,
+    accent: Option<u32>,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let filled = accent.is_some();
+    div()
+        .id(id)
+        .flex()
+        .w_full()
+        .min_w_0()
+        .h(px(26.))
+        .px_2()
+        .items_center()
+        .justify_start()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(accent.unwrap_or(CARD_EDGE)))
+        .bg(rgb(accent.unwrap_or(CARD)))
+        .text_color(rgb(if filled { INK } else { TEXT }))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .when(filled, |row| row.font_weight(FontWeight::BOLD))
+        .when(enabled, |row| row.cursor_pointer())
+        .when(!enabled, |row| row.opacity(0.4).cursor_default())
+        .child(label)
+        .when(enabled, |row| row.on_click(on_click))
+}
+
 fn small_chip(
     id: impl Into<gpui::ElementId>,
-    label: &'static str,
+    label: impl Into<SharedString>,
     accent: Option<u32>,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -6526,7 +8576,7 @@ fn small_chip(
         .when(filled, |chip| chip.font_weight(FontWeight::BOLD))
         .when(enabled, |chip| chip.cursor_pointer())
         .when(!enabled, |chip| chip.opacity(0.4).cursor_default())
-        .child(label)
+        .child(label.into())
         .when(enabled, |chip| chip.on_click(on_click))
 }
 
@@ -7307,6 +9357,18 @@ fn device_details(device: &Found, selection: &str, caps: &[String]) -> impl Into
         )
 }
 
+fn codec_cell(width: f32, color: u32, text: impl Into<String>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(width))
+        .px_1()
+        .text_xs()
+        .text_color(rgb(color))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .child(text.into())
+}
+
 fn muted_line(text: String) -> impl IntoElement {
     div()
         .w_full()
@@ -7405,6 +9467,100 @@ fn ipv6_scope(nic: Option<&str>, nics: &[NicChoice]) -> u32 {
 /// `any`, loopback, and the netfilter pseudo-devices are not play adapters.
 fn nic_shown(nic: &NicChoice) -> bool {
     !matches!(nic.name.trim(), "any" | "lo" | "nflog" | "nfqueue")
+}
+
+fn listen_set() -> crate::desk_model::ListenSet {
+    let faces = etherquic::list_faces().unwrap_or_default();
+    crate::desk_model::ListenSet::from_parts(faces.into_iter().map(|face| {
+        let friendly = if face.description.trim().is_empty() {
+            face.name.clone()
+        } else {
+            face.description
+        };
+        let mac = face.mac.map(format_mac).unwrap_or_default();
+        let ipv4 = face.ipv4.iter().map(|ip| ip.to_string()).collect();
+        let ipv6 = face.ipv6.iter().map(|ip| ip.to_string()).collect();
+        (face.name, friendly, mac, ipv4, ipv6, face.kind)
+    }))
+}
+
+struct Shelf {
+    group: u64,
+}
+
+impl Render for Shelf {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (tabs, _quick) = crate::desk_model::published_tabs();
+        let group = self.group;
+        let mine: Vec<_> = tabs
+            .into_iter()
+            .filter(|tab| tab.group == group)
+            .collect();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .p_3()
+            .gap_2()
+            .child(div().font_weight(FontWeight::BOLD).child(format!(
+                "Window {group}"
+            )))
+            .child(muted_line(
+                "Tabs in this window. Double-click focuses the picture, including a minimized window or another desktop.".into(),
+            ));
+        if mine.is_empty() {
+            col = col.child(muted_line("No connections in this window.".into()));
+        }
+        for tab in mine {
+            let id = tab.id;
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!("shelf-{group}-{id}")))
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(if tab.current { 0x243044 } else { CARD }))
+                    .child(div().flex_1().child(format!("{}  {}", tab.label, tab.badge)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, ev: &MouseDownEvent, _, _| {
+                            if ev.click_count >= 2 {
+                                crate::desk_model::push_cmd(crate::desk_model::ShareCmd::Focus(id));
+                            } else {
+                                crate::desk_model::push_cmd(crate::desk_model::ShareCmd::Select(id));
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("shelf-x-{group}-{id}")))
+                            .px_1()
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, _| {
+                                    crate::desk_model::push_cmd(crate::desk_model::ShareCmd::Close(id));
+                                }),
+                            ),
+                    ),
+            );
+        }
+        col.child(small_chip(
+            SharedString::from(format!("shelf-quick-{group}")),
+            "Quick settings",
+            Some(PLAYER_BLUE),
+            true,
+            cx.listener(|_, _, _, _| {
+                crate::desk_model::push_cmd(crate::desk_model::ShareCmd::ToggleQuick);
+            }),
+        ))
+    }
 }
 
 fn lane_row() -> impl IntoElement {
@@ -7515,7 +9671,7 @@ impl Render for Tip {
         div()
             .px_2()
             .py_1()
-            .max_w(px(280.))
+            .max_w(px(420.))
             .rounded_sm()
             .border_1()
             .border_color(rgb(CARD_EDGE))
@@ -7527,8 +9683,33 @@ impl Render for Tip {
     }
 }
 
+fn warn_triangle(
+    id: SharedString,
+    level: crate::path_budget::WarnLevel,
+    tip: String,
+) -> impl IntoElement {
+    let color = match level {
+        crate::path_budget::WarnLevel::Red => DANGER,
+        crate::path_budget::WarnLevel::Yellow | crate::path_budget::WarnLevel::Ok => 0xe6c14a,
+    };
+    div()
+        .id(id)
+        .flex_none()
+        .text_xs()
+        .line_height(px(14.))
+        .text_color(rgb(color))
+        .cursor_default()
+        .tooltip(shared_tip(tip))
+        .child("▲")
+}
+
+fn shared_tip(why: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    let why = why.into();
+    move |_, cx| cx.new(|_| Tip { text: why.clone() }).into()
+}
+
 fn why_tip(why: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView {
-    move |_, cx| cx.new(|_| Tip { text: why.into() }).into()
+    shared_tip(why)
 }
 
 /// One sound device in a column. The name is clipped to the column.

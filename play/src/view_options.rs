@@ -158,6 +158,10 @@ pub struct ViewOptions {
     pub debug_dirty_rects: bool,
     /// PyroWave colour format asked of the host.
     pub yuv: etherquic::negotiate::YuvFormat,
+    /// Client upscaler. On asks the host for 720p and fills the window here.
+    pub upscale: etherquic::upscale::Upscale,
+    /// Insert a synthesised picture between arrivals.
+    pub frame_gen: etherquic::fruc::FrameGen,
     pub pad_slots: Vec<PadSlot>,
     /// Output device by name. `None` is the default device. Read when sound starts.
     pub output_device: Option<String>,
@@ -180,6 +184,8 @@ impl Default for ViewOptions {
             dirty_rects: false,
             debug_dirty_rects: false,
             yuv: etherquic::negotiate::YuvFormat::YUV444P8,
+            upscale: etherquic::upscale::Upscale::Off,
+            frame_gen: etherquic::fruc::FrameGen::Off,
             pad_slots: Vec::new(),
             output_device: None,
         }

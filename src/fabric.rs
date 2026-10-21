@@ -132,6 +132,13 @@ impl Fabric {
         }
     }
 
+    /// Inject `frame` for `dst` and return what that listener actually received.
+    pub(crate) fn deliver(self: &Arc<Self>, dst: Mac, frame: Frame) -> Option<Frame> {
+        let inbox = self.attach(dst);
+        self.inject(frame);
+        pop_frame(&inbox)
+    }
+
     pub(crate) fn inject(&self, frame: Frame) {
         let plan = plan_delivery(self.ether_type, self.max_quic_datagram(), &frame);
         match plan {

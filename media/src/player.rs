@@ -36,6 +36,11 @@ pub fn offer_for(
     want_dirty_rects: bool,
     yuv: crate::negotiate::YuvFormat,
     fps: crate::negotiate::FpsWish,
+    audio_bitrate_kbps: u32,
+    audio_channels: u16,
+    view_only: bool,
+    exclusive: bool,
+    carrier: Option<u8>,
 ) -> Offer {
     let (video, audio) = decodes();
     build_offer(&OfferInput {
@@ -51,6 +56,11 @@ pub fn offer_for(
         want_dirty_rects,
         yuv,
         fps,
+        audio_bitrate_kbps,
+        audio_channels,
+        view_only,
+        exclusive,
+        carrier,
     })
 }
 
@@ -104,11 +114,70 @@ enum DecodeIn {
 
 /// Read pictures. `v2` is an `EVI2` stream; otherwise it is the legacy `EVID`
 /// JPEG stream. Decoded frames go to `frames`.
+/// `Err` when an `etherquic/2` config echoes a different carrier than the offer.
+/// The caller stops before the first picture.
+pub fn carrier_echo_ok(v2: bool, expected: Option<u8>, echoed: Option<u8>) -> Result<(), String> {
+    if !v2 {
+        return Ok(());
+    }
+    etherquic::carrier::config_matches(true, expected, echoed).map(|_| ())
+}
+
+/// One task owns `read_datagram` and splits picture (lane 1) from audio (lane 2).
+/// Assembled bytes are the same record body a stream reader would see.
+pub fn spawn_lane_demux(
+    conn: Connection,
+    picture: mpsc::Sender<Vec<u8>>,
+    audio: mpsc::Sender<Vec<u8>>,
+) -> etherquic::carrier::AssemblerReset {
+    let reset = etherquic::carrier::AssemblerReset::new();
+    let flag = reset.clone();
+    tokio::spawn(async move {
+        let mut pictures = etherquic::carrier::Assembler::new();
+        let mut audios = etherquic::carrier::Assembler::new();
+        let mut seen = flag.get();
+        loop {
+            seen = etherquic::carrier::apply_reset(&mut pictures, flag.get(), seen);
+            seen = etherquic::carrier::apply_reset(&mut audios, flag.get(), seen);
+            let packet = match conn.read_datagram().await {
+                Ok(packet) => packet,
+                Err(_) => break,
+            };
+            seen = etherquic::carrier::apply_reset(&mut pictures, flag.get(), seen);
+            seen = etherquic::carrier::apply_reset(&mut audios, flag.get(), seen);
+            let Some((&lane, rest)) = packet.split_first() else {
+                continue;
+            };
+            let Some(slice) = etherquic::carrier::Slice::decode(rest) else {
+                continue;
+            };
+            let now = std::time::Instant::now();
+            let deadline = now + Duration::from_secs(2);
+            let (asm, tx) = if lane == etherquic::carrier::Lane::Picture as u8 {
+                (&mut pictures, &picture)
+            } else if lane == etherquic::carrier::Lane::Audio as u8 {
+                (&mut audios, &audio)
+            } else {
+                continue;
+            };
+            if let Some(record) = asm.push(slice, now, deadline) {
+                if tx.send(record).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    reset
+}
+
 pub async fn read_video(
     mut recv: RecvStream,
     v2: bool,
     frames: Sink<Frame>,
     events: mpsc::UnboundedSender<PlayerEvent>,
+    expected_carrier: Option<u8>,
+    mut pictures: Option<mpsc::Receiver<Vec<u8>>>,
+    reset: Option<etherquic::carrier::AssemblerReset>,
 ) -> Result<(), String> {
     let magic: &[u8; 4] = if v2 {
         crate::negotiate::VIDEO2_MAGIC
@@ -116,6 +185,7 @@ pub async fn read_video(
         crate::host::LEGACY_VIDEO_MAGIC
     };
     let decoded = Arc::new(AtomicU64::new(0));
+    let mut configs = 0u32;
     let (tx, mut rx) = mpsc::channel::<DecodeIn>(8);
     let thread_events = events.clone();
     let thread_decoded = decoded.clone();
@@ -145,6 +215,9 @@ pub async fn read_video(
                     Video::Mjpeg,
                 ))
             };
+            // A picture can win the race against the config record. Keep the
+            // latest one and decode it once a decoder exists.
+            let mut held: Option<Vec<u8>> = None;
             while let Some(input) = rx.blocking_recv() {
                 match input {
                     DecodeIn::Config(config) => {
@@ -160,7 +233,33 @@ pub async fn read_video(
                             counted.clone(),
                             config.yuv,
                         ) {
-                            Ok(dec) => decoder = Some((dec, video)),
+                            Ok(dec) => {
+                                decoder = Some((dec, video));
+                                if let Some(bytes) = held.take() {
+                                    let failed = decoder.as_mut().and_then(|(dec, video)| {
+                                        dec.push(&bytes).err().map(|reason| (*video, reason))
+                                    });
+                                    if let Some((video, reason)) = failed {
+                                        if video.skip_bad_frame() {
+                                            eprintln!("etherquic-play: picture: {reason}");
+                                            if video == Video::Mjpeg {
+                                                decoder = Some((
+                                                    VideoDecoder::Mjpeg {
+                                                        sink: counted.clone(),
+                                                    },
+                                                    Video::Mjpeg,
+                                                ));
+                                            }
+                                        } else {
+                                            decoder = None;
+                                            let _ = thread_events.send(PlayerEvent::VideoFailed {
+                                                video,
+                                                reason,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                             Err(reason) => {
                                 let _ =
                                     thread_events.send(PlayerEvent::VideoFailed { video, reason });
@@ -188,6 +287,7 @@ pub async fn read_video(
                     }
                     DecodeIn::Data(bytes) => {
                         let Some((dec, video)) = decoder.as_mut() else {
+                            held = Some(bytes);
                             continue;
                         };
                         if let Err(reason) = dec.push(&bytes) {
@@ -224,12 +324,74 @@ pub async fn read_video(
     let mut tick = Instant::now();
     let mut bytes = 0u64;
     let mut last_decoded = 0u64;
+    let mut on_datagrams = pictures.is_some();
+    let mut stream_open = true;
     let result = loop {
-        let record = match wire::read_record(&mut recv, magic).await {
-            Ok(Some(record)) => record,
-            Ok(None) => break Ok(()),
-            Err(error) => break Err(error),
+        enum Incoming {
+            Stream(Vec<u8>),
+            Datagram(Vec<u8>),
+            Closed,
+            Ended,
+        }
+        let incoming = if let Some(rx) = pictures.as_mut() {
+            if stream_open {
+                tokio::select! {
+                    biased;
+                    record = wire::read_record(&mut recv, magic) => {
+                        match record {
+                            Ok(Some(record)) => Incoming::Stream(record),
+                            Ok(None) => Incoming::Ended,
+                            Err(error) => break Err(error),
+                        }
+                    }
+                    body = rx.recv() => match body {
+                        Some(record) => Incoming::Datagram(record),
+                        None => Incoming::Closed,
+                    },
+                }
+            } else {
+                // The reliable stream has finished. Carriers 3–5 still deliver
+                // pictures on this channel. Leave once it goes quiet so the
+                // task does not sit until the player thread's own timer.
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(record)) => Incoming::Datagram(record),
+                    Ok(None) => Incoming::Closed,
+                    Err(_) => break Ok(()),
+                }
+            }
+        } else if stream_open {
+            match wire::read_record(&mut recv, magic).await {
+                Ok(Some(record)) => Incoming::Stream(record),
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        } else {
+            break Ok(());
         };
+        if matches!(incoming, Incoming::Ended) {
+            if pictures.is_some() {
+                stream_open = false;
+                continue;
+            }
+            break Ok(());
+        }
+        if matches!(incoming, Incoming::Closed) {
+            pictures = None;
+            on_datagrams = false;
+            if !stream_open {
+                break Ok(());
+            }
+            continue;
+        }
+        let (record, from_datagram) = match incoming {
+            Incoming::Stream(record) => (record, false),
+            Incoming::Datagram(record) => (record, true),
+            Incoming::Closed | Incoming::Ended => continue,
+        };
+        if on_datagrams && !from_datagram && matches!(record.first(), Some(&RECORD_DATA | &RECORD_PATCH))
+        {
+            continue;
+        }
         bytes += record.len() as u64;
         let input = if !v2 {
             DecodeIn::Data(record)
@@ -237,6 +399,15 @@ pub async fn read_video(
             match record.first() {
                 Some(&RECORD_CONFIG) => match StreamConfig::decode(&record) {
                     Ok(config) => {
+                        if let Err(error) =
+                            carrier_echo_ok(v2, expected_carrier, config.carrier)
+                        {
+                            break Err(error);
+                        }
+                        etherquic::carrier::pulse_on_later_config(&mut configs, reset.as_ref());
+                        on_datagrams = config.carrier.is_some_and(|id| {
+                            id == etherquic::carrier::QUIC_DATAGRAMS || id >= etherquic::carrier::UDP_RTP
+                        });
                         stats.video = config.video;
                         stats.width = config.width;
                         stats.height = config.height;
@@ -305,6 +476,8 @@ pub async fn read_audio(
     v2: bool,
     pcm: mpsc::Sender<Pcm>,
     events: mpsc::UnboundedSender<PlayerEvent>,
+    mut packets: Option<mpsc::Receiver<Vec<u8>>>,
+    reset: Option<etherquic::carrier::AssemblerReset>,
 ) -> Result<(), String> {
     let magic: &[u8; 4] = if v2 {
         crate::negotiate::AUDIO2_MAGIC
@@ -316,19 +489,110 @@ pub async fn read_audio(
     } else {
         Some((AudioDecoder::Pcm, Audio::Pcm))
     };
-    while let Some(record) = wire::read_record(&mut recv, magic).await? {
-        let data: &[u8] = if !v2 {
-            &record
+    let mut configs = 0u32;
+    let mut on_datagrams = packets.is_some();
+    let mut stream_open = true;
+    let mut held: Option<Vec<u8>> = None;
+    loop {
+        enum Incoming {
+            Stream(Vec<u8>),
+            Datagram(Vec<u8>),
+            Closed,
+            Ended,
+        }
+        let incoming = if let Some(rx) = packets.as_mut() {
+            if stream_open {
+                tokio::select! {
+                    biased;
+                    record = wire::read_record(&mut recv, magic) => {
+                        match record {
+                            Ok(Some(record)) => Incoming::Stream(record),
+                            Ok(None) => Incoming::Ended,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    body = rx.recv() => match body {
+                        Some(record) => Incoming::Datagram(record),
+                        None => Incoming::Closed,
+                    },
+                }
+            } else {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(record)) => Incoming::Datagram(record),
+                    Ok(None) => Incoming::Closed,
+                    Err(_) => break,
+                }
+            }
+        } else if stream_open {
+            match wire::read_record(&mut recv, magic).await? {
+                Some(record) => Incoming::Stream(record),
+                None => break,
+            }
+        } else {
+            break;
+        };
+        if matches!(incoming, Incoming::Ended) {
+            if packets.is_some() {
+                stream_open = false;
+                continue;
+            }
+            break;
+        }
+        if matches!(incoming, Incoming::Closed) {
+            packets = None;
+            on_datagrams = false;
+            if !stream_open {
+                break;
+            }
+            continue;
+        }
+        let (record, from_datagram) = match incoming {
+            Incoming::Stream(record) => (record, false),
+            Incoming::Datagram(record) => (record, true),
+            Incoming::Closed | Incoming::Ended => continue,
+        };
+        if on_datagrams && !from_datagram && record.first() == Some(&RECORD_DATA) {
+            continue;
+        }
+        let data = if !v2 {
+            record
         } else {
             match record.first() {
                 Some(&RECORD_CONFIG) => {
                     match StreamConfig::decode(&record) {
                         Ok(config) => {
+                            etherquic::carrier::pulse_on_later_config(&mut configs, reset.as_ref());
+                            on_datagrams = config.carrier.is_some_and(|id| {
+                                id == etherquic::carrier::QUIC_DATAGRAMS
+                                    || id >= etherquic::carrier::UDP_RTP
+                            });
                             let _ = events.send(PlayerEvent::Audio(config.clone()));
                             decoder = None;
                             if let Some(audio) = config.audio {
                                 match AudioDecoder::open(audio, config.channels.max(1)) {
-                                    Ok(dec) => decoder = Some((dec, audio)),
+                                    Ok(dec) => {
+                                        decoder = Some((dec, audio));
+                                        if let Some(bytes) = held.take() {
+                                            let decoded = decoder.as_mut().map(|(dec, audio)| {
+                                                dec.decode(&bytes).map_err(|reason| (*audio, reason))
+                                            });
+                                            match decoded {
+                                                Some(Ok(chunk)) => {
+                                                    if pcm.send(chunk).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(Err((audio, reason))) => {
+                                                    decoder = None;
+                                                    let _ = events.send(PlayerEvent::AudioFailed {
+                                                        audio,
+                                                        reason,
+                                                    });
+                                                }
+                                                None => {}
+                                            }
+                                        }
+                                    }
                                     Err(reason) => {
                                         let _ =
                                             events.send(PlayerEvent::AudioFailed { audio, reason });
@@ -340,14 +604,15 @@ pub async fn read_audio(
                     }
                     continue;
                 }
-                Some(&RECORD_DATA) => &record[1..],
+                Some(&RECORD_DATA) => record[1..].to_vec(),
                 _ => continue,
             }
         };
         let Some((dec, audio)) = decoder.as_mut() else {
+            held = Some(data);
             continue;
         };
-        match dec.decode(data) {
+        match dec.decode(&data) {
             Ok(chunk) => {
                 if pcm.send(chunk).await.is_err() {
                     break;

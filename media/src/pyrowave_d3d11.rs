@@ -18,7 +18,7 @@ use libloading::Library;
 
 use crate::negotiate::{YuvChroma, YuvDepth, YuvFormat};
 use crate::pyrowave::Decoder;
-use crate::yuv::{rgb_to_yuv, YuvPlanes};
+use crate::yuv::{rgb_to_i420, rgb_to_yuv, I420, YuvPlanes};
 use crate::Frame;
 
 type Handle = *mut c_void;
@@ -110,6 +110,8 @@ struct Api {
     device_destroy: unsafe extern "C" fn(Handle),
     encoder_create: unsafe extern "C" fn(*const EncInfo, *mut Handle) -> c_int,
     encode_cpu: unsafe extern "C" fn(Handle, *const CpuBuffer, *const RateControl) -> c_int,
+    submit: Option<unsafe extern "C" fn(Handle, *const CpuBuffer, *const RateControl) -> c_int>,
+    finish: Option<unsafe extern "C" fn(Handle) -> c_int>,
     num_packets: unsafe extern "C" fn(Handle, usize, *mut usize) -> c_int,
     packetize:
         unsafe extern "C" fn(Handle, *mut Packet, usize, *mut usize, *mut c_void, usize) -> c_int,
@@ -235,6 +237,14 @@ fn open_api() -> Result<Api, String> {
                         continue;
                     }
                 },
+                submit: lib
+                    .get(b"pwd3d11_encoder_submit\0")
+                    .ok()
+                    .map(|sym: libloading::Symbol<_>| *sym),
+                finish: lib
+                    .get(b"pwd3d11_encoder_finish\0")
+                    .ok()
+                    .map(|sym: libloading::Symbol<_>| *sym),
                 num_packets: match lib.get(b"pwd3d11_encoder_compute_num_packets\0") {
                     Ok(sym) => *sym,
                     Err(error) => {
@@ -258,6 +268,15 @@ fn open_api() -> Result<Api, String> {
                 },
                 _lib: lib,
                 _path: path,
+            }
+        };
+        let api = if api.submit.is_some() && api.finish.is_some() {
+            api
+        } else {
+            Api {
+                submit: None,
+                finish: None,
+                ..api
             }
         };
         return Ok(api);
@@ -307,12 +326,16 @@ pub struct Encoder {
     adapter: String,
     format: YuvFormat,
     planes: YuvPlanes,
+    /// Reused 4:2:0 8-bit planes. The direct writer matches `rgb_to_yuv`.
+    i420: I420,
     pack_y: Vec<u8>,
     pack_u: Vec<u8>,
     pack_v: Vec<u8>,
     bitstream: Vec<u8>,
     packets: Vec<Packet>,
     frame_bytes: usize,
+    /// A submit has been flushed and not mapped yet.
+    inflight: bool,
 }
 
 unsafe impl Send for Encoder {}
@@ -382,12 +405,14 @@ impl Encoder {
             adapter: adapter_name,
             format,
             planes: YuvPlanes::new(width as usize, height as usize, format),
+            i420: I420::new(width as usize, height as usize),
             pack_y: Vec::new(),
             pack_u: Vec::new(),
             pack_v: Vec::new(),
             bitstream: vec![0; frame_bytes + 64 * 1024],
             packets: Vec::new(),
             frame_bytes,
+            inflight: false,
         })
     }
 
@@ -395,11 +420,20 @@ impl Encoder {
         &self.adapter
     }
 
-    /// One record: u32le packet count, then u32le size and bytes per packet.
-    pub fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, String> {
-        frame.check()?;
-        if (frame.width, frame.height) != (self.width, self.height) {
-            return Err("frame size changed under the encoder".into());
+    /// The record from `encode` is the previous picture after the first call.
+    /// The DLL has to export submit and finish. An older DLL stays in lockstep.
+    pub fn picture_lags(&self) -> bool {
+        self.api.submit.is_some() && self.api.finish.is_some()
+    }
+
+    fn direct_420p8(&self) -> bool {
+        self.format.chroma == YuvChroma::Yuv420 && self.format.depth == YuvDepth::Depth8
+    }
+
+    fn fill_planes(&mut self, frame: &Frame) {
+        if self.direct_420p8() {
+            rgb_to_i420(frame, &mut self.i420);
+            return;
         }
         rgb_to_yuv(frame, &mut self.planes);
         let work = self.planes.for_bitstream();
@@ -407,21 +441,51 @@ impl Encoder {
         self.pack_y = pack_plane(&work.y, work.format.depth);
         self.pack_u = pack_plane(&work.u, work.format.depth);
         self.pack_v = pack_plane(&work.v, work.format.depth);
-        let buffer = packed_buffer(
-            &mut self.pack_y,
-            &mut self.pack_u,
-            &mut self.pack_v,
-            work.width,
-            work.height,
-            work.format,
-        );
-        let rate = RateControl {
-            maximum_bitstream_size: self.frame_bytes,
-        };
-        check(
-            unsafe { (self.api.encode_cpu)(self.handle, &buffer, &rate) },
-            "encode",
-        )?;
+    }
+
+    fn cpu_buffer(&mut self) -> CpuBuffer {
+        if self.direct_420p8() {
+            let width = self.i420.width;
+            let height = self.i420.height;
+            packed_buffer(
+                &mut self.i420.y,
+                &mut self.i420.u,
+                &mut self.i420.v,
+                width,
+                height,
+                self.format,
+            )
+        } else {
+            let width = self.width as usize;
+            let height = self.height as usize;
+            packed_buffer(
+                &mut self.pack_y,
+                &mut self.pack_u,
+                &mut self.pack_v,
+                width,
+                height,
+                self.format.bitstream(),
+            )
+        }
+    }
+
+    fn submit_gpu(&mut self, rate: &RateControl) -> Result<(), String> {
+        let submit = self.api.submit.expect("submit");
+        let handle = self.handle;
+        let buffer = self.cpu_buffer();
+        check(unsafe { submit(handle, &buffer, rate) }, "submit")?;
+        self.inflight = true;
+        Ok(())
+    }
+
+    fn finish_gpu(&mut self) -> Result<(), String> {
+        let finish = self.api.finish.expect("finish");
+        check(unsafe { finish(self.handle) }, "finish")?;
+        self.inflight = false;
+        Ok(())
+    }
+
+    fn packetize_record(&mut self) -> Result<Vec<u8>, String> {
         let mut count = 0usize;
         check(
             unsafe { (self.api.num_packets)(self.handle, PACKET_BOUNDARY, &mut count) },
@@ -458,6 +522,52 @@ impl Encoder {
             out.extend_from_slice(&self.bitstream[packet.offset..end]);
         }
         Ok(out)
+    }
+
+    /// One record: u32le packet count, then u32le size and bytes per packet.
+    ///
+    /// With submit/finish, the first call returns this picture and leaves the
+    /// same picture running on the GPU. Later calls return that in-flight
+    /// picture and submit `frame`. `flush` maps the last one.
+    pub fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, String> {
+        frame.check()?;
+        if (frame.width, frame.height) != (self.width, self.height) {
+            return Err("frame size changed under the encoder".into());
+        }
+        self.fill_planes(frame);
+        let rate = RateControl {
+            maximum_bitstream_size: self.frame_bytes,
+        };
+        if self.picture_lags() {
+            if !self.inflight {
+                self.submit_gpu(&rate)?;
+                self.finish_gpu()?;
+                let record = self.packetize_record()?;
+                self.submit_gpu(&rate)?;
+                return Ok(record);
+            }
+            // Map the in-flight picture, then submit this one before the
+            // byte copy. The copy reads the CPU buffers, so the GPU can
+            // run during it.
+            self.finish_gpu()?;
+            self.submit_gpu(&rate)?;
+            return self.packetize_record();
+        }
+        let buffer = self.cpu_buffer();
+        check(
+            unsafe { (self.api.encode_cpu)(self.handle, &buffer, &rate) },
+            "encode",
+        )?;
+        self.packetize_record()
+    }
+
+    /// Map the picture still on the GPU. `None` when encode is in lockstep.
+    pub fn flush(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if !self.inflight {
+            return Ok(None);
+        }
+        self.finish_gpu()?;
+        Ok(Some(self.packetize_record()?))
     }
 }
 
@@ -520,6 +630,9 @@ mod tests {
     /// which is [`crate::pyrowave::default_frame_bytes`] (about 4 bits per
     /// pixel, at least 32 KiB). Two successive low-frequency frames must each
     /// produce a packet-bearing record. A CPU lavapipe reject is not a failure.
+    ///
+    /// A DLL with submit/finish returns the previous picture after the first
+    /// call. The last picture arrives from `flush`.
     #[test]
     fn encodes_two_desktop_frames_at_720p() {
         if !d3d11_dll_present() {
@@ -557,6 +670,11 @@ mod tests {
             );
         }
         let dump = std::env::var("ETHERQUIC_PYROWAVE_DUMP").ok();
+        let lags = matches!(
+            &encoder,
+            crate::video::VideoEncoder::PyrowaveD3d11 { inner, .. } if inner.picture_lags()
+        );
+        let mut shown: Option<Vec<u8>> = None;
         let mut check_frame = |index: usize, kind: &str, frame: &crate::Frame| {
             assert!(
                 encoder
@@ -584,7 +702,17 @@ mod tests {
             match crate::pyrowave::Decoder::new(width, height, YuvFormat::YUV420P8) {
                 Ok(mut decoder) => match decoder.decode(&record) {
                     Ok(got) => {
-                        let mae = rgb_mae(frame, &got);
+                        let source = if lags {
+                            shown.as_deref().unwrap_or(frame.rgb.as_slice())
+                        } else {
+                            frame.rgb.as_slice()
+                        };
+                        let source_frame = crate::Frame {
+                            width,
+                            height,
+                            rgb: source.to_vec(),
+                        };
+                        let mae = rgb_mae(&source_frame, &got);
                         println!("{kind} frame={index} decode_mae={mae:.2}");
                         assert!(
                             mae < 28.0,
@@ -600,6 +728,9 @@ mod tests {
                 std::fs::write(&path, &record)
                     .unwrap_or_else(|error| panic!("write {path}: {error}"));
             }
+            if lags {
+                shown = Some(frame.rgb.clone());
+            }
         };
         for generation in 0..2u32 {
             let frame = desktop_frame(width, height, generation);
@@ -607,9 +738,41 @@ mod tests {
         }
         let busy = high_freq_frame(width, height);
         check_frame(2, "busy-720p", &busy);
+        drop(check_frame);
+        let extra = if lags {
+            assert!(
+                encoder.flush().expect("flush the last picture"),
+                "the last picture was still on the GPU"
+            );
+            if let (Some(rgb), Some(record)) = (
+                shown,
+                records.lock().expect("records").last().cloned(),
+            ) {
+                record_acceptable(width, height, &record).expect("flushed record");
+                if let Ok(mut decoder) =
+                    crate::pyrowave::Decoder::new(width, height, YuvFormat::YUV420P8)
+                {
+                    if let Ok(got) = decoder.decode(&record) {
+                        let mae = rgb_mae(
+                            &crate::Frame {
+                                width,
+                                height,
+                                rgb,
+                            },
+                            &got,
+                        );
+                        println!("flush decode_mae={mae:.2}");
+                        assert!(mae < 28.0, "flushed picture mae={mae:.2}");
+                    }
+                }
+            }
+            1
+        } else {
+            0
+        };
         assert_eq!(
             records.lock().expect("records").len(),
-            3,
+            3 + extra,
             "two desktop frames and one high-frequency frame"
         );
     }

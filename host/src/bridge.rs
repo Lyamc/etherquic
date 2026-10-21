@@ -1,19 +1,19 @@
-//! Keep the desktop helper alive and feed one play session from its pipe.
+//! Keep the desktop helper alive and feed play sessions from its pipe.
 //!
-//! The helper stays up across players. A new picture replaces the previous
-//! one. Audio is dropped when the player is behind. Input is written as EQIN
+//! The helper stays up across players. Capture writes one FrameSlot for every
+//! viewer. Audio is dropped when a player is behind. Input is written as EQIN
 //! and injected on the console desktop.
 
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use etherquic_input::{encode, Event};
-use etherquic_media::host::FrameSlot;
-use tokio::sync::mpsc;
+use etherquic_media::host::{EncodeHub, FrameSlot, KeyframeBus, Room, SharedEncode};
+use tokio::sync::{broadcast, mpsc};
 
 use crate::link::{self, Pipe};
 use crate::proto::{AudioChunk, Message, Rgb};
@@ -21,8 +21,8 @@ use crate::run::Log;
 
 struct Outbound {
     video: FrameSlot,
-    audio: mpsc::Sender<AudioChunk>,
-    acks: mpsc::Sender<Vec<u8>>,
+    audio: broadcast::Sender<AudioChunk>,
+    acks: broadcast::Sender<Vec<u8>>,
     cursor: tokio::sync::watch::Sender<Option<Vec<u8>>>,
 }
 
@@ -31,8 +31,14 @@ pub use crate::extras::Picture;
 pub struct Desk {
     log: Log,
     stop: Arc<AtomicBool>,
-    /// True while a player is attached. The input thread tells the helper.
+    /// True while at least one player is attached. The input thread tells the helper.
     session: Arc<AtomicBool>,
+    peers: Arc<AtomicUsize>,
+    frames: FrameSlot,
+    audio: broadcast::Sender<AudioChunk>,
+    acks: broadcast::Sender<Vec<u8>>,
+    cursor_rx: tokio::sync::watch::Receiver<Option<Vec<u8>>>,
+    shared: SharedEncode,
     outbound: Arc<Mutex<Option<Outbound>>>,
     input: mpsc::Sender<Vec<Event>>,
     supervisor: Option<JoinHandle<()>>,
@@ -45,8 +51,40 @@ impl Desk {
         etherquic_media::caps::warm();
         let stop = Arc::new(AtomicBool::new(false));
         let session = Arc::new(AtomicBool::new(false));
+        let peers = Arc::new(AtomicUsize::new(0));
         let generation = Arc::new(AtomicU64::new(0));
-        let outbound = Arc::new(Mutex::new(None));
+        let frames = FrameSlot::new();
+        let (audio_tx, _) = broadcast::channel(32);
+        let (ack_tx, _) = broadcast::channel(64);
+        let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
+        let caps = etherquic_media::caps::host_caps();
+        let media_log: etherquic_media::Log = {
+            let log = log.clone();
+            Arc::new(move |line: &str| log.line(line))
+        };
+        let (fps, display_hz) = crate::media::host_rate();
+        let options = etherquic_media::host::HostOptions {
+            fps,
+            display_hz,
+            caps,
+            log: media_log,
+            cap_kbps: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            carrier_tap: Some(etherquic::carrier::open_carrier_tap()),
+        };
+        let keyframes = KeyframeBus::default();
+        let hub = EncodeHub::new(frames.clone(), keyframes.clone(), &options);
+        let room = Room::default();
+        let shared = SharedEncode {
+            keyframes,
+            hub: Some(hub),
+            room: Some(room),
+        };
+        let outbound = Arc::new(Mutex::new(Some(Outbound {
+            video: frames.clone(),
+            audio: audio_tx.clone(),
+            acks: ack_tx.clone(),
+            cursor: cursor_tx,
+        })));
         let pipe_slot = Arc::new(Mutex::new(None));
         let (input_tx, input_rx) = mpsc::channel(64);
         let writer_stop = Arc::clone(&stop);
@@ -83,6 +121,12 @@ impl Desk {
             log: log.clone(),
             stop,
             session,
+            peers,
+            frames,
+            audio: audio_tx,
+            acks: ack_tx,
+            cursor_rx,
+            shared,
             outbound,
             input: input_tx,
             supervisor,
@@ -94,59 +138,82 @@ impl Desk {
         self.input.clone()
     }
 
-    pub fn attach(
-        &self,
-        video: FrameSlot,
-        audio: mpsc::Sender<AudioChunk>,
-        acks: mpsc::Sender<Vec<u8>>,
-        cursor: tokio::sync::watch::Sender<Option<Vec<u8>>>,
-    ) {
-        *lock(&self.outbound) = Some(Outbound {
-            video,
-            audio,
-            acks,
-            cursor,
-        });
-    }
-
-    pub fn detach(&self) {
-        *lock(&self.outbound) = None;
+    pub fn locked(&self) -> bool {
+        self.shared
+            .room
+            .as_ref()
+            .is_some_and(|room| room.locked())
     }
 
     pub async fn serve_player(&self, conn: quinn::Connection) -> Result<(), String> {
-        let video = FrameSlot::new();
-        let (audio_tx, audio_rx) = mpsc::channel(8);
-        let (ack_tx, ack_rx) = mpsc::channel(64);
-        let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
-        self.attach(video.clone(), audio_tx, ack_tx, cursor_tx);
-        // The helper wakes the display and moves onto the input desktop. A
-        // screen saver, lock screen, or powered-down output would otherwise
-        // hand this player a stale black picture and swallow its input.
+        if self.locked() {
+            conn.close(1u32.into(), b"exclusive");
+            return Err("exclusive session".into());
+        }
+        let n = self.peers.fetch_add(1, Ordering::SeqCst) + 1;
         self.session.store(true, Ordering::SeqCst);
-        let _guard = Detach(self);
+        let _guard = Leave(self);
         let log = self.log.clone();
         let media_log: etherquic_media::Log = Arc::new(move |line: &str| log.line(line));
-        let result = crate::media::serve(
+        let _ = n;
+        crate::media::serve_shared(
             conn,
-            video.clone(),
-            audio_rx,
+            self.frames.clone(),
+            subscribe_audio(&self.audio),
             self.input(),
-            ack_rx,
+            subscribe_bytes(&self.acks),
             media_log,
-            cursor_rx,
+            self.cursor_rx.clone(),
+            self.shared.clone(),
         )
-        .await;
-        video.close();
-        result
+        .await
     }
 }
 
-struct Detach<'a>(&'a Desk);
+fn subscribe_audio(tx: &broadcast::Sender<AudioChunk>) -> mpsc::Receiver<AudioChunk> {
+    let mut rx = tx.subscribe();
+    let (out_tx, out_rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(chunk) => {
+                    if out_tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    out_rx
+}
 
-impl Drop for Detach<'_> {
+fn subscribe_bytes(tx: &broadcast::Sender<Vec<u8>>) -> mpsc::Receiver<Vec<u8>> {
+    let mut rx = tx.subscribe();
+    let (out_tx, out_rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => {
+                    if out_tx.send(bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    out_rx
+}
+
+struct Leave<'a>(&'a Desk);
+
+impl Drop for Leave<'_> {
     fn drop(&mut self) {
-        self.0.session.store(false, Ordering::SeqCst);
-        self.0.detach();
+        let left = self.0.peers.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+        self.0.session.store(left > 0, Ordering::SeqCst);
     }
 }
 
@@ -313,7 +380,7 @@ fn reader_loop(
                         saw_audio = true;
                     }
                     if let Some(tx) = audio_sender(&outbound) {
-                        let _ = tx.try_send(chunk);
+                        let _ = tx.send(chunk);
                     }
                 }
                 Err(error) if !logged_audio_error => {
@@ -329,7 +396,7 @@ fn reader_loop(
             }
             Ok(Some(Message::Ack(bytes))) => {
                 if let Some(tx) = ack_sender(&outbound) {
-                    let _ = tx.try_send(bytes);
+                    let _ = tx.send(bytes);
                 }
             }
             Ok(Some(Message::Cursor(bytes))) => {
@@ -413,11 +480,11 @@ fn video_sender(outbound: &Mutex<Option<Outbound>>) -> Option<FrameSlot> {
     lock(outbound).as_ref().map(|out| out.video.clone())
 }
 
-fn audio_sender(outbound: &Mutex<Option<Outbound>>) -> Option<mpsc::Sender<AudioChunk>> {
+fn audio_sender(outbound: &Mutex<Option<Outbound>>) -> Option<broadcast::Sender<AudioChunk>> {
     lock(outbound).as_ref().map(|out| out.audio.clone())
 }
 
-fn ack_sender(outbound: &Mutex<Option<Outbound>>) -> Option<mpsc::Sender<Vec<u8>>> {
+fn ack_sender(outbound: &Mutex<Option<Outbound>>) -> Option<broadcast::Sender<Vec<u8>>> {
     lock(outbound).as_ref().map(|out| out.acks.clone())
 }
 

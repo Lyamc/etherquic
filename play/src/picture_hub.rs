@@ -145,6 +145,38 @@ pub fn switch_picture(id: u64) -> bool {
     switched
 }
 
+static RAISE: AtomicBool = AtomicBool::new(false);
+
+/// Ask the picture window to unminimize, come forward, and take the desktop
+/// it is fullscreen on. The window thread applies this on its next turn.
+pub fn request_raise() {
+    RAISE.store(true, Ordering::SeqCst);
+    wake();
+}
+
+pub fn take_raise() -> bool {
+    RAISE.swap(false, Ordering::SeqCst)
+}
+
+/// What a double-click asks the picture window to do: leave the minimized
+/// state, become visible, and take focus so another desktop comes forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PictureRaise {
+    pub unminimize: bool,
+    pub show: bool,
+    pub focus: bool,
+}
+
+impl PictureRaise {
+    pub fn for_double_click() -> Self {
+        Self {
+            unminimize: true,
+            show: true,
+            focus: true,
+        }
+    }
+}
+
 pub fn shown_picture() -> Option<u64> {
     lock_inner().shown
 }
@@ -285,6 +317,12 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn a_double_click_unminimizes_shows_and_focuses() {
+        let raise = PictureRaise::for_double_click();
+        assert!(raise.unminimize && raise.show && raise.focus);
+    }
 
     #[test]
     fn two_sessions_switch_and_the_closed_one_does_not_wait_on_the_window() {

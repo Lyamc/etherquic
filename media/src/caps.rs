@@ -215,6 +215,8 @@ pub fn caps_text_if_ready() -> String {
 
 /// Start the probe on a background thread so a later [`probe`] is instant.
 pub fn warm() {
+    etherquic::look::warm();
+    etherquic::fruc::warm();
     std::thread::spawn(|| {
         let _ = probe();
     });

@@ -27,12 +27,32 @@ impl super::Context {
         extra_flags: glsl::WriterFlags,
     ) -> super::PipelineInner {
         let gl = self.lock();
-        let force_explicit_bindings = self
+        // Storage buffers need at least `#version 310 es`. `#version 320 es`
+        // needs OpenGL ES 3.2. Waydroid's ANGLE is ES 3.1 and rejects 320.
+        let version = gl.version();
+        let glsl_es: u16 = if version.is_embedded {
+            if (version.major, version.minor) >= (3, 2) {
+                320
+            } else if (version.major, version.minor) >= (3, 1) {
+                310
+            } else {
+                300
+            }
+        } else if self
             .capabilities
-            .contains(super::Capabilities::BUFFER_STORAGE);
+            .contains(super::Capabilities::BUFFER_STORAGE)
+        {
+            320
+        } else {
+            300
+        };
+        let force_explicit_bindings = glsl_es >= 310
+            && self
+                .capabilities
+                .contains(super::Capabilities::BUFFER_STORAGE);
         let mut naga_options = glsl::Options {
             version: glsl::Version::Embedded {
-                version: if force_explicit_bindings { 320 } else { 300 },
+                version: glsl_es,
                 is_webgl: cfg!(target_arch = "wasm32"),
             },
             writer_flags: extra_flags | glsl::WriterFlags::ADJUST_COORDINATE_SPACE,

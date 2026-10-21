@@ -13,7 +13,7 @@ use std::time::Duration;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
-    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, IdleTimeout, ServerConfig,
+    AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, IdleTimeout, ServerConfig,
     TokioRuntime, TransportConfig, UdpSender, VarInt,
 };
 
@@ -30,6 +30,9 @@ use crate::Mac;
 pub struct L2Net {
     pub fabric: Arc<Fabric>,
     out: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Write end of the pipe the Linux I/O thread polls with the pcap fd.
+    #[cfg(target_os = "linux")]
+    wake: Option<std::os::fd::OwnedFd>,
     ethertype: u16,
     l2_backend: u8,
     hw_mac: Option<Mac>,
@@ -57,6 +60,12 @@ impl L2Net {
         );
 
         let fabric_rx = fabric.clone();
+        #[cfg(target_os = "linux")]
+        let (wake_read, wake_write) = wake_pipe().map_err(|e| EndpointError::Other(e.to_string()))?;
+        #[cfg(not(target_os = "linux"))]
+        let wake_read: Option<WakePipe> = None;
+        #[cfg(target_os = "linux")]
+        let wake_read = Some(wake_read);
         // Membrane's read waits inside the driver until a frame arrives.
         // pcap returns at once. A read on the send thread leaves the first
         // picture queued until the peer sends again.
@@ -68,18 +77,20 @@ impl L2Net {
                     eprintln!(
                         "L2 recv could not open a second Membrane handle ({error}); sends wait for reads"
                     );
-                    spawn_coupled_io(rx, io, fabric_rx, ethertype)?;
+                    spawn_coupled_io(rx, io, fabric_rx, ethertype, wake_read)?;
                 }
             }
         } else {
-            spawn_coupled_io(rx, io, fabric_rx, ethertype)?;
+            spawn_coupled_io(rx, io, fabric_rx, ethertype, wake_read)?;
         }
         #[cfg(not(windows))]
-        spawn_coupled_io(rx, io, fabric_rx, ethertype)?;
+        spawn_coupled_io(rx, io, fabric_rx, ethertype, wake_read)?;
 
         Ok(Arc::new(Self {
             fabric,
             out: tx,
+            #[cfg(target_os = "linux")]
+            wake: Some(wake_write),
             ethertype,
             l2_backend,
             hw_mac,
@@ -108,6 +119,8 @@ impl L2Net {
         Arc::new(Self {
             fabric,
             out: tx,
+            #[cfg(target_os = "linux")]
+            wake: None,
             ethertype,
             l2_backend: 0,
             hw_mac: None,
@@ -134,6 +147,17 @@ impl L2Net {
     pub fn adapter(&self) -> Option<&str> {
         self.adapter.as_deref()
     }
+
+    fn enqueue(&self, bytes: Vec<u8>) -> io::Result<()> {
+        self.out
+            .send(bytes)
+            .map_err(|e| io::Error::other(format!("L2 outbound queue closed: {e}")))?;
+        #[cfg(target_os = "linux")]
+        if let Some(wake) = &self.wake {
+            poke_wake(wake);
+        }
+        Ok(())
+    }
 }
 
 /// Writes queued frames on this thread. A blocked recv must be a different thread.
@@ -145,6 +169,103 @@ fn drive_send(rx: Receiver<Vec<u8>>, mut send: impl FnMut(&[u8])) {
         send(&frame);
         while let Ok(more) = rx.try_recv() {
             send(&more);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct WakePipe(std::os::fd::OwnedFd);
+
+#[cfg(not(target_os = "linux"))]
+struct WakePipe;
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn wake_pipe() -> io::Result<(WakePipe, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two open descriptors. We own both.
+    let read = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+    Ok((WakePipe(read), write))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn poke_wake(wake: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let byte = [1u8];
+    unsafe {
+        libc::write(wake.as_raw_fd(), byte.as_ptr().cast(), 1);
+    }
+}
+
+/// Block until one of `fds` is readable. Linux L2 uses this on the pcap fd
+/// and the send-wake pipe together, instead of a 1 ms receive timeout.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub(crate) fn wait_readable(fds: &[i32]) -> io::Result<()> {
+    let mut pollfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|fd| libc::pollfd {
+            fd: *fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_poll_loop(
+    rx: Receiver<Vec<u8>>,
+    io: &mut PacketIo,
+    fabric: &Fabric,
+    ethertype: u16,
+    pcap_fd: i32,
+    wake_read: &WakePipe,
+) {
+    use std::os::fd::AsRawFd;
+    let wake_fd = wake_read.0.as_raw_fd();
+    loop {
+        if wait_readable(&[pcap_fd, wake_fd]).is_err() {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let mut buf = [0u8; 256];
+        unsafe {
+            libc::read(wake_fd, buf.as_mut_ptr().cast(), buf.len());
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    if let Err(e) = io.send(&frame) {
+                        eprintln!("L2 send error: {e}");
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        let batch = match io.recv_batch(64) {
+            Ok(batch) => batch,
+            Err(e) => {
+                eprintln!("L2 recv error: {e}");
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        for raw in batch {
+            deliver_raw(fabric, ethertype, &raw);
         }
     }
 }
@@ -163,10 +284,19 @@ fn spawn_coupled_io(
     mut io: PacketIo,
     fabric: Arc<Fabric>,
     ethertype: u16,
+    wake_read: Option<WakePipe>,
 ) -> Result<(), EndpointError> {
     thread::Builder::new()
         .name("etherquic-l2-io".into())
         .spawn(move || {
+            #[cfg(target_os = "linux")]
+            {
+                let pcap_fd = io.poll_fd();
+                if let (Some(pcap_fd), Some(wake_read)) = (pcap_fd, wake_read) {
+                    linux_poll_loop(rx, &mut io, &fabric, ethertype, pcap_fd, &wake_read);
+                    return;
+                }
+            }
             loop {
                 // Wait on the send queue first. A read that blocks until a
                 // frame arrives must not run on this thread: the queued
@@ -341,7 +471,35 @@ fn transport_for_mtu(max_datagram: u16) -> TransportConfig {
     transport.initial_mtu(max_datagram);
     transport.min_mtu(1200.min(max_datagram));
     transport.mtu_discovery_config(None);
+    // The shared listener is mode 1 (12,000 bytes). Mode 2 is installed on
+    // the connection that agreed `carrier 2` by [`apply_agreed_mode`].
+    crate::carrier::apply_mode(
+        &mut transport,
+        crate::carrier::QUIC_STREAMS,
+        true,
+        None,
+    );
+    transport.datagram_receive_buffer_size(Some(1024 * 1024));
+    transport.datagram_send_buffer_size(1024 * 1024);
     transport
+}
+
+/// Mode 2 on L2 takes the short path on this connection: 1 ms RTT, 256 KiB
+/// CUBIC, 1 ms ACK delay. Mode 1 leaves the 12,000-byte window in place.
+pub(crate) fn apply_agreed_mode(conn: &Connection, mode: u8) {
+    if mode != crate::carrier::QUIC_DATAGRAMS {
+        return;
+    }
+    if conn.congestion_state().initial_window() == crate::carrier::MODE2_WINDOW {
+        return;
+    }
+    let profile = crate::carrier::profile_for(crate::carrier::QUIC_DATAGRAMS, true, None);
+    conn.retune_cubic(
+        profile.initial_rtt,
+        profile.initial_window,
+        profile.max_ack_delay,
+        u32::try_from(profile.ack_eliciting).unwrap_or(0),
+    );
 }
 
 pub fn l2_server_endpoint(
@@ -366,6 +524,7 @@ pub fn l2_server_endpoint(
 
     let socket = L2Socket::open(net, local_mac, service_id);
     let runtime = Arc::new(TokioRuntime);
+    crate::note_quic_bind();
     Ok(Endpoint::new_with_abstract_socket(
         endpoint_config,
         Some(server_config),
@@ -400,6 +559,7 @@ pub fn l2_client_endpoint(
 
     let socket = L2Socket::open(net, local_mac, service_id);
     let runtime = Arc::new(TokioRuntime);
+    crate::note_quic_bind();
     let endpoint = Endpoint::new_with_abstract_socket(endpoint_config, None, socket, runtime)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
@@ -510,11 +670,7 @@ impl L2Sender {
             payload: transmit.contents.to_vec(),
         };
         let bytes = frame.encode();
-        self.net
-            .out
-            .send(bytes)
-            .map_err(|e| io::Error::other(format!("L2 outbound queue closed: {e}")))?;
-        Ok(())
+        self.net.enqueue(bytes)
     }
 }
 
@@ -570,6 +726,15 @@ impl PacketIo {
             PacketIo::Pcap(_) => false,
             #[cfg(windows)]
             PacketIo::Ndis(_) => true,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        match self {
+            PacketIo::Pcap(link) => Some(link.poll_fd()),
+            #[cfg(windows)]
+            PacketIo::Ndis(_) => None,
         }
     }
 
@@ -659,6 +824,26 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::drive_send;
+
+    /// The Linux wait sits on the pcap fd and the send-wake pipe together.
+    /// A byte on the wake pipe unblocks it. There is no 1 ms poll.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_l2_waits_on_the_pcap_fd_and_the_send_wake_together() {
+        let (wake_read, wake_write) = super::wake_pipe().expect("pipe");
+        let (other_read, _other_write) = super::wake_pipe().expect("pipe");
+        let started = Instant::now();
+        let reader = thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            super::wait_readable(&[other_read.0.as_raw_fd(), wake_read.0.as_raw_fd()]).expect("poll");
+        });
+        thread::sleep(Duration::from_millis(30));
+        super::poke_wake(&wake_write);
+        reader.join().expect("wait thread");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(20), "returned too fast: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(500), "did not wake: {elapsed:?}");
+    }
 
     /// Membrane's read waits in the driver. The send side of that split is
     /// [`drive_send`]: a frame queued while recv has not returned is still written.

@@ -10,7 +10,9 @@
 //! so the phone runs the same GPUI Desk as the desktop window. Codec
 //! libraries the host can send (`libopus.so`, `libpyrowave-shared.so`,
 //! `libffmpeg.so` with H.264/HEVC/AV1/OpenAPV/JPEG-XS) are packed next to it
-//! as unversioned `lib/arm64-v8a/lib*.so` so the package manager extracts them.
+//! as unversioned `lib/<abi>/lib*.so` so the package manager extracts them.
+//! The default abi is `arm64-v8a`. `ETHERQUIC_ANDROID_ABI=x86_64` is the
+//! Waydroid image on a PC, and that build does not pack the arm64 codecs.
 //!
 //! Neither package is the Membrane NDIS driver under `windows/`.
 
@@ -161,7 +163,15 @@ pub fn build_android_package(output: &Path, version_code: u32, version_name: &st
     Ok(())
 }
 
-const ANDROID_JNI: &str = "lib/arm64-v8a";
+/// `ETHERQUIC_ANDROID_ABI` selects the APK directory. Waydroid on a PC is
+/// `x86_64`. Phones stay `arm64-v8a`.
+fn jni_abi() -> String {
+    std::env::var("ETHERQUIC_ANDROID_ABI").unwrap_or_else(|_| "arm64-v8a".into())
+}
+
+fn jni_root() -> String {
+    format!("lib/{}", jni_abi())
+}
 
 /// NativeActivity plus codec `.so` files the player dlopens or execs.
 ///
@@ -199,7 +209,7 @@ fn push_jni(
     if bytes.is_empty() {
         return;
     }
-    let name = format!("{ANDROID_JNI}/{file}");
+    let name = format!("{}/{}", jni_root(), file);
     if seen.insert(name.clone()) {
         out.push((name, bytes));
     }
@@ -225,7 +235,9 @@ fn android_codec_dirs() -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os("ETHERQUIC_ANDROID_LIBS") {
         dirs.push(PathBuf::from(path));
     }
-    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("android/jni/arm64-v8a"));
+    if jni_abi() == "arm64-v8a" {
+        dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("android/jni/arm64-v8a"));
+    }
     dirs
 }
 
@@ -253,7 +265,7 @@ fn android_jni_files_from(dir: &Path) -> Vec<(String, Vec<u8>)> {
         if bytes.is_empty() {
             continue;
         }
-        out.push((format!("{ANDROID_JNI}/{name}"), bytes));
+        out.push((format!("{}/{}", jni_root(), name), bytes));
     }
     out
 }

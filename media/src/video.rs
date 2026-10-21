@@ -29,6 +29,11 @@ pub enum VideoEncoder {
         sink: Sink<Vec<u8>>,
         quality: u8,
     },
+    /// ffmpeg mjpeg. The Rust encoder is the fallback when this cannot start.
+    MjpegPipe {
+        pipe: jpeg::Pipe,
+        quality: u8,
+    },
     Mj2k {
         sink: Sink<Vec<u8>>,
         quality: u8,
@@ -50,13 +55,15 @@ impl VideoEncoder {
     /// its own thread as bytes arrive).
     pub fn open(setup: &EncodeSetup, sink: Sink<Vec<u8>>) -> Result<(VideoEncoder, u32), String> {
         match setup.video {
-            Video::Mjpeg => Ok((
-                VideoEncoder::Mjpeg {
-                    sink,
-                    quality: crate::negotiate::clamp_quality(setup.quality),
-                },
-                0,
-            )),
+            Video::Mjpeg => {
+                let quality = crate::negotiate::clamp_quality(setup.quality);
+                if let Ok(pipe) =
+                    jpeg::Pipe::open(setup.width, setup.height, setup.fps, quality, sink.clone())
+                {
+                    return Ok((VideoEncoder::MjpegPipe { pipe, quality }, 0));
+                }
+                Ok((VideoEncoder::Mjpeg { sink, quality }, 0))
+            }
             Video::Mj2k => Ok((
                 VideoEncoder::Mj2k {
                     sink,
@@ -65,16 +72,16 @@ impl VideoEncoder {
                 0,
             )),
             Video::Pyrowave | Video::PyrowaveCpu => {
-                let frame_bytes = if setup.kbps > 0 {
+                // Four bits per pixel. Below that the D3D11 packetizer returns
+                // a generic error and the player window stays black.
+                let natural = pyrowave::default_frame_bytes(setup.width, setup.height);
+                let asked = if setup.kbps > 0 {
                     (setup.kbps as usize * 1000 / 8) / setup.fps.max(1) as usize
                 } else {
-                    scale_budget(
-                        pyrowave::default_frame_bytes(setup.width, setup.height) as u32,
-                        setup.quality,
-                    ) as usize
+                    scale_budget(natural as u32, setup.quality) as usize
                 };
-                let kbps =
-                    (frame_bytes.max(16 * 1024) * 8 * setup.fps.max(1) as usize / 1000) as u32;
+                let frame_bytes = asked.max(natural);
+                let kbps = (frame_bytes * 8 * setup.fps.max(1) as usize / 1000) as u32;
                 if setup.encoder == "pyrowave-d3d11" {
                     #[cfg(windows)]
                     {
@@ -127,7 +134,9 @@ impl VideoEncoder {
     /// JPEG or JPEG 2000 of `frame` without writing it. Used for dirty tiles.
     pub fn encode_intra(&self, frame: &Frame) -> Result<Vec<u8>, String> {
         match self {
-            VideoEncoder::Mjpeg { quality, .. } => jpeg::encode(frame, *quality),
+            VideoEncoder::Mjpeg { quality, .. } | VideoEncoder::MjpegPipe { quality, .. } => {
+                jpeg::encode(frame, *quality)
+            }
             VideoEncoder::Mj2k { quality, .. } => jpeg2000::encode(frame, *quality),
             _ => Err("this codec does not encode a tile on its own".into()),
         }
@@ -136,12 +145,32 @@ impl VideoEncoder {
     pub fn push(&mut self, frame: &Frame) -> Result<bool, String> {
         match self {
             VideoEncoder::Mjpeg { sink, quality } => Ok(sink(jpeg::encode(frame, *quality)?)),
+            VideoEncoder::MjpegPipe { pipe, .. } => pipe.push(frame).map(|_| true),
             VideoEncoder::Mj2k { sink, quality } => Ok(sink(jpeg2000::encode(frame, *quality)?)),
             VideoEncoder::Pyrowave { inner, sink } => Ok(sink(inner.encode(frame)?)),
             #[cfg(windows)]
             VideoEncoder::PyrowaveD3d11 { inner, sink } => Ok(sink(inner.encode(frame)?)),
             VideoEncoder::Ffmpeg(inner) => inner.push(frame).map(|_| true),
         }
+    }
+
+    /// Send the PyroWave picture still sitting on the GPU. Other codecs have
+    /// nothing waiting, and this returns false.
+    pub fn flush(&mut self) -> Result<bool, String> {
+        match self {
+            #[cfg(windows)]
+            VideoEncoder::PyrowaveD3d11 { inner, sink } => match inner.flush()? {
+                Some(bytes) => Ok(sink(bytes)),
+                None => Ok(false),
+            },
+            _ => Ok(false),
+        }
+    }
+}
+
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 

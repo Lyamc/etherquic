@@ -283,6 +283,26 @@ mod tests {
     }
 
     #[test]
+    fn a_nic_change_keeps_mac_service_and_unattended() {
+        let text = "mac=02:11:22:33:44:55\nnic=wlan0\nservice=4433\nunattended=yes\n";
+        let mut cfg = resolve(Some(text), MACHINE).unwrap();
+        cfg.nic = "enp5s0".into();
+        let written = render(&cfg);
+        let back = resolve(Some(&written), MACHINE).unwrap();
+        assert_eq!(format_mac(back.mac), "02:11:22:33:44:55");
+        assert_eq!(back.nic, "enp5s0");
+        assert_eq!(back.service, 4433);
+        assert!(back.unattended);
+        cfg.nic.clear();
+        let cleared = render(&cfg);
+        let back = resolve(Some(&cleared), MACHINE).unwrap();
+        assert_eq!(back.nic, "");
+        assert_eq!(format_mac(back.mac), "02:11:22:33:44:55");
+        assert_eq!(back.service, 4433);
+        assert!(back.unattended);
+    }
+
+    #[test]
     fn resolve_keeps_a_written_mac() {
         let text = "mac=02:11:22:33:44:55\nnic=Killer\nservice=4433\n";
         let cfg = resolve(Some(text), MACHINE).unwrap();

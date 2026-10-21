@@ -79,8 +79,14 @@ pub struct ConnectSession {
     pub trace_input: bool,
     /// Dial this UDP address instead of the L2 service.
     pub udp: Option<SocketAddr>,
+    /// Default L2 Connect for carriers 3–5. The RTP target is `rtp`, not the local `rtp=` line.
+    pub l2_offer: bool,
+    /// Host IP and RTP input port already parsed from the scanned offer.
+    pub rtp: Option<SocketAddr>,
     /// Scale, what to send, pad slots, and the speaker. Read while the view runs.
     pub view: crate::LiveView,
+    /// Codec, rate, and carrier changed while the view is open.
+    pub tune: crate::LiveTune,
     /// Codec order, pins and limits for the offer.
     pub codecs: crate::CodecChoice,
     /// Set to this session's picture id before the view blocks.
@@ -190,6 +196,11 @@ fn run_view(event_loop: &mut EventLoop<()>, request: ViewRequest) {
             context: None,
             surface: None,
             picture: None,
+            fruc_prev: None,
+            fruc_rgb: Vec::new(),
+            fruc_due: None,
+            fruc_shown: false,
+            fruc_last: Instant::now(),
             debug_prev: None,
             debug_tiles: Vec::new(),
             debug_on: false,
@@ -281,6 +292,16 @@ async fn wake_window(
             seen = seq;
             let _ = proxy.send_event(());
         }
+    }
+}
+
+/// 720p while a client upscaler is on; otherwise the codec max (0 is unlimited).
+fn stream_size(upscale: crate::Upscale, codec_max: (u32, u32)) -> (u32, u32) {
+    if upscale.enabled() {
+        let stream = upscale.stream_limit();
+        (stream.width, stream.height)
+    } else {
+        codec_max
     }
 }
 
@@ -506,8 +527,9 @@ pub fn connect_view(
             .map_err(|_| view_error("the picture window stopped"))?
             .map_err(view_error)?;
     }
-    // Keep the runtime until the window loop returns, then join the side threads.
-    drop(rt);
+    // Background tasks (gate forward, keystrokes) park until channels close.
+    // A hard drop of the runtime waits for them forever.
+    rt.shutdown_timeout(Duration::from_secs(2));
     release_view(pads_stop, playback, gamepad);
     Ok(())
 }
@@ -539,6 +561,42 @@ async fn connect_player(
     picture_id: u64,
     cursors: Arc<Mutex<etherquic::cursor::CursorView>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let carrier = connect
+        .codecs
+        .carrier
+        .unwrap_or(etherquic::carrier::QUIC_STREAMS);
+    etherquic::set_capture_carrier(carrier);
+    if carrier >= etherquic::carrier::UDP_RTP {
+        if carrier == etherquic::carrier::AVB {
+            etherquic::carrier::note_reservation(false);
+            etherquic::carrier::note_avb_listener(false);
+        }
+        let udp = connect.udp;
+        let l2_offer = connect.l2_offer;
+        let rtp = connect.rtp;
+        let before = etherquic::quic_binds();
+        let (picture, audio) = tokio::task::spawn_blocking(move || {
+            etherquic::carrier::open_carrier_player(carrier, udp, l2_offer, rtp)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if picture.is_empty() || audio.is_empty() || etherquic::quic_binds() != before {
+            end_view(
+                &stop,
+                &status,
+                "The carrier session did not deliver picture and audio.",
+            );
+            return Ok(());
+        }
+        deliver_carrier(&frames, &speaker, &picture, &audio);
+        let line = etherquic::carrier::connect_row_now(carrier);
+        end_view(
+            &stop,
+            &status,
+            &format!("{line}. This session does not open a QUIC socket."),
+        );
+        return Ok(());
+    }
     let (cmd_tx, pipes, outbound, inbound) = desk_io::open_notes(desk_io::desk_roster());
     desk_io::attach_player(picture_id, cmd_tx);
     let _detach = DetachPlayer(picture_id);
@@ -637,7 +695,9 @@ async fn connect_player(
     let negotiates = etherquic::negotiates(&conn);
     let mut offer = connect.codecs.offer();
     let view_look = connect.view.clone();
+    let view_tune = connect.tune.clone();
     let initial = crate::snapshot(&view_look);
+    let initial_tune = crate::snapshot_tune(&view_tune);
     offer.look = initial.look;
     offer.dither = Some(initial.dither);
     offer.pixel_size = Some(initial.pixel_size);
@@ -649,6 +709,13 @@ async fn connect_player(
     }
     offer.want_dirty_rects = Some(connect.codecs.dirty_rects || initial.dirty_rects);
     offer.yuv = Some(initial.yuv);
+    let codec_max = (connect.codecs.max_width, connect.codecs.max_height);
+    let (max_width, max_height) = stream_size(initial.upscale, codec_max);
+    offer.max.width = max_width;
+    offer.max.height = max_height;
+    if let Some(fps) = initial_tune.fps {
+        offer.fps = fps;
+    }
     let (live_tx, live_rx) = tokio::sync::watch::channel(crate::LiveOffer {
         look: offer.look,
         dither: initial.dither,
@@ -658,11 +725,18 @@ async fn connect_player(
         dirty_rects: offer.want_dirty_rects.unwrap_or(false),
         yuv: offer.yuv.unwrap_or_default(),
         fps: offer.fps,
+        max_width,
+        max_height,
+        video: initial_tune.video,
+        audio: initial_tune.audio,
+        carrier: initial_tune.carrier,
     });
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let snap = crate::snapshot(&view_look);
+            let tune = crate::snapshot_tune(&view_tune);
+            let (max_width, max_height) = stream_size(snap.upscale, codec_max);
             if live_tx
                 .send(crate::LiveOffer {
                     look: snap.look,
@@ -672,7 +746,12 @@ async fn connect_player(
                     quality: snap.quality,
                     dirty_rects: snap.dirty_rects,
                     yuv: snap.yuv,
-                    fps: offer.fps,
+                    fps: tune.fps.unwrap_or(offer.fps),
+                    max_width,
+                    max_height,
+                    video: tune.video,
+                    audio: tune.audio,
+                    carrier: tune.carrier,
                 })
                 .is_err()
             {
@@ -736,10 +815,16 @@ async fn connect_player(
             let show = line.apply(&event);
             if let Some(log) = line.log_line(&event) {
                 eprintln!("etherquic-play: {log}");
+                if crate::debug_log::enabled() {
+                    crate::debug_log::push(&log);
+                }
             }
-            if show
-                && !(quiet_stats && matches!(event, etherquic_media::player::PlayerEvent::Stats(_)))
-            {
+            let show_stats = crate::debug_log::show_stats(
+                quiet_stats,
+                crate::debug_log::enabled(),
+                matches!(event, etherquic_media::player::PlayerEvent::Stats(_)),
+            );
+            if show && show_stats {
                 let text = line.text();
                 codec_status(&text);
                 if let Ok(mut title) = codec_title.lock() {
@@ -791,6 +876,44 @@ async fn connect_player(
     drop(watch);
     shutdown_endpoint(endpoint).await;
     Ok(())
+}
+
+/// One picture row and one PCM chunk from the bytes the carrier socket returned.
+fn deliver_carrier(
+    frames: &Arc<Mutex<Option<Picture>>>,
+    speaker: &std::sync::mpsc::Sender<AudioChunk>,
+    picture: &[u8],
+    audio: &[u8],
+) {
+    let mut rgb = picture.to_vec();
+    let extra = rgb.len() % 3;
+    if extra != 0 {
+        rgb.resize(rgb.len() + (3 - extra), 0);
+    }
+    if rgb.is_empty() {
+        rgb.extend_from_slice(&[0, 0, 0]);
+    }
+    let width = (rgb.len() / 3) as u32;
+    if let Ok(mut slot) = frames.lock() {
+        *slot = Some(Picture {
+            width,
+            height: 1,
+            rgb,
+        });
+    }
+    let mut bytes = audio.to_vec();
+    if bytes.len() % 2 == 1 {
+        bytes.push(0);
+    }
+    let pcm = bytes
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    let _ = speaker.send(AudioChunk {
+        sample_rate: 48_000,
+        channels: 1,
+        pcm,
+    });
 }
 
 /// Tell the window to close, unless the user already pressed Stop.
@@ -930,6 +1053,12 @@ struct App {
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     picture: Option<Picture>,
+    /// Previous decoded picture, for client frame generation.
+    fruc_prev: Option<(u32, u32, Vec<u8>)>,
+    fruc_rgb: Vec<u8>,
+    fruc_due: Option<Instant>,
+    fruc_shown: bool,
+    fruc_last: Instant,
     /// Previous picture RGB, for the dirty-tile overlay.
     debug_prev: Option<(u32, u32, Vec<u8>)>,
     debug_tiles: Vec<etherquic_media::dirty::Rect>,
@@ -1194,6 +1323,15 @@ impl ApplicationHandler for App {
         self.apply_title();
         self.drain_keystroke_strings();
         self.sync_cursor(event_loop);
+        if let Some(due) = self.fruc_due {
+            if Instant::now() >= due {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            }
+        }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1230,6 +1368,11 @@ impl App {
             context: None,
             surface: None,
             picture: None,
+            fruc_prev: None,
+            fruc_rgb: Vec::new(),
+            fruc_due: None,
+            fruc_shown: false,
+            fruc_last: Instant::now(),
             debug_prev: None,
             debug_tiles: Vec::new(),
             debug_on: false,
@@ -1273,6 +1416,9 @@ impl App {
         self.cursor_icon = None;
         self.cursor_image = 0;
         self.picture = None;
+        self.fruc_prev = None;
+        self.fruc_due = None;
+        self.fruc_shown = false;
         self.debug_prev = None;
         self.debug_tiles.clear();
         self.debug_on = false;
@@ -1303,6 +1449,20 @@ impl App {
         if self.bound_id != 0 && self.stop.load(Ordering::SeqCst) {
             self.begin_close(event_loop);
             return;
+        }
+        if self.window.is_some() && picture_hub::take_raise() {
+            if let Some(window) = &self.window {
+                let raise = picture_hub::PictureRaise::for_double_click();
+                if raise.unminimize {
+                    window.set_minimized(false);
+                }
+                if raise.show {
+                    window.set_visible(true);
+                }
+                if raise.focus {
+                    window.focus_window();
+                }
+            }
         }
         match picture_hub::screen_seat() {
             None if self.window.is_some() => self.begin_close(event_loop),
@@ -1422,6 +1582,12 @@ impl App {
             return;
         }
         self.take_frame();
+        let options = crate::snapshot(&self.view);
+        let generated = if options.frame_gen.enabled() {
+            self.take_generated()
+        } else {
+            None
+        };
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -1449,10 +1615,9 @@ impl App {
         };
         event_loop.set_control_flow(ControlFlow::Wait);
         buffer.fill(0);
-        if let Some(picture) = &self.picture {
-            let scale = crate::snapshot(&self.view).scale;
+        if let Some(picture) = generated.as_ref().or(self.picture.as_ref()) {
             let place = crate::place(
-                scale,
+                options.scale,
                 picture.width,
                 picture.height,
                 size.width,
@@ -1460,8 +1625,20 @@ impl App {
             );
             self.letterbox = place;
             let mut view = vec![0u32; (place.view_w as usize) * (place.view_h as usize)];
-            blit_rgb(picture, &mut view, place.view_w, place.view_h);
-            if crate::snapshot(&self.view).debug_dirty_rects {
+            if let Some(kind) = options.upscale.kind() {
+                etherquic::upscale::blit_argb(
+                    &picture.rgb,
+                    picture.width,
+                    picture.height,
+                    &mut view,
+                    place.view_w,
+                    place.view_h,
+                    kind,
+                );
+            } else {
+                blit_rgb(picture, &mut view, place.view_w, place.view_h);
+            }
+            if options.debug_dirty_rects {
                 let color = 0x00FF40;
                 let src_w = picture.width.max(1);
                 let src_h = picture.height.max(1);
@@ -1638,6 +1815,35 @@ impl App {
         self.cursor_seq = seq;
     }
 
+    fn take_generated(&mut self) -> Option<Picture> {
+        if self.fruc_shown {
+            return None;
+        }
+        let due = self.fruc_due?;
+        if Instant::now() < due {
+            return None;
+        }
+        let (width, height, curr) = match &self.picture {
+            Some(picture) => (picture.width, picture.height, picture.rgb.clone()),
+            None => return None,
+        };
+        let prev = match &self.fruc_prev {
+            Some((pw, ph, rgb)) if *pw == width && *ph == height => rgb.clone(),
+            _ => return None,
+        };
+        self.fruc_rgb.resize(curr.len(), 0);
+        if !etherquic::fruc::interpolate(&prev, &curr, width, height, 384, &mut self.fruc_rgb) {
+            return None;
+        }
+        self.fruc_shown = true;
+        self.fruc_due = None;
+        Some(Picture {
+            width,
+            height,
+            rgb: self.fruc_rgb.clone(),
+        })
+    }
+
     fn take_frame(&mut self) {
         let options = crate::snapshot(&self.view);
         if options.debug_dirty_rects != self.debug_on {
@@ -1671,9 +1877,31 @@ impl App {
                 self.debug_prev = Some((picture.width, picture.height, picture.rgb.clone()));
             }
             let size = (picture.width, picture.height);
+            if crate::snapshot(&self.view).frame_gen.enabled() {
+                if let Some(old) = &self.picture {
+                    if old.width == picture.width && old.height == picture.height {
+                        let now = Instant::now();
+                        let gap = now.saturating_duration_since(self.fruc_last);
+                        let half = (gap / 2).clamp(Duration::from_millis(8), Duration::from_millis(24));
+                        self.fruc_prev = Some((old.width, old.height, old.rgb.clone()));
+                        self.fruc_due = Some(now + half);
+                        self.fruc_shown = false;
+                    } else {
+                        self.fruc_prev = None;
+                        self.fruc_due = None;
+                    }
+                }
+                self.fruc_last = Instant::now();
+            } else {
+                self.fruc_prev = None;
+                self.fruc_due = None;
+            }
             self.picture = Some(picture);
             if let Some(window) = &self.window {
-                if options.size_match == crate::SizeMatch::WindowToHost && size != self.fitted {
+                if options.size_match == crate::SizeMatch::WindowToHost
+                    && !options.upscale.enabled()
+                    && size != self.fitted
+                {
                     self.fitted = size;
                     let _ = window.request_inner_size(PhysicalSize::new(size.0, size.1));
                 }

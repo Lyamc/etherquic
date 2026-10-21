@@ -12,14 +12,20 @@ mod badge;
 mod extra_keys;
 #[cfg(feature = "ui")]
 mod overlay;
+mod path_budget;
+#[cfg(feature = "ui")]
+mod latency_help;
 #[cfg(feature = "ui")]
 mod quality_preview;
 #[cfg(feature = "ui")]
 mod update;
-#[cfg(all(feature = "ui", target_os = "macos"))]
+// The macOS app is the process that spawns this child. The argv builder is
+// compiled on every desktop so that connect is tested here too.
+#[cfg(feature = "ui")]
 mod child_view;
 #[cfg(feature = "ui")]
 mod hosts;
+mod desk_model;
 mod link;
 #[cfg(feature = "ui")]
 pub mod macos_service;
@@ -49,17 +55,21 @@ pub use hosts::{
     HostEntry, Presence, Roster, RosterRow, Sighting, ThisMachine, RECENT_CAP,
 };
 #[cfg(feature = "ui")]
-pub use link::{last_session, live_view, set_host_audio_device, CodecOffer};
+pub use link::{last_session, live_view, set_host_audio_device, stage_live, CodecOffer};
 pub use link::{list_nics, Link, NicChoice};
 #[cfg(feature = "ui")]
 pub use prefs::{
-    apply_override, audio_announce, audio_for, audio_hint, audio_match_line, backend_hint,
+    apply_override, audio_announce, audio_for, audio_hint, audio_layout_name, audio_match_line,
+    backend_hint,
     backend_label, backend_line, capture_rate, chosen_audio, chosen_video, codec_choice_for,
     default_audio, default_video, fps_headline, listed_top, load_connections, load_preferences,
-    local_video_line, mac_key, move_to_front, negotiated_from_status, predicted_pair,
-    remote_backend_line, remote_hardware_line, resolve_fps, store_connections, store_preferences,
+    local_codec_rows, local_video_line, mac_key, move_to_front, negotiated_from_status,
+    predicted_pair, codec_table_text, CodecSupportRow,
+    remote_backend_line, remote_hardware_line, resolve_fps, scale_audio_kbps, store_connections,
+    store_preferences,
     swap_earlier, swap_later, top_selection, video_announce, video_hint, video_match_line, Applied,
-    ConnectionOverride, ConnectionPrefs, FrameRate, Predicted, Preferences, FPS_CHOICES,
+    ConnectionOverride, ConnectionPrefs, FrameRate, Predicted, Preferences, AUDIO_BITRATE_CHOICES,
+    AUDIO_LAYOUTS, FPS_CHOICES,
     HARDWARE_FPS, SOFTWARE_FPS,
 };
 pub use session::{

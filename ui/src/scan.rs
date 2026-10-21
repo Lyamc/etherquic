@@ -28,6 +28,7 @@ impl Default for Board {
 
 struct Job {
     nic: Option<String>,
+    nics: Vec<String>,
     generation: u64,
 }
 
@@ -58,12 +59,25 @@ impl Scan {
     }
 
     pub fn refresh(&self, nic: Option<String>) {
+        self.send(nic, Vec::new());
+    }
+
+    /// Probe each named adapter. An empty list uses the single default adapter.
+    pub fn refresh_nics(&self, nics: &[String]) {
+        self.send(None, nics.to_vec());
+    }
+
+    fn send(&self, nic: Option<String>, nics: Vec<String>) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Ok(mut board) = self.board.lock() {
             board.looking = true;
             board.error = None;
         }
-        let _ = self.tx.send(Job { nic, generation });
+        let _ = self.tx.send(Job {
+            nic,
+            nics,
+            generation,
+        });
     }
 
     pub fn board(&self) -> Board {
@@ -87,12 +101,47 @@ impl Scan {
     }
 }
 
+fn discover_many(
+    nics: &[String],
+    generation: &AtomicU64,
+    expected: u64,
+) -> Result<Vec<discover::Found>, String> {
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    for nic in nics {
+        if generation.load(Ordering::SeqCst) != expected {
+            break;
+        }
+        match discover::discover(Some(nic), generation, expected) {
+            Ok(batch) => {
+                for host in batch {
+                    if !found.iter().any(|have: &discover::Found| have.key == host.key) {
+                        found.push(host);
+                    }
+                }
+            }
+            Err(err) => errors.push(format!("{nic}: {err}")),
+        }
+    }
+    if found.is_empty() {
+        if let Some(err) = errors.into_iter().next() {
+            return Err(err);
+        }
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name).then(a.key.cmp(&b.key)));
+    Ok(found)
+}
+
 fn worker(rx: mpsc::Receiver<Job>, generation: Arc<AtomicU64>, board: Arc<Mutex<Board>>) {
     while let Ok(mut job) = rx.recv() {
         while let Ok(newer) = rx.try_recv() {
             job = newer;
         }
-        let result = discover::discover(job.nic.as_deref(), &generation, job.generation);
+        let result = if job.nics.is_empty() {
+            discover::discover(job.nic.as_deref(), &generation, job.generation)
+        } else {
+            discover_many(&job.nics, &generation, job.generation)
+        };
         if generation.load(Ordering::SeqCst) != job.generation {
             continue;
         }

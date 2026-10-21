@@ -1,0 +1,84 @@
+direction: down
+
+title: |md
+  # Glass to glass
+  60 fps is 16.7 ms. 120 is 8.3. 144 is 6.9.
+| {shape: text}
+
+host: Host {
+  display: Display\nrefresh waits up to 1 frame
+  grab: Grab\nmonitor list + one image\nperiod is 1000/fps ms
+  paint: Fit, look,\ndirty compare
+  encode: Encode\nAuto is 15 software / 30 hardware
+  display -> grab -> paint -> encode
+}
+
+audio: Audio lane {
+  opus: Opus\n10 ms at 48 kHz
+  pcm: PCM\n1 ms on ST 2110
+}
+
+carriers: Carrier {
+  streams: 1 QUIC streams\n25 ms ACK cap\n14,720 byte start window\nloss stalls the stream
+  datagrams: 2 QUIC datagrams\n1 ms ACK, 256 KiB\nL2 or UDP under 2 ms\nhole does not stall
+  rtp: 3 UDP/RTP\nno Quinn\npicture hole = 1 frame, min 2 ms
+  avb: 4 AVB 0x22F0\n200 Mbit/s picture\n250 µs class B\nreservation or fail
+  st: 5 ST 2110\nrows paced across the frame\n~2.5 Gbit/s for 1080p60
+}
+
+nic: Link {
+  membrane: Membrane NDIS\nmeasured 4.8 MiB/s
+  poll: Linux poll\npcap fd + send wake
+  udp: UDP\nno raw NIC
+  bpf: macOS BPF + AF_NDRV
+  npcap: Npcap fallback\nmeasured 0.09 MiB/s
+}
+
+player: Player {
+  assemble: Assemble\ndrop the hole
+  decode: Decode
+  present: Present\nsoftbuffer, up to 1 refresh
+  assemble -> decode -> present
+}
+
+host.encode -> carriers.streams: picture
+host.encode -> carriers.datagrams: picture
+host.encode -> carriers.rtp: picture
+host.encode -> carriers.avb: picture
+host.encode -> carriers.st: picture
+audio.opus -> carriers.streams
+audio.opus -> carriers.datagrams
+audio.pcm -> carriers.rtp
+audio.pcm -> carriers.avb
+audio.pcm -> carriers.st
+
+carriers.streams -> nic.membrane
+carriers.streams -> nic.poll
+carriers.streams -> nic.udp
+carriers.streams -> nic.bpf
+carriers.streams -> nic.npcap
+carriers.datagrams -> nic.membrane
+carriers.datagrams -> nic.poll
+carriers.datagrams -> nic.udp
+carriers.rtp -> nic.udp
+carriers.avb -> nic.membrane
+carriers.avb -> nic.poll
+carriers.st -> nic.udp
+
+nic.membrane -> player.assemble
+nic.poll -> player.assemble
+nic.udp -> player.assemble
+nic.bpf -> player.assemble
+nic.npcap -> player.assemble
+
+photon: Photon {shape: oval}
+player.present -> photon
+
+acks: ACK path {
+  every: Datagrams ACK every packet
+  pair: Streams ACK every 2 packets\nor at 25 ms
+}
+player.assemble -> acks.every: short path
+player.assemble -> acks.pair: streams
+acks.every -> host.encode: frees the window
+acks.pair -> host.encode: frees the window

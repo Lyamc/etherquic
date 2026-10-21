@@ -91,6 +91,11 @@ async fn main() -> Result<(), String> {
         false,
         etherquic_media::negotiate::YuvFormat::YUV444P8,
         etherquic_media::negotiate::FpsWish::Auto,
+        0,
+        0,
+        false,
+        false,
+        None,
     );
     let mut offer_send = None;
     if negotiates {
@@ -128,12 +133,14 @@ async fn main() -> Result<(), String> {
             b"EVID" | b"EVI2" => {
                 let v2 = &magic == VIDEO2_MAGIC;
                 let (sink, events) = (sink.clone(), events_tx.clone());
-                tokio::spawn(async move { player::read_video(recv, v2, sink, events).await });
+                tokio::spawn(async move {
+                    player::read_video(recv, v2, sink, events, None, None, None).await
+                });
             }
             b"EAUD" | b"EAU2" => {
                 let v2 = &magic == AUDIO2_MAGIC;
                 let (pcm, events) = (pcm_tx.clone(), events_tx.clone());
-                tokio::spawn(async move { player::read_audio(recv, v2, pcm, events).await });
+                tokio::spawn(async move { player::read_audio(recv, v2, pcm, events, None, None).await });
             }
             other => {
                 return Err(format!(

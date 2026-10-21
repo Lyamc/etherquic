@@ -26,6 +26,10 @@ const PLAY_EXE: &str = if cfg!(windows) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildConnect {
     pub udp: Option<SocketAddr>,
+    /// L2 Connect for carriers 3–5. The child offers on `rtp` and ignores the local `rtp=` line.
+    pub l2_offer: bool,
+    /// Host IP and RTP input port from the scanned offer.
+    pub rtp: Option<SocketAddr>,
     pub nic: Option<String>,
     pub peer_mac: [u8; 6],
     pub local_mac: [u8; 6],
@@ -55,6 +59,8 @@ pub fn connect_args(c: &ChildConnect) -> Vec<String> {
     }
     let v = &c.view;
     args.extend(["--scale".into(), v.scale.token().into()]);
+    args.extend(["--upscale".into(), v.upscale.token().into()]);
+    args.extend(["--frame-gen".into(), v.frame_gen.token().into()]);
     args.extend(["--cursor".into(), v.cursor.token().into()]);
     args.extend(["--look".into(), v.look.token().into()]);
     args.extend(["--dither".into(), v.dither.token().into()]);
@@ -87,12 +93,19 @@ pub fn connect_args(c: &ChildConnect) -> Vec<String> {
         args.extend(["--pad".into(), format!("{}={}", pad.slot, pad.name)]);
     }
     args.extend(c.codecs.args());
+    if c.l2_offer {
+        args.push("--l2-offer".into());
+    }
+    if let Some(addr) = c.rtp {
+        args.extend(["--rtp".into(), addr.to_string()]);
+    }
     args.push("--parent-pipe".into());
     args
 }
 
 /// `ETHERQUIC_PLAY`, then next to this app (inside the .app bundle that is
 /// `Contents/MacOS`), then `PATH`, then the cargo target dirs of a checkout.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn play_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ETHERQUIC_PLAY") {
         let path = PathBuf::from(path);
@@ -186,10 +199,12 @@ pub fn exit_error(code: Option<i32>, problem: Option<&str>) -> Option<String> {
 
 /// Run one session in the child and block until it ends or `stop` is set.
 /// Status lines go to `report`. Returns the failure reason, if any.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn run(
     connect: &ChildConnect,
     stop: &AtomicBool,
     report: &(dyn Fn(&str) + Send + Sync),
+    commands: Option<mpsc::Receiver<String>>,
 ) -> Result<(), String> {
     let bin = play_binary().ok_or_else(|| {
         format!("{PLAY_EXE} was not found next to the app, on PATH, or in a cargo target dir")
@@ -202,6 +217,7 @@ pub fn run(
         .spawn()
         .map_err(|err| format!("could not start {}: {err}", bin.display()))?;
     report("Connecting…");
+    let mut stdin = child.stdin.take();
     let (tx, rx) = mpsc::channel::<String>();
     let stderr = child.stderr.take();
     let reader = std::thread::Builder::new()
@@ -222,7 +238,7 @@ pub fn run(
             match classify(&line) {
                 Line::Status(text) => report(&text),
                 Line::Problem(text) => *problem = Some(text),
-                Line::Trace => {}
+                Line::Trace => etherquic_play::push_debug(&line),
             }
         }
     };
@@ -233,8 +249,17 @@ pub fn run(
             Ok(None) => {}
             Err(err) => break Err(err.to_string()),
         }
+        if let Some(commands) = &commands {
+            while let Ok(line) = commands.try_recv() {
+                if let Some(stdin) = stdin.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(stdin, "{line}");
+                    let _ = stdin.flush();
+                }
+            }
+        }
         if stop.load(Ordering::SeqCst) {
-            stop_child(&mut child);
+            stop_child(&mut child, stdin.take());
             if let Some(reader) = reader {
                 let _ = reader.join();
             }
@@ -254,7 +279,9 @@ pub fn run(
 }
 
 /// Close stdin so the child ends the session itself, then kill it if it does not.
-fn stop_child(child: &mut Child) {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn stop_child(child: &mut Child, stdin: Option<std::process::ChildStdin>) {
+    drop(stdin);
     drop(child.stdin.take());
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -275,6 +302,8 @@ mod tests {
     fn udp() -> ChildConnect {
         ChildConnect {
             udp: Some("192.168.0.58:4434".parse().unwrap()),
+            l2_offer: false,
+            rtp: None,
             nic: None,
             peer_mac: [2, 0, 0, 0, 0, 1],
             local_mac: [2, 0, 0, 0, 0, 2],
@@ -341,6 +370,8 @@ mod tests {
         for part in [
             "--trace-input",
             "--scale fill",
+            "--upscale off",
+            "--frame-gen off",
             "--cursor native",
             "--look off",
             "--dirty-rects",
@@ -382,6 +413,138 @@ mod tests {
             Some("etherquic-play exited with code 3".into())
         );
         assert!(exit_error(None, None).is_some());
+    }
+
+    #[test]
+    fn l2_child_argv_skips_the_raw_nic() {
+        let frame = etherquic_media::Frame {
+            width: 16,
+            height: 16,
+            rgb: {
+                let mut rgb = Vec::with_capacity(16 * 16 * 3);
+                for y in 0..16u32 {
+                    for x in 0..16u32 {
+                        rgb.push((x * 16) as u8);
+                        rgb.push((y * 16) as u8);
+                        rgb.push(40);
+                    }
+                }
+                rgb
+            },
+        };
+        let pcm = etherquic_media::Pcm {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![1, -2, 3, -4, 5, 6, 7, -8],
+        };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let discovery = std::thread::spawn(move || {
+            let card = etherquic::discover::HostCard {
+                name: "carrier".into(),
+                l2_mac: [0x02, 0, 0, 0, 0, 1],
+                l2_service: 4433,
+                l3_port: 4433,
+                video: None,
+                audio: None,
+                l2_backend: 0,
+            };
+            let _ = etherquic::discover::serve_udp(
+                None,
+                &card,
+                &etherquic::discover::NoExtras,
+                &flag,
+            );
+        });
+        struct StopDiscovery(std::sync::Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+        impl Drop for StopDiscovery {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+                if let Some(handle) = self.1.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let _stop = StopDiscovery(stop, Some(discovery));
+        struct ClearCarrier;
+        impl Drop for ClearCarrier {
+            fn drop(&mut self) {
+                etherquic::carrier::set_l3_port(0);
+            }
+        }
+        let _clear = ClearCarrier;
+        for id in [
+            etherquic::carrier::UDP_RTP,
+            etherquic::carrier::AVB,
+            etherquic::carrier::ST2110,
+        ] {
+            let before = etherquic::quic_binds();
+            let published = etherquic::carrier::prepare_host();
+            assert_ne!(published.port(), 0, "{id}");
+            etherquic::carrier::clear_published_input();
+            etherquic::carrier::publish_input(19_999);
+            let payload = etherquic::discover::fetch_offer(std::net::Ipv4Addr::LOCALHOST.into())
+                .unwrap_or_else(|| panic!("carrier {id} discovery did not answer"));
+            let seen = etherquic::discover::offer_rtp_socket(&payload)
+                .unwrap_or_else(|| panic!("carrier {id} offer had no rtp socket"));
+            assert_eq!(seen.port(), published.port(), "{id}");
+            assert_ne!(seen.port(), 19_999, "{id}");
+            let mut child = udp();
+            child.udp = None;
+            child.l2_offer = true;
+            child.rtp = Some(seen);
+            child.codecs.carrier = Some(id);
+            let args = connect_args(&child);
+            assert!(
+                args.iter().all(|arg| arg != "--udp"),
+                "{id} child argv dialed QUIC: {args:?}"
+            );
+            assert!(args.iter().any(|arg| arg == "--l2-offer"), "{id}");
+            let rtp_at = args.iter().position(|arg| arg == "--rtp").expect("--rtp");
+            assert_eq!(args[rtp_at + 1], seen.to_string(), "{id}");
+            let etherquic_play::args::Command::Connect(connect) = etherquic_play::args::parse(args)
+                .unwrap_or_else(|err| panic!("carrier {id} argv: {err}"))
+            else {
+                panic!("carrier {id} was not connect");
+            };
+            assert!(connect.l2_offer, "{id}");
+            assert!(connect.udp.is_none(), "{id}");
+            assert_eq!(connect.rtp, Some(seen), "{id}");
+            assert_eq!(connect.codecs.carrier, Some(id), "{id}");
+            let mut opened = false;
+            let net: Result<Option<()>, &str> = etherquic::carrier::connect_net(
+                connect.udp,
+                connect.l2_offer,
+                connect.nic.as_deref(),
+                |_| {
+                    opened = true;
+                    Err("raw nic")
+                },
+            );
+            assert!(!opened, "{id} opened a raw nic");
+            assert!(net.expect("opener must not run").is_none(), "{id}");
+            let host = etherquic::carrier::player_host_for(connect.udp, connect.l2_offer, connect.rtp)
+                .unwrap_or_else(|| panic!("carrier {id} l2 offer was dropped"));
+            assert_eq!(host, seen, "{id}");
+            assert_ne!(
+                host,
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 19_999)),
+                "{id} used the local rtp line"
+            );
+            let udp = connect.udp;
+            let l2_offer = connect.l2_offer;
+            let rtp = connect.rtp;
+            let player = std::thread::spawn(move || {
+                etherquic::carrier::open_carrier_player(id, udp, l2_offer, rtp)
+            });
+            let (picture, audio) = etherquic_media::host::serve_carrier(id, &frame, &pcm)
+                .unwrap_or_else(|err| panic!("carrier {id} host did not send: {err}"));
+            let (got_picture, got_audio) = player.join().expect("player");
+            assert_eq!(got_picture, picture, "carrier {id} picture");
+            assert_eq!(got_audio, audio, "carrier {id} audio");
+            assert_eq!(etherquic::quic_binds(), before, "carrier {id} opened QUIC");
+            etherquic::carrier::set_l3_port(0);
+        }
     }
 
     #[test]

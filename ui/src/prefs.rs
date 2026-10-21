@@ -14,7 +14,9 @@ use etherquic::discover::{
     AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_APV, VIDEO_AV1, VIDEO_H264, VIDEO_H265,
     VIDEO_JPEGXS, VIDEO_MJ2K, VIDEO_MJPEG, VIDEO_PYROWAVE,
 };
+use etherquic::negotiate::Video;
 use etherquic::{BackendProbe, MediaBackend};
+use etherquic_play::etherquic_media::{caps::Probe, ffmpeg};
 use etherquic_play::{
     catalog, choose_audio, choose_codec, codec_name, AudioId, AudioMachine, CodecId, EndSupport,
     MachineCodecs, PicturePref,
@@ -296,6 +298,229 @@ pub fn local_video_line(machine: &MachineCodecs) -> String {
         .join(" · ")
 }
 
+/// One row of the this-computer codec table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecSupportRow {
+    pub id: CodecId,
+    pub name: &'static str,
+    pub software: bool,
+    pub hardware: bool,
+    pub backend: String,
+    pub error: Option<String>,
+    pub latency: &'static str,
+    pub psnr_per_byte: &'static str,
+    pub i_frame: bool,
+    pub p_frame: bool,
+    pub b_frame: bool,
+}
+
+impl CodecSupportRow {
+    pub fn software_label(&self) -> &'static str {
+        if self.software {
+            "yes"
+        } else {
+            "no"
+        }
+    }
+
+    pub fn hardware_label(&self) -> &'static str {
+        if self.hardware {
+            "yes"
+        } else {
+            "no"
+        }
+    }
+
+    pub fn frame_label(on: bool) -> &'static str {
+        if on {
+            "yes"
+        } else {
+            "—"
+        }
+    }
+}
+
+fn videos_for(id: CodecId) -> &'static [Video] {
+    match id {
+        CodecId::Pyrowave => &[Video::Pyrowave, Video::PyrowaveCpu],
+        CodecId::Mjpeg => &[Video::Mjpeg],
+        CodecId::Mj2k => &[Video::Mj2k],
+        CodecId::JpegXs => &[Video::JpegXs],
+        CodecId::OpenApv => &[Video::OpenApv],
+        CodecId::H264 => &[Video::H264Hw, Video::H264Sw],
+        CodecId::H265 => &[Video::H265Hw],
+        CodecId::Av1 => &[Video::Av1Hw],
+    }
+}
+
+fn needs_ffmpeg(id: CodecId) -> bool {
+    matches!(
+        id,
+        CodecId::JpegXs | CodecId::OpenApv | CodecId::H264 | CodecId::H265 | CodecId::Av1
+    )
+}
+
+fn note_matches(id: CodecId, note: &str) -> bool {
+    let n = note.to_ascii_lowercase();
+    match id {
+        CodecId::Pyrowave => n.contains("pyrowave"),
+        CodecId::Mjpeg => n.contains("mjpeg"),
+        CodecId::Mj2k => n.contains("mj2k") || n.contains("jpeg2000") || n.contains("jpeg 2000"),
+        CodecId::JpegXs => {
+            n.contains("jpegxs")
+                || n.contains("jpeg xs")
+                || n.contains("svtjpegxs")
+                || n.contains("libsvtjpegxs")
+        }
+        CodecId::OpenApv => n.contains("openapv") || n.contains("liboapv") || n.contains("oapv"),
+        CodecId::H264 => {
+            n.contains("h264")
+                || n.contains("h.264")
+                || n.contains("libx264")
+                || n.contains("264_")
+        }
+        CodecId::H265 => n.contains("h265") || n.contains("h.265") || n.contains("hevc"),
+        CodecId::Av1 => n.contains("av1"),
+    }
+}
+
+fn is_error_note(note: &str) -> bool {
+    let n = note.to_ascii_lowercase();
+    n.contains("not found")
+        || n.contains("encode:")
+        || n.contains("decode:")
+        || n.starts_with("mj2k:")
+        || n.contains("failed")
+        || n.contains("error")
+        || n.contains("disabled")
+}
+
+fn push_error(slot: &mut Option<String>, msg: String) {
+    if msg.is_empty() {
+        return;
+    }
+    match slot {
+        Some(existing) if existing.contains(&msg) => {}
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&msg);
+        }
+        None => *slot = Some(msg),
+    }
+}
+
+/// SW/HW rows for this computer, with probe backends and library errors.
+pub fn local_codec_rows(
+    machine: &MachineCodecs,
+    probe: Option<&Probe>,
+    pyrowave_library: bool,
+) -> Vec<CodecSupportRow> {
+    let ffmpeg_missing = probe
+        .map(|probe| {
+            probe
+                .notes
+                .iter()
+                .any(|note| note.eq_ignore_ascii_case("ffmpeg: not found"))
+        })
+        .unwrap_or(false);
+    catalog()
+        .into_iter()
+        .map(|info| {
+            let end = machine.get(info.id);
+            let caps: Vec<_> = probe
+                .map(|probe| {
+                    probe
+                        .caps
+                        .video
+                        .iter()
+                        .filter(|cap| videos_for(info.id).contains(&cap.video))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (software, hardware, backend) = if probe.is_some() {
+                let software = caps.iter().any(|cap| !cap.video.hardware());
+                let hardware = caps.iter().any(|cap| cap.video.hardware());
+                let backend = if caps.is_empty() {
+                    "—".into()
+                } else {
+                    let mut names: Vec<String> = caps.iter().map(|cap| cap.encoder.clone()).collect();
+                    names.sort();
+                    names.dedup();
+                    names.join(", ")
+                };
+                (software, hardware, backend)
+            } else {
+                let hardware = end.hardware_encode;
+                let software = end.cpu_can_sustain
+                    || (info.id == CodecId::Pyrowave && end.gpu_compute && !end.hardware_encode);
+                (software, hardware, "…".into())
+            };
+            let mut error = None;
+            if info.id == CodecId::Pyrowave && !pyrowave_library {
+                push_error(&mut error, "Pyrowave library: not found".into());
+            }
+            if let Some(probe) = probe {
+                for note in &probe.notes {
+                    if is_error_note(note) && note_matches(info.id, note) {
+                        push_error(&mut error, note.clone());
+                    }
+                }
+                if ffmpeg_missing && needs_ffmpeg(info.id) {
+                    push_error(&mut error, "ffmpeg: not found".into());
+                } else if !ffmpeg_missing && needs_ffmpeg(info.id) && caps.is_empty() {
+                    let wanted: Vec<&str> = videos_for(info.id)
+                        .iter()
+                        .copied()
+                        .flat_map(ffmpeg::candidates)
+                        .copied()
+                        .collect();
+                    if !wanted.is_empty() {
+                        push_error(
+                            &mut error,
+                            format!("ffmpeg encoder {} not found", wanted.join("/")),
+                        );
+                    }
+                }
+            }
+            CodecSupportRow {
+                id: info.id,
+                name: info.name,
+                software,
+                hardware,
+                backend,
+                error,
+                latency: info.display_to_frame,
+                psnr_per_byte: info.psnr_per_byte,
+                i_frame: info.i_frame,
+                p_frame: info.p_frame,
+                b_frame: info.b_frame,
+            }
+        })
+        .collect()
+}
+
+pub fn codec_table_text(rows: &[CodecSupportRow]) -> String {
+    let mut lines = vec![
+        "codec\tSW\tHW\tbackend\terror\tlatency\tPSNR/B\tI\tP\tB".to_string(),
+    ];
+    for row in rows {
+        lines.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.name,
+            row.software_label(),
+            row.hardware_label(),
+            row.backend,
+            row.error.as_deref().unwrap_or(""),
+            row.latency,
+            row.psnr_per_byte,
+            CodecSupportRow::frame_label(row.i_frame),
+            CodecSupportRow::frame_label(row.p_frame),
+            CodecSupportRow::frame_label(row.b_frame),
+        ));
+    }
+    lines.join("\n")
+}
+
 pub fn remote_hardware_line(video: Option<&[AnnouncedCodec]>) -> String {
     let Some(rows) = video else {
         return "Codec hardware: not announced".into();
@@ -405,6 +630,9 @@ pub fn codec_choice_for(
     quality: u8,
     dirty_rects: bool,
     yuv: etherquic::negotiate::YuvFormat,
+    view_only: bool,
+    exclusive: bool,
+    carrier: Option<u8>,
 ) -> etherquic_play::CodecChoice {
     let mut video = applied.video.clone();
     if let Some(pin) = video_pin {
@@ -420,11 +648,17 @@ pub fn codec_choice_for(
         video_pin,
         audio_pin,
         max_width: 0,
+        max_height: 0,
         bitrate_kbps: 0,
         quality,
         dirty_rects,
         yuv,
         fps: applied.fps.wish(),
+        audio_bitrate_kbps: applied.audio_bitrate_kbps,
+        audio_channels: applied.audio_channels,
+        view_only,
+        exclusive,
+        carrier,
     }
 }
 
@@ -473,6 +707,56 @@ pub const HARDWARE_FPS: u32 = etherquic::negotiate::HARDWARE_FPS;
 
 /// Rates the window offers beside Auto and Match remote.
 pub const FPS_CHOICES: [u32; 4] = [15, 30, 60, 120];
+
+/// Stereo-equivalent audio bitrates the Connect row offers. Displayed values
+/// scale with the selected channel layout.
+pub const AUDIO_BITRATE_CHOICES: [u32; 6] = [48, 64, 96, 128, 160, 192];
+
+/// Channel layouts next to the audio dropdown. Auto is 2-channel stereo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioLayout {
+    pub channels: u16,
+    pub name: &'static str,
+}
+
+pub const AUDIO_LAYOUTS: [AudioLayout; 6] = [
+    AudioLayout {
+        channels: 0,
+        name: "Auto",
+    },
+    AudioLayout {
+        channels: 1,
+        name: "Mono",
+    },
+    AudioLayout {
+        channels: 2,
+        name: "Stereo",
+    },
+    AudioLayout {
+        channels: 3,
+        name: "2.1",
+    },
+    AudioLayout {
+        channels: 6,
+        name: "5.1",
+    },
+    AudioLayout {
+        channels: 8,
+        name: "7.1",
+    },
+];
+
+pub fn audio_layout_name(channels: u16) -> &'static str {
+    AUDIO_LAYOUTS
+        .iter()
+        .find(|layout| layout.channels == channels)
+        .map(|layout| layout.name)
+        .unwrap_or("Auto")
+}
+
+pub fn scale_audio_kbps(stereo_kbps: u32, channels: u16) -> u32 {
+    etherquic::negotiate::scale_audio_kbps(stereo_kbps, channels)
+}
 
 /// Auto is 15/30. Match remote follows the host display. A fixed rate is the number picked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -615,6 +899,10 @@ pub struct Preferences {
     pub trace_input: bool,
     /// Default rate for every connection, and the rate this PC captures at.
     pub fps: FrameRate,
+    /// Stereo-equivalent audio bitrate in kbit/s. Zero is Auto (96 stereo).
+    pub audio_bitrate_kbps: u32,
+    /// Max audio channels. Zero is Auto (2-channel stereo).
+    pub audio_channels: u16,
 }
 
 impl Preferences {
@@ -627,6 +915,8 @@ impl Preferences {
             skip_without_hw: false,
             trace_input: false,
             fps: FrameRate::Auto,
+            audio_bitrate_kbps: 0,
+            audio_channels: 0,
         }
     }
 }
@@ -687,7 +977,7 @@ fn store_preferences_at(path: &Path, prefs: &Preferences) -> Result<(), String> 
 
 fn render_preferences(prefs: &Preferences) -> String {
     format!(
-        "video={}\nvideo-off={}\naudio={}\nopus={}\nskip-without-hw={}\ntrace-input={}\nfps={}\n",
+        "video={}\nvideo-off={}\naudio={}\nopus={}\nskip-without-hw={}\ntrace-input={}\nfps={}\naudio-bitrate={}\naudio-channels={}\n",
         join_tokens(prefs.video.iter().map(|pref| pref.token())),
         join_tokens(prefs.video_off.iter().map(|pref| pref.token())),
         join_tokens(prefs.audio.iter().map(|codec| codec.token())),
@@ -695,6 +985,16 @@ fn render_preferences(prefs: &Preferences) -> String {
         yes_no(prefs.skip_without_hw),
         yes_no(prefs.trace_input),
         prefs.fps.token(),
+        if prefs.audio_bitrate_kbps == 0 {
+            "auto".to_string()
+        } else {
+            prefs.audio_bitrate_kbps.to_string()
+        },
+        if prefs.audio_channels == 0 {
+            "auto".to_string()
+        } else {
+            prefs.audio_channels.to_string()
+        },
     )
 }
 
@@ -706,6 +1006,8 @@ fn parse_preferences(text: &str) -> Preferences {
     let mut skip_without_hw = false;
     let mut trace_input = false;
     let mut fps = FrameRate::Auto;
+    let mut audio_bitrate_kbps = 0;
+    let mut audio_channels = 0;
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -722,6 +1024,12 @@ fn parse_preferences(text: &str) -> Preferences {
                     fps = rate;
                 }
             }
+            "audio-bitrate" => {
+                audio_bitrate_kbps = parse_audio_bitrate(value);
+            }
+            "audio-channels" => {
+                audio_channels = parse_audio_channels(value);
+            }
             _ => {}
         }
     }
@@ -736,6 +1044,30 @@ fn parse_preferences(text: &str) -> Preferences {
         skip_without_hw,
         trace_input,
         fps,
+        audio_bitrate_kbps,
+        audio_channels,
+    }
+}
+
+fn parse_audio_bitrate(value: &str) -> u32 {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") || value.is_empty() {
+        0
+    } else {
+        value.parse().unwrap_or(0)
+    }
+}
+
+fn parse_audio_channels(value: &str) -> u16 {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") || value.is_empty() {
+        0
+    } else {
+        value
+            .parse::<u16>()
+            .ok()
+            .map(|n| n.min(etherquic::negotiate::AUDIO_CHANNELS_MAX))
+            .unwrap_or(0)
     }
 }
 
@@ -828,6 +1160,11 @@ pub struct ConnectionOverride {
     pub fps: Option<FrameRate>,
     pub skip_without_hw: Option<bool>,
     pub trace_input: Option<bool>,
+    /// Carrier for the next session with this host. `None` keeps QUIC streams
+    /// and leaves the offer line off.
+    pub carrier: Option<u8>,
+    /// `plain` or `gcm`. Unset keeps UDP/RTP on `gcm` and ST 2110 on `plain`.
+    pub profile: Option<String>,
 }
 
 impl ConnectionOverride {
@@ -837,6 +1174,8 @@ impl ConnectionOverride {
             && self.fps.is_none()
             && self.skip_without_hw.is_none()
             && self.trace_input.is_none()
+            && self.carrier.is_none()
+            && self.profile.is_none()
     }
 }
 
@@ -848,6 +1187,10 @@ pub struct Applied {
     pub fps: FrameRate,
     pub skip_without_hw: bool,
     pub trace_input: bool,
+    pub audio_bitrate_kbps: u32,
+    pub audio_channels: u16,
+    /// Pinned carrier, or QUIC streams when this host has no pin.
+    pub carrier: u8,
     /// `true` when at least one field is pinned for this computer.
     pub custom: bool,
 }
@@ -874,6 +1217,11 @@ pub fn apply_override(prefs: &Preferences, over: Option<&ConnectionOverride>) ->
         trace_input: over
             .and_then(|over| over.trace_input)
             .unwrap_or(prefs.trace_input),
+        audio_bitrate_kbps: prefs.audio_bitrate_kbps,
+        audio_channels: prefs.audio_channels,
+        carrier: over
+            .and_then(|over| over.carrier)
+            .unwrap_or(etherquic::carrier::QUIC_STREAMS),
         custom: over.is_some(),
     }
 }
@@ -892,6 +1240,8 @@ fn pin_first<T: Copy + PartialEq>(order: &[T], pin: T) -> Vec<T> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectionPrefs {
     by_mac: Vec<(String, ConnectionOverride)>,
+    /// Host RTP input port from a standalone `rtp=<port>` line.
+    rtp_port: Option<u16>,
 }
 
 impl ConnectionPrefs {
@@ -954,6 +1304,11 @@ fn render_connections(prefs: &ConnectionPrefs) -> String {
         .collect();
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     let mut out = String::new();
+    if let Some(port) = prefs.rtp_port {
+        out.push_str("rtp=");
+        out.push_str(&port.to_string());
+        out.push('\n');
+    }
     for (mac, over) in rows {
         out.push_str(mac);
         if let Some(video) = over.video {
@@ -976,6 +1331,14 @@ fn render_connections(prefs: &ConnectionPrefs) -> String {
             out.push_str(" trace-input=");
             out.push_str(yes_no(trace));
         }
+        if let Some(carrier) = over.carrier {
+            out.push_str(" carrier=");
+            out.push_str(&carrier.to_string());
+        }
+        if let Some(profile) = &over.profile {
+            out.push_str(" profile=");
+            out.push_str(profile);
+        }
         out.push('\n');
     }
     out
@@ -986,6 +1349,20 @@ fn parse_connections(text: &str) -> ConnectionPrefs {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // A whole line `rtp=<port>`. A bad value does not clear a port already read.
+        if let Some(rest) = line.strip_prefix("rtp=") {
+            if !rest.is_empty()
+                && !rest.bytes().any(|byte| byte.is_ascii_whitespace())
+                && rest.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                if let Ok(port) = rest.parse::<u16>() {
+                    if port != 0 {
+                        prefs.rtp_port = Some(port);
+                    }
+                }
+            }
             continue;
         }
         let mut parts = line.split_whitespace();
@@ -1003,6 +1380,16 @@ fn parse_connections(text: &str) -> ConnectionPrefs {
                 "fps" => over.fps = FrameRate::from_token(value),
                 "skip-without-hw" => over.skip_without_hw = Some(parse_yes(value)),
                 "trace-input" => over.trace_input = Some(parse_yes(value)),
+                "carrier" => {
+                    if let Some(id) = value.parse::<u8>().ok().filter(|id| (1..=5).contains(id)) {
+                        over.carrier = Some(id);
+                    }
+                }
+                "profile" => {
+                    if value == "plain" || value == "gcm" {
+                        over.profile = Some(value.to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -1116,10 +1503,16 @@ mod tests {
             0,
             false,
             etherquic::negotiate::YuvFormat::YUV444P8,
+            false,
+            false,
+            None,
         );
         assert_eq!(choice.video.first(), Some(&PicturePref::Mjpeg));
+        assert_eq!(choice.carrier, None);
         assert_eq!(choice.video_pin, Some(PicturePref::Mjpeg));
         assert_eq!(choice.video.len(), applied.video.len());
+        assert_eq!(choice.max_width, 0);
+        assert_eq!(choice.max_height, 0);
     }
 
     #[test]
@@ -1291,6 +1684,8 @@ mod tests {
         assert_eq!(partial.opus.len(), 3);
         assert!(!partial.skip_without_hw);
         assert_eq!(partial.fps, FrameRate::Auto);
+        assert_eq!(partial.audio_bitrate_kbps, 0);
+        assert_eq!(partial.audio_channels, 0);
 
         let path = std::env::temp_dir().join(format!(
             "etherquic-prefs-{}-{}.txt",
@@ -1331,6 +1726,26 @@ mod tests {
         assert!(sender_hardware_encode(Some(PicturePref::Pyrowave)));
         assert!(!sender_hardware_encode(Some(PicturePref::PyrowaveCpu)));
         assert!(!sender_hardware_encode(Some(PicturePref::H264Sw)));
+    }
+
+    #[test]
+    fn audio_bitrate_chips_scale_with_layout() {
+        assert_eq!(scale_audio_kbps(96, 2), 96);
+        assert_eq!(scale_audio_kbps(96, 3), 108);
+        assert_eq!(scale_audio_kbps(96, 6), 128);
+        assert_eq!(scale_audio_kbps(96, 8), 144);
+        assert_eq!(audio_layout_name(0), "Auto");
+        assert_eq!(audio_layout_name(6), "5.1");
+        let mut prefs = Preferences::baseline();
+        prefs.audio_bitrate_kbps = 96;
+        prefs.audio_channels = 6;
+        let loaded = parse_preferences(&render_preferences(&prefs));
+        assert_eq!(loaded.audio_bitrate_kbps, 96);
+        assert_eq!(loaded.audio_channels, 6);
+        assert_eq!(
+            parse_preferences("audio-bitrate=auto\naudio-channels=auto\n").audio_channels,
+            0
+        );
     }
 
     #[test]
@@ -1431,5 +1846,134 @@ not-a-mac video=mjpeg
         assert_eq!(parse_connections(&body), loaded);
         assert!(body.contains("video=mjpeg"));
         assert!(!body.contains("not-a-mac"));
+
+        let pinned = "020000000003 carrier=3 carrier=9\n020000000004 carrier=0\n";
+        let loaded = parse_connections(pinned);
+        let key = mac_key([2, 0, 0, 0, 0, 3]);
+        let over = loaded.get(&key).unwrap();
+        assert_eq!(over.carrier, Some(3));
+        assert!(!over.is_empty());
+        assert!(loaded.get(&mac_key([2, 0, 0, 0, 0, 4])).is_none());
+        let again = parse_connections(&render_connections(&loaded));
+        assert_eq!(again.get(&key).unwrap().carrier, Some(3));
+        let marked = "\
+020000000006 carrier=3 profile=gcm profile=nope
+020000000007 profile=bogus
+";
+        let loaded = parse_connections(marked);
+        let key = mac_key([2, 0, 0, 0, 0, 6]);
+        let over = loaded.get(&key).unwrap();
+        assert_eq!(over.carrier, Some(3));
+        assert_eq!(over.profile.as_deref(), Some("gcm"));
+        assert!(!over.is_empty());
+        assert!(loaded.get(&mac_key([2, 0, 0, 0, 0, 7])).is_none());
+        let again = parse_connections(&render_connections(&loaded));
+        assert_eq!(again.get(&key).unwrap().profile.as_deref(), Some("gcm"));
+        assert!(render_connections(&loaded).contains("profile=gcm"));
+        let applied = apply_override(&Preferences::baseline(), Some(over));
+        assert_eq!(applied.carrier, 3);
+        assert_eq!(
+            apply_override(&Preferences::baseline(), None).carrier,
+            etherquic::carrier::QUIC_STREAMS
+        );
+        let choice = codec_choice_for(
+            &applied,
+            None,
+            None,
+            0,
+            false,
+            etherquic::negotiate::YuvFormat::YUV444P8,
+            false,
+            false,
+            over.carrier,
+        );
+        assert_eq!(choice.carrier, Some(3));
+
+        let with_rtp = "\
+rtp=21002
+020000000006 carrier=3 profile=gcm
+rtp=0
+rtp=nope
+";
+        let loaded = parse_connections(with_rtp);
+        assert_eq!(loaded.rtp_port, Some(21002));
+        assert_eq!(loaded.get(&key).unwrap().carrier, Some(3));
+        let again = parse_connections(&render_connections(&loaded));
+        assert_eq!(again, loaded);
+        assert!(render_connections(&loaded).starts_with("rtp=21002\n"));
+        let mut dropped = loaded.clone();
+        dropped.rtp_port = None;
+        dropped.set(key, ConnectionOverride::default());
+        assert!(render_connections(&dropped).is_empty());
+    }
+
+    #[test]
+    fn local_codec_rows_put_library_errors_on_the_codec() {
+        use etherquic::negotiate::{EncodeCap, HostCaps, Limit};
+        let machine = MachineCodecs::from_rows(vec![
+            (
+                CodecId::Mjpeg,
+                EndSupport {
+                    cpu_can_sustain: true,
+                    ..EndSupport::default()
+                },
+            ),
+            (
+                CodecId::H264,
+                EndSupport {
+                    hardware_encode: true,
+                    ..EndSupport::default()
+                },
+            ),
+        ]);
+        let probe = Probe {
+            caps: HostCaps {
+                video: vec![
+                    EncodeCap {
+                        video: Video::Mjpeg,
+                        encoder: "jpeg".into(),
+                        limit: Limit::NONE,
+                    },
+                    EncodeCap {
+                        video: Video::H264Hw,
+                        encoder: "h264_nvenc".into(),
+                        limit: Limit::NONE,
+                    },
+                ],
+                audio: vec![],
+            },
+            decodes: vec![],
+            audio_decodes: vec![],
+            notes: vec![
+                "ffmpeg: /usr/bin/ffmpeg".into(),
+                "pyrowave encode: libpyrowave-shared not found".into(),
+            ],
+        };
+        let rows = local_codec_rows(&machine, Some(&probe), false);
+        let pyro = rows.iter().find(|row| row.id == CodecId::Pyrowave).unwrap();
+        assert!(!pyro.software && !pyro.hardware);
+        assert_eq!(pyro.backend, "—");
+        let err = pyro.error.as_deref().unwrap();
+        assert!(err.contains("Pyrowave library: not found"), "{err}");
+        assert!(err.contains("pyrowave encode:"), "{err}");
+        let jpegxs = rows.iter().find(|row| row.id == CodecId::JpegXs).unwrap();
+        assert!(!jpegxs.software && !jpegxs.hardware);
+        assert!(jpegxs
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("ffmpeg encoder"));
+        let h264 = rows.iter().find(|row| row.id == CodecId::H264).unwrap();
+        assert!(!h264.software && h264.hardware);
+        assert_eq!(h264.backend, "h264_nvenc");
+        assert!(h264.error.is_none());
+        assert!(h264.i_frame && h264.p_frame && !h264.b_frame);
+        let mjpeg = rows.iter().find(|row| row.id == CodecId::Mjpeg).unwrap();
+        assert!(mjpeg.software && !mjpeg.hardware);
+        assert_eq!(mjpeg.backend, "jpeg");
+        assert!(mjpeg.error.is_none());
+        let text = codec_table_text(&rows);
+        assert!(text.contains("codec\tSW\tHW\tbackend\terror"));
+        assert!(text.contains("H.264\tno\tyes\th264_nvenc"));
     }
 }

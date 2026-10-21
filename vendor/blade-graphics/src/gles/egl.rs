@@ -90,6 +90,11 @@ struct EglContext {
     srgb_kind: SrgbFrameBufferKind,
 }
 
+// khronos-egl's Display/Context/Surface are raw pointers, so they are not
+// Send. Android EGL objects are safe to move between threads, and this
+// context stays behind ContextInner's mutex.
+unsafe impl Send for EglContext {}
+
 impl EglContext {
     fn make_current(&self) {
         self.instance

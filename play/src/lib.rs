@@ -10,11 +10,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod args;
 mod ack;
 mod capture;
 mod chat;
 mod clipboard;
 mod codec;
+mod debug_log;
 mod desk_io;
 pub mod hostinfo;
 mod join;
@@ -22,6 +24,7 @@ mod keystrokes;
 pub mod negotiated;
 mod outbox;
 mod pad;
+pub mod parent_ctl;
 mod picture;
 mod picture_hub;
 mod pipes;
@@ -61,17 +64,21 @@ pub use picture::{
     blit_rgb, decode_jpeg, decode_picture, encode_jpeg, encode_picture, fit_rgba, stroke_rgb,
     Picture, PictureCodec,
 };
+pub use debug_log::{enabled as debug_trace, lines as debug_lines, push as push_debug, set_enabled as set_debug_trace};
 pub use picture_hub::{
-    close_picture, hold_picture, open_picture, shown_picture, switch_picture, PictureSeat,
+    close_picture, hold_picture, open_picture, request_raise, shown_picture, switch_picture,
+    take_raise, PictureSeat,
 };
 pub use pipes::Pipes;
 pub use pointer::{ei_absolute, place_pointer, wayland_wheel, PointerPlace};
 pub use session::{
-    play, play_session, resample, serve, serve_session, AudioChunk, HostMedia, LiveOffer,
-    PlayerMedia,
+    live_tune, play, play_session, resample, serve, serve_session, snapshot_tune, AudioChunk,
+    HostMedia, LiveOffer, LiveTune, PlayerMedia, SessionTune,
 };
 pub use svc::{drop_jitter_enhancement, SvcLayer};
 pub use transfer::{submit_file, NamedFile};
+pub use etherquic::fruc::FrameGen;
+pub use etherquic::upscale::Upscale;
 pub use view_options::{
     live, place, slot_for, snapshot, to_remote, CursorMode, LiveView, PadSlot, Placement,
     ScaleMode, SizeMatch, ViewOptions, PAD_SLOTS,

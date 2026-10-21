@@ -51,7 +51,10 @@ impl Resampler {
 }
 
 pub enum AudioEncoder {
-    Pcm,
+    Pcm {
+        in_channels: u16,
+        channels: u16,
+    },
     Opus {
         inner: opus::Encoder,
         resampler: Resampler,
@@ -61,18 +64,64 @@ pub enum AudioEncoder {
     },
 }
 
+/// Cap at capture. Auto (0) is stereo. Never upmix.
+pub fn capped_channels(in_channels: u16, max_channels: u16) -> u16 {
+    let want = crate::negotiate::audio_channels_or_auto(max_channels);
+    in_channels.min(want).max(1)
+}
+
+/// Downmix interleaved PCM to `out_ch` channels. Extra channels are dropped;
+/// mono is an average of the frame.
+pub fn mix_channels(samples: &[i16], in_ch: usize, out_ch: usize) -> Vec<i16> {
+    if in_ch == 0 || out_ch == 0 {
+        return Vec::new();
+    }
+    if in_ch == out_ch {
+        return samples.to_vec();
+    }
+    let mut out = Vec::with_capacity((samples.len() / in_ch) * out_ch);
+    for frame in samples.chunks_exact(in_ch) {
+        if out_ch == 1 {
+            let sum: i32 = frame.iter().map(|s| i32::from(*s)).sum();
+            out.push((sum / in_ch as i32) as i16);
+        } else {
+            let take = in_ch.min(out_ch);
+            out.extend_from_slice(&frame[..take]);
+            if out_ch > in_ch {
+                out.extend(std::iter::repeat(0i16).take(out_ch - in_ch));
+            }
+        }
+    }
+    out
+}
+
 impl AudioEncoder {
     /// Rate and channel count the stream carries.
+    ///
+    /// `max_channels` 0 is Auto (stereo). `stereo_kbps` 0 is Auto (96 kbps stereo,
+    /// scaled to the channels actually sent). Opus is 1 or 2 channels.
     pub fn open(
         audio: Audio,
         in_rate: u32,
         in_channels: u16,
+        max_channels: u16,
+        stereo_kbps: u32,
     ) -> Result<(AudioEncoder, u32, u16), String> {
+        let channels = capped_channels(in_channels, max_channels);
         match audio {
-            Audio::Pcm => Ok((AudioEncoder::Pcm, in_rate, in_channels)),
+            Audio::Pcm => Ok((
+                AudioEncoder::Pcm {
+                    in_channels,
+                    channels,
+                },
+                in_rate,
+                channels,
+            )),
             Audio::Opus => {
-                let channels = in_channels.clamp(1, 2);
-                let inner = opus::Encoder::new(channels, opus::DEFAULT_BITRATE)?;
+                let channels = channels.min(2);
+                let kbps = crate::negotiate::scale_audio_kbps(stereo_kbps, channels);
+                let bitrate = (kbps.max(1) * 1000) as i32;
+                let inner = opus::Encoder::new(channels, bitrate)?;
                 let resampler = Resampler::new(in_rate, opus::RATE, channels as usize);
                 Ok((
                     AudioEncoder::Opus {
@@ -93,7 +142,7 @@ impl AudioEncoder {
     /// True when the next chunk has a format this encoder was not opened for.
     pub fn changed(&self, pcm: &Pcm) -> bool {
         match self {
-            AudioEncoder::Pcm => false,
+            AudioEncoder::Pcm { in_channels, .. } => *in_channels != pcm.channels,
             AudioEncoder::Opus {
                 in_rate,
                 in_channels,
@@ -105,7 +154,22 @@ impl AudioEncoder {
     /// Data record payloads for this chunk.
     pub fn push(&mut self, pcm: &Pcm) -> Result<Vec<Vec<u8>>, String> {
         match self {
-            AudioEncoder::Pcm => Ok(vec![pcm.encode()]),
+            AudioEncoder::Pcm {
+                in_channels,
+                channels,
+            } => {
+                let mixed = mix_channels(
+                    &pcm.samples,
+                    (*in_channels).max(1) as usize,
+                    (*channels).max(1) as usize,
+                );
+                Ok(vec![Pcm {
+                    sample_rate: pcm.sample_rate,
+                    channels: *channels,
+                    samples: mixed,
+                }
+                .encode()])
+            }
             AudioEncoder::Opus {
                 inner,
                 resampler,
@@ -113,21 +177,11 @@ impl AudioEncoder {
                 channels,
                 ..
             } => {
-                let inch = (*in_channels).max(1) as usize;
-                let outch = *channels as usize;
-                let picked: Vec<i16> = if inch == outch {
-                    pcm.samples.clone()
-                } else if outch == 1 {
-                    pcm.samples
-                        .chunks_exact(inch)
-                        .map(|f| (f.iter().map(|s| *s as i32).sum::<i32>() / inch as i32) as i16)
-                        .collect()
-                } else {
-                    pcm.samples
-                        .chunks_exact(inch)
-                        .flat_map(|f| [f[0], f[1]])
-                        .collect()
-                };
+                let picked = mix_channels(
+                    &pcm.samples,
+                    (*in_channels).max(1) as usize,
+                    (*channels).max(1) as usize,
+                );
                 inner.push(&resampler.run(&picked))
             }
         }
@@ -176,5 +230,17 @@ mod tests {
         }
         // 1 s of 44.1 kHz is 48000 frames, give or take one.
         assert!((total as i64 - 48_000).abs() <= 2, "{total}");
+    }
+
+    #[test]
+    fn mix_drops_extra_channels_and_averages_to_mono() {
+        let five_one: Vec<i16> = (0..6).collect();
+        assert_eq!(mix_channels(&five_one, 6, 2), vec![0, 1]);
+        assert_eq!(mix_channels(&five_one, 6, 6), five_one);
+        let stereo = vec![10i16, 30];
+        assert_eq!(mix_channels(&stereo, 2, 1), vec![20]);
+        assert_eq!(capped_channels(8, 0), 2);
+        assert_eq!(capped_channels(8, 6), 6);
+        assert_eq!(capped_channels(2, 8), 2);
     }
 }

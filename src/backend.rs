@@ -553,6 +553,27 @@ pub fn nvidia_present() -> bool {
     }
 }
 
+/// Intel graphics that XeSS would target.
+pub fn intel_present() -> bool {
+    #[cfg(windows)]
+    {
+        [
+            r"C:\Windows\System32\igd10iumd64.dll",
+            r"C:\Windows\System32\igxelpicd64.dll",
+        ]
+        .iter()
+        .any(|path| Path::new(path).is_file())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/sys/module/i915").exists() || Path::new("/sys/module/xe").exists()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
 /// Where a macOS build looks for a dylib: the app bundle's `Frameworks`,
 /// the dyld paths, then Homebrew and `/usr/local`.
 #[cfg(target_os = "macos")]

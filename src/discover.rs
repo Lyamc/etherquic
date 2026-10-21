@@ -27,7 +27,8 @@
 //! [`TLV_CAPS`] carries [`Capabilities`] and [`TLV_THUMBNAIL`] a JPEG XL
 //! desktop thumbnail sized to the room left in the frame. [`TLV_RELEASE`]
 //! carries this build's etherquic version and the operating system's name
-//! and version. Unknown types are skipped, so later records do not break
+//! and version. [`TLV_RTP`] carries the host's RTP input port.
+//! Unknown types are skipped, so later records do not break
 //! this reader. An unmarked announce (an older player) always gets the old
 //! offer, which that player accepts.
 //!
@@ -76,6 +77,10 @@ pub const TLV_CAPS: u8 = 1;
 pub const TLV_THUMBNAIL: u8 = 2;
 /// Etherquic version and operating system. Older players skip this type.
 pub const TLV_RELEASE: u8 = 3;
+/// Carrier ids this host can open. At most eight. Older players skip this type.
+pub const TLV_CARRIERS: u8 = 4;
+/// RTP input port, u16 big-endian. Older players skip this type.
+pub const TLV_RTP: u8 = 5;
 /// Below this a thumbnail is not worth sending.
 pub const MIN_THUMBNAIL: usize = 64;
 const ANNOUNCE: u8 = 1;
@@ -187,6 +192,11 @@ pub struct Found {
     pub thumbnail: Option<Vec<u8>>,
     /// Etherquic version and operating system. `None` from an older host.
     pub release: Option<Release>,
+    /// Carrier ids from [`TLV_CARRIERS`]. Empty when that TLV was absent,
+    /// which means carrier 1 only.
+    pub carriers: Vec<u8>,
+    /// RTP input port from [`TLV_RTP`]. `0` when the offer did not carry one.
+    pub rtp_port: u16,
     /// Answered over raw Ethernet.
     pub via_l2: bool,
     /// Answered over UDP.
@@ -780,6 +790,10 @@ pub trait OfferExtras: Send + Sync {
     fn release(&self) -> Release {
         local_release()
     }
+    /// Carrier ids for [`TLV_CARRIERS`]. Empty omits the TLV (carrier 1 only).
+    fn carriers(&self) -> Vec<u8> {
+        crate::carrier::local_carriers(0)
+    }
 }
 
 /// No capabilities and no picture. A version-3 offer still carries the driver byte.
@@ -1004,32 +1018,32 @@ pub fn serve_udp(
         ipv4: Vec::new(),
         ipv6: Vec::new(),
     });
-    // Bind IPv6 first: on Linux that socket is dual-stack and the IPv4 bind
-    // then fails, which is fine. On Windows it is IPv6-only and both bind.
+    // IPv4 and IPv6 are separate sockets. The IPv6 one is IPv6-only.
+    // A dual-stack `[::]` socket does not receive IPv4 broadcasts, and a
+    // broadcast is how another computer finds this one.
     let mut sockets = Vec::new();
+    let mut v6_at = None;
     let mut last_err = String::new();
     for addr in [
-        SocketAddr::from((Ipv6Addr::UNSPECIFIED, UDP_PORT)),
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, UDP_PORT)),
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, UDP_PORT)),
     ] {
-        match UdpSocket::bind(addr) {
+        match bind_discovery_socket(addr) {
             Ok(socket) => {
-                if socket
-                    .set_read_timeout(Some(Duration::from_millis(50)))
-                    .is_ok()
-                {
-                    sockets.push(socket);
+                if addr.is_ipv6() {
+                    v6_at = Some(sockets.len());
                 }
+                sockets.push(socket);
             }
-            Err(err) => last_err = format!("bind {addr}: {err}"),
+            Err(err) => last_err = err,
         }
     }
     if sockets.is_empty() {
         return Err(last_err);
     }
-    if let Some(v6) = sockets.first() {
+    if let Some(index) = v6_at {
         let scope = ipv6_scope(&info.name);
-        let _ = v6.join_multicast_v6(&ALL_NODES, scope);
+        let _ = sockets[index].join_multicast_v6(&ALL_NODES, scope);
     }
     let mut buf = [0u8; 2048];
     while !stop.load(Ordering::SeqCst) {
@@ -1051,6 +1065,31 @@ pub fn serve_udp(
 }
 
 const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// One discovery socket. IPv6 is IPv6-only so the same port can also be IPv4.
+fn bind_discovery_socket(addr: SocketAddr) -> Result<UdpSocket, String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|err| format!("udp {addr}: {err}"))?;
+    if addr.is_ipv6() {
+        socket
+            .set_only_v6(true)
+            .map_err(|err| format!("udp {addr}: {err}"))?;
+    }
+    socket
+        .bind(&addr.into())
+        .map_err(|err| format!("bind {addr}: {err}"))?;
+    let socket: UdpSocket = socket.into();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(|err| format!("udp {addr}: {err}"))?;
+    Ok(socket)
+}
 
 /// Payload room for a reply to `peer`. An IPv4-mapped peer is IPv4 on the wire.
 pub fn udp_limit(peer: &SocketAddr) -> usize {
@@ -1130,6 +1169,8 @@ struct Acc {
     caps: Option<Capabilities>,
     thumbnail: Option<Vec<u8>>,
     release: Option<Release>,
+    carriers: Vec<u8>,
+    rtp_port: u16,
     via_l2: bool,
     via_udp: bool,
     name: String,
@@ -1165,6 +1206,8 @@ impl Acc {
             caps: self.caps,
             thumbnail: self.thumbnail,
             release: self.release,
+            carriers: self.carriers,
+            rtp_port: self.rtp_port,
             via_l2: self.via_l2,
             via_udp: self.via_udp,
         }
@@ -1260,6 +1303,8 @@ fn note_offer(
         caps: None,
         thumbnail: None,
         release: None,
+        carriers: Vec::new(),
+        rtp_port: 0,
         via_l2: false,
         via_udp: false,
         name: info.name.clone(),
@@ -1294,6 +1339,12 @@ fn note_offer(
     if info.release.is_some() {
         row.release = info.release;
     }
+    if !info.carriers.is_empty() {
+        row.carriers = info.carriers;
+    }
+    if info.rtp_port != 0 {
+        row.rtp_port = info.rtp_port;
+    }
     // Keep the larger picture: the L2 and UDP replies may differ in room.
     if let Some(thumb) = info.thumbnail {
         if row
@@ -1322,6 +1373,8 @@ struct OfferBody {
     caps: Option<Capabilities>,
     thumbnail: Option<Vec<u8>>,
     release: Option<Release>,
+    carriers: Vec<u8>,
+    rtp_port: u16,
 }
 
 fn announce_frame(src: Mac, id: u32) -> Frame {
@@ -1408,6 +1461,14 @@ pub fn offer_payload(
     if payload.len() + TLV_HEADER + release.len() <= limit {
         push_tlv(&mut payload, TLV_RELEASE, &release);
     }
+    let carriers = crate::carrier::encode_carrier_tlv(&extras.carriers());
+    if carriers.len() > 1 && payload.len() + TLV_HEADER + carriers.len() <= limit {
+        push_tlv(&mut payload, TLV_CARRIERS, &carriers);
+    }
+    let rtp = crate::carrier::bound_input_port();
+    if rtp != 0 && payload.len() + TLV_HEADER + 2 <= limit {
+        push_tlv(&mut payload, TLV_RTP, &rtp.to_be_bytes());
+    }
     if let Some(budget) = thumbnail_budget(limit, payload.len()) {
         if let Some(thumb) = extras.thumbnail(budget) {
             if !thumb.is_empty() && thumb.len() <= budget {
@@ -1417,6 +1478,13 @@ pub fn offer_payload(
     }
     debug_assert!(payload.len() <= limit);
     payload
+}
+
+/// Carrier ids on a version-3 offer. `Some(empty)` is a parsed offer with no
+/// [`TLV_CARRIERS`] (carrier 1 only). `None` is not an offer. An unknown TLV
+/// does not fail the parse.
+pub fn offered_carriers(payload: &[u8]) -> Option<Vec<u8>> {
+    decode_offer(payload).map(|(_, body)| body.carriers)
 }
 
 fn push_tlv(payload: &mut Vec<u8>, kind: u8, value: &[u8]) {
@@ -1589,6 +1657,8 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
     let mut caps = None;
     let mut thumbnail = None;
     let mut release = None;
+    let mut carriers = Vec::new();
+    let mut rtp_port = 0u16;
     let (video, audio, l2_backend) = if version == VERSION {
         if !rest.is_empty() {
             return None;
@@ -1619,6 +1689,19 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
                 TLV_CAPS => caps = Capabilities::parse(value),
                 TLV_THUMBNAIL => thumbnail = Some(value.to_vec()),
                 TLV_RELEASE => release = Release::parse(value),
+                TLV_CARRIERS => {
+                    if let Some(ids) = crate::carrier::parse_carrier_tlv(value) {
+                        carriers = ids;
+                    }
+                }
+                TLV_RTP => {
+                    if value.len() == 2 {
+                        let port = u16::from_be_bytes([value[0], value[1]]);
+                        if port != 0 {
+                            rtp_port = port;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1638,8 +1721,66 @@ fn decode_offer(payload: &[u8]) -> Option<(u32, OfferBody)> {
             caps,
             thumbnail,
             release,
+            carriers,
+            rtp_port,
         },
     ))
+}
+
+/// RTP input port carried by one offer. `None` when the offer has no [`TLV_RTP`].
+pub fn rtp_input_port(payload: &[u8]) -> Option<u16> {
+    let (_, body) = decode_offer(payload)?;
+    (body.rtp_port != 0).then_some(body.rtp_port)
+}
+
+/// One offer from `ip` on the discovery port that carries [`TLV_RTP`].
+pub fn fetch_offer(ip: IpAddr) -> Option<Vec<u8>> {
+    let bind = if ip.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .ok()?;
+    let announce = encode_header(VERSION, ANNOUNCE, EXT_MARK | 7);
+    let dest = SocketAddr::new(ip, UDP_PORT);
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        let _ = socket.send_to(&announce, dest);
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) if from.ip() == ip => {
+                let payload = buf[..n].to_vec();
+                if rtp_input_port(&payload).is_some() {
+                    return Some(payload);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Ask `ip` on the discovery port for its RTP input. The QUIC service port is not used.
+pub fn ask_rtp_input(ip: IpAddr) -> Option<u16> {
+    rtp_input_port(&fetch_offer(ip)?)
+}
+
+/// Host IP and RTP input port from one offer.
+///
+/// The IP is the first announced address. The port is [`TLV_RTP`]. The QUIC
+/// service port is not a substitute.
+pub fn offer_rtp_socket(payload: &[u8]) -> Option<SocketAddr> {
+    let (_, body) = decode_offer(payload)?;
+    let ip = body
+        .ipv4
+        .first()
+        .copied()
+        .map(IpAddr::V4)
+        .or_else(|| body.ipv6.first().copied().map(IpAddr::V6))?;
+    crate::carrier::rtp_socket(Some(ip), body.rtp_port, body.l3_port)
 }
 
 fn split_header(payload: &[u8]) -> Option<(u8, u8, u32, &[u8])> {
@@ -2295,5 +2436,52 @@ CurrentBuildNumber    REG_SZ    2600
         push_tlv(&mut marked, 0x7f, b"later");
         let (_, body) = decode_offer(&marked).unwrap();
         assert_eq!(body.release.unwrap(), rel);
+    }
+
+    #[test]
+    fn carrier_tlv_parses_and_an_unknown_tlv_does_not_drop_the_offer() {
+        let extras = Fixed {
+            caps: None,
+            short_by: None,
+        };
+        let payload = offer_payload(EXT_MARK | 11, &card(), &info(), &extras, L2_PAYLOAD_LIMIT);
+        assert_eq!(payload[4], VERSION_EXT);
+        let ids = offered_carriers(&payload).expect("offer parses");
+        assert_eq!(ids, extras.carriers());
+        assert!(!ids.is_empty());
+        assert!(ids.len() <= crate::carrier::MAX_CARRIERS);
+        let mut with_unknown = payload.clone();
+        push_tlv(&mut with_unknown, 9, b"mystery");
+        assert_eq!(offered_carriers(&with_unknown).unwrap(), ids);
+        let old = legacy_payload(5, &card(), &info());
+        assert_eq!(offered_carriers(&old).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            crate::carrier::effective_carriers(&offered_carriers(&old).unwrap()),
+            vec![crate::carrier::QUIC_STREAMS]
+        );
+    }
+
+    #[test]
+    fn ipv4_announces_arrive_while_ipv6_is_bound() {
+        let mut pair = None;
+        for port in 40_000..40_200 {
+            let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+            let Ok(v4) = bind_discovery_socket(v4) else {
+                continue;
+            };
+            let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+            let v6 = bind_discovery_socket(v6).expect("IPv6-only socket shares the discovery port");
+            pair = Some((v4, v6, port));
+            break;
+        }
+        let (v4, _v6, port) = pair.expect("a free UDP port");
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let announce = b"EQDS\x01\x01\x00\x00\x00\x2a";
+        sender
+            .send_to(announce, (Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (len, _) = v4.recv_from(&mut buf).expect("IPv4 announce");
+        assert_eq!(&buf[..len], announce);
     }
 }

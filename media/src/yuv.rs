@@ -393,6 +393,33 @@ mod tests {
     }
 
     #[test]
+    fn i420_bytes_match_the_depth8_planes() {
+        let width = 8u32;
+        let height = 6u32;
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgb.extend_from_slice(&[(x * 30 + y) as u8, (255 - x * 10) as u8, (y * 40) as u8]);
+            }
+        }
+        let frame = Frame {
+            width,
+            height,
+            rgb,
+        };
+        let mut planes = YuvPlanes::new(width as usize, height as usize, YuvFormat::YUV420P8);
+        rgb_to_yuv(&frame, &mut planes);
+        let mut direct = I420::new(width as usize, height as usize);
+        rgb_to_i420(&frame, &mut direct);
+        let y: Vec<u8> = planes.y.iter().map(|sample| *sample as u8).collect();
+        let u: Vec<u8> = planes.u.iter().map(|sample| *sample as u8).collect();
+        let v: Vec<u8> = planes.v.iter().map(|sample| *sample as u8).collect();
+        assert_eq!(y, direct.y);
+        assert_eq!(u, direct.u);
+        assert_eq!(v, direct.v);
+    }
+
+    #[test]
     fn chroma_keeps_a_saturated_pixel_in_a_mixed_block() {
         // Three white, one red — coloured UI on a light desk.
         let frame = Frame {

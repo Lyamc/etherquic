@@ -34,6 +34,128 @@ pub struct Nic {
     pub description: String,
 }
 
+/// A physical cable or radio, a virtual adapter, or a capture pseudo-device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IfaceKind {
+    Physical,
+    Virtual,
+    Loopback,
+    /// `any`, netfilter, and other devices that are not a link.
+    Capture,
+}
+
+impl IfaceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Physical => "physical",
+            Self::Virtual => "virtual",
+            Self::Loopback => "loopback",
+            Self::Capture => "capture",
+        }
+    }
+}
+
+/// One adapter the desk can listen on, with the addresses next to its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfaceFace {
+    pub name: String,
+    pub description: String,
+    pub mac: Option<Mac>,
+    pub ipv4: Vec<Ipv4Addr>,
+    pub ipv6: Vec<Ipv6Addr>,
+    pub kind: IfaceKind,
+}
+
+/// Classify a pcap or OS interface name. Virtual and loopback stay visible so
+/// the desk can show them apart from a real link.
+pub fn iface_kind(name: &str) -> IfaceKind {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return IfaceKind::Capture;
+    }
+    if lower == "lo"
+        || lower.starts_with("loopback")
+        || (lower.starts_with("lo")
+            && lower.len() > 2
+            && lower[2..].chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return IfaceKind::Loopback;
+    }
+    const CAPTURE: &[&str] = &["any", "nflog", "nfqueue", "dbus", "pktap"];
+    if CAPTURE.iter().any(|skip| lower == *skip) {
+        return IfaceKind::Capture;
+    }
+    const VIRTUAL: &[&str] = &[
+        "bluetooth",
+        "docker",
+        "veth",
+        "virbr",
+        "tun",
+        "tap",
+        "tailscale",
+        "nordlynx",
+        "br-",
+        "wg",
+        "awdl",
+        "llw",
+        "gif",
+        "stf",
+        "feth",
+        "vmnet",
+        "ap1",
+        "bridge",
+        "p2p",
+        "anpi",
+    ];
+    if VIRTUAL
+        .iter()
+        .any(|skip| lower == *skip || lower.contains(skip))
+    {
+        IfaceKind::Virtual
+    } else {
+        IfaceKind::Physical
+    }
+}
+
+/// Every adapter pcap lists, including virtual ones. Empty on Android.
+pub fn list_faces() -> Result<Vec<IfaceFace>> {
+    #[cfg(target_os = "android")]
+    {
+        Ok(Vec::new())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let devs = pcap::Device::list().map_err(map_pcap)?;
+        Ok(devs
+            .into_iter()
+            .map(|dev| {
+                let mut ipv4 = Vec::new();
+                let mut ipv6 = Vec::new();
+                for address in &dev.addresses {
+                    match address.addr {
+                        IpAddr::V4(ip) if usable_v4(ip) => ipv4.push(ip),
+                        IpAddr::V6(ip) if usable_v6(ip) => ipv6.push(ip),
+                        _ => {}
+                    }
+                }
+                ipv4.sort_by_key(|ip| u8::from(ip.is_link_local()));
+                ipv6.sort_by_key(|ip| u8::from(ip.is_unicast_link_local()));
+                ipv4.truncate(4);
+                ipv6.truncate(4);
+                let name = dev.name;
+                IfaceFace {
+                    mac: read_hw_mac(&name),
+                    description: dev.desc.unwrap_or_default(),
+                    kind: iface_kind(&name),
+                    name,
+                    ipv4,
+                    ipv6,
+                }
+            })
+            .collect())
+    }
+}
+
 /// Adapter chosen for an announcement: hardware MAC when sysfs has it, plus its addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceInfo {
@@ -202,38 +324,7 @@ fn choose_device(devs: Vec<pcap::Device>, want: Option<&str>) -> Result<pcap::De
 
 #[cfg(not(target_os = "android"))]
 fn cable_nic(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    const SKIP: &[&str] = &[
-        "any",
-        "lo",
-        "nflog",
-        "nfqueue",
-        "dbus",
-        "bluetooth",
-        "docker",
-        "veth",
-        "virbr",
-        "tun",
-        "tap",
-        "tailscale",
-        "nordlynx",
-        "br-",
-        "wg",
-        "awdl",
-        "llw",
-        "gif",
-        "stf",
-        "pktap",
-        "feth",
-        "vmnet",
-        "ap1",
-        "bridge",
-        "p2p",
-        "anpi",
-    ];
-    !SKIP
-        .iter()
-        .any(|skip| lower == *skip || lower.contains(skip))
+    iface_kind(name) == IfaceKind::Physical
 }
 
 #[cfg(not(target_os = "android"))]
@@ -359,6 +450,12 @@ impl Link {
         self.cap.sendpacket(frame).map_err(map_pcap)?;
         crate::capture::note_ether(crate::capture::DIR_SEND, frame);
         Ok(())
+    }
+
+    /// pcap fd the Linux I/O thread polls together with the send-wake pipe.
+    #[cfg(target_os = "linux")]
+    pub fn poll_fd(&self) -> std::os::unix::io::RawFd {
+        std::os::unix::io::AsRawFd::as_raw_fd(&self.cap)
     }
 
     /// Next matching frame, or `Ok(None)` on timeout.
@@ -499,6 +596,19 @@ mod tests {
         assert_eq!(reason_for(HostOs::Windows, false), None);
         assert_eq!(reason_for(HostOs::Mac, true), None);
         assert_eq!(reason_for(HostOs::Mac, false), Some("macOS BPF needs root"));
+    }
+
+    #[test]
+    fn iface_kind_separates_real_links_from_virtual_ones() {
+        assert_eq!(iface_kind("enp5s0"), IfaceKind::Physical);
+        assert_eq!(iface_kind("wlan0"), IfaceKind::Physical);
+        assert_eq!(iface_kind("docker0"), IfaceKind::Virtual);
+        assert_eq!(iface_kind("tailscale0"), IfaceKind::Virtual);
+        assert_eq!(iface_kind("veth123"), IfaceKind::Virtual);
+        assert_eq!(iface_kind("lo"), IfaceKind::Loopback);
+        assert_eq!(iface_kind("lo0"), IfaceKind::Loopback);
+        assert_eq!(iface_kind("any"), IfaceKind::Capture);
+        assert_eq!(iface_kind("nflog"), IfaceKind::Capture);
     }
 
     #[test]

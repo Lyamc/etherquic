@@ -218,9 +218,10 @@ pub fn fit_rgba(rgba: &[u8], width: u32, height: u32, max_width: u32) -> Result<
         th = 2;
     }
     if tw == width && th == height {
-        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-        for px in rgba[..expect].chunks_exact(4) {
-            rgb.extend_from_slice(&px[..3]);
+        let pixels = (width as usize) * (height as usize);
+        let mut rgb = vec![0u8; pixels * 3];
+        for (px, dst) in rgba[..expect].chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
+            dst.copy_from_slice(&px[..3]);
         }
         return Ok(Rgb { width, height, rgb });
     }

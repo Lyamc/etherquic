@@ -17,7 +17,7 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -27,10 +27,13 @@ const PCAP_MAGIC: u32 = 0xa1b2c3d4;
 const LINKTYPE_ETHERNET: u32 = 1;
 /// Wireshark `WTAP_ENCAP_USER0`. The Lua dissector binds to this.
 const LINKTYPE_USER0: u32 = 147;
+/// Wireshark `WTAP_ENCAP_USER1`. `rtp.pcap` uses this.
+const LINKTYPE_USER1: u32 = 148;
 const SNAPLEN: u32 = 16 * 1024 * 1024;
 const ETHER_MIN: usize = 60;
 const ETHER_QUEUE: usize = 1024;
 const APP_QUEUE: usize = 256;
+const EXTRA_QUEUE: usize = 256;
 
 /// This process handed the bytes to the socket or the QUIC stream.
 pub const DIR_SEND: u8 = 1;
@@ -46,18 +49,29 @@ ether.pcap is Ethernet. EtherType 0x88B6 carries a service header, then a QUIC d
 app.pcap uses Wireshark user DLT 147. Each record is the plaintext video (EVID), audio (EAUD), input (EINP), or confirmation (EACK) from this process.
 Direction in app.pcap is send (1) or recv (2) for this process.
 The dissector ships in the etherquic source tree at wireshark/etherquic.lua.
+rtp.pcap (link type 148) is opened only while the session carrier is UDP/RTP or ST 2110. Each packet is a direction byte then the RTP packet. wireshark/rtp.lua reads it.
+avtp.pcap is Ethernet and is opened only while the session carrier is AVB. wireshark/avtp.lua reads EtherType 0x22F0.
 ";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static SHARE: Mutex<Option<Arc<Share>>> = Mutex::new(None);
 static JOIN: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/// Carrier id the open capture should record. Zero until a session sets one.
+static CARRIER: AtomicU8 = AtomicU8::new(0);
 
 struct Share {
     ether_tx: SyncSender<Stamped>,
     app_tx: SyncSender<Stamped>,
+    rtp_tx: SyncSender<Stamped>,
+    avtp_tx: SyncSender<Stamped>,
+    cmd_tx: SyncSender<Cmd>,
     dropped_ether: Arc<AtomicU64>,
     dropped_app: Arc<AtomicU64>,
     dir: PathBuf,
+}
+
+enum Cmd {
+    Open { id: u8, done: SyncSender<()> },
 }
 
 struct Stamped {
@@ -123,20 +137,32 @@ pub fn capture_start(dir: Option<PathBuf>) -> Result<PathBuf, CaptureError> {
     fs::write(dir.join("wireshark.txt"), NOTE)?;
     let (ether_tx, ether_rx) = sync_channel(ETHER_QUEUE);
     let (app_tx, app_rx) = sync_channel(APP_QUEUE);
+    let (rtp_tx, rtp_rx) = sync_channel(EXTRA_QUEUE);
+    let (avtp_tx, avtp_rx) = sync_channel(EXTRA_QUEUE);
+    let (cmd_tx, cmd_rx) = sync_channel(16);
     let dropped_ether = Arc::new(AtomicU64::new(0));
     let dropped_app = Arc::new(AtomicU64::new(0));
+    let writer_dir = dir.clone();
     let handle = thread::Builder::new()
         .name("etherquic-capture".into())
-        .spawn(move || writer(ether_rx, app_rx, ether, app))?;
+        .spawn(move || writer(ether_rx, app_rx, rtp_rx, avtp_rx, cmd_rx, writer_dir, ether, app))?;
     *lock(&JOIN) = Some(handle);
     *share_guard = Some(Arc::new(Share {
         ether_tx,
         app_tx,
+        rtp_tx,
+        avtp_tx,
+        cmd_tx,
         dropped_ether,
         dropped_app,
         dir: dir.clone(),
     }));
+    drop(share_guard);
     ENABLED.store(true, Ordering::Relaxed);
+    let id = CARRIER.load(Ordering::Relaxed);
+    if matches!(id, 3 | 4 | 5) {
+        set_capture_carrier(id);
+    }
     Ok(dir)
 }
 
@@ -202,6 +228,83 @@ pub fn note_app(dir: u8, magic: &[u8; 4], payload: &[u8]) {
     }
 }
 
+/// Remember which carrier this process is using. While capture is on, open
+/// `rtp.pcap` for UDP/RTP (3) and ST 2110 (5), or `avtp.pcap` for AVB (4).
+/// A carrier that is off does not get a file.
+pub fn set_capture_carrier(id: u8) {
+    CARRIER.store(id, Ordering::Relaxed);
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let cmd_tx = {
+        let guard = lock(&SHARE);
+        let Some(share) = guard.as_ref() else {
+            return;
+        };
+        share.cmd_tx.clone()
+    };
+    let (done_tx, done_rx) = sync_channel(1);
+    if cmd_tx
+        .try_send(Cmd::Open {
+            id,
+            done: done_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+    let _ = done_rx.recv_timeout(Duration::from_secs(2));
+}
+
+/// One RTP packet. Written only while the capture carrier is 3 or 5.
+/// The stored packet is the direction byte followed by the RTP bytes.
+pub fn note_rtp(dir: u8, packet: &[u8]) {
+    let id = CARRIER.load(Ordering::Relaxed);
+    if id != 3 && id != 5 {
+        return;
+    }
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(share) = lock(&SHARE).clone() else {
+        return;
+    };
+    let (sec, usec) = now_us();
+    let mut bytes = Vec::with_capacity(1 + packet.len());
+    bytes.push(dir);
+    bytes.extend_from_slice(packet);
+    if share
+        .rtp_tx
+        .try_send(Stamped { sec, usec, bytes })
+        .is_err()
+    {
+        share.dropped_ether.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One AVTP Ethernet frame. Written only while the capture carrier is 4.
+pub fn note_avtp(dir: u8, frame: &[u8]) {
+    let _ = dir;
+    if CARRIER.load(Ordering::Relaxed) != 4 {
+        return;
+    }
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(share) = lock(&SHARE).clone() else {
+        return;
+    };
+    let (sec, usec) = now_us();
+    let packet = Stamped {
+        sec,
+        usec,
+        bytes: pad_ether(frame),
+    };
+    if share.avtp_tx.try_send(packet).is_err() {
+        share.dropped_ether.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn pad_ether(frame: &[u8]) -> Vec<u8> {
     if frame.len() >= ETHER_MIN {
         return frame.to_vec();
@@ -215,50 +318,217 @@ fn pad_ether(frame: &[u8]) -> Vec<u8> {
 fn writer(
     ether_rx: Receiver<Stamped>,
     app_rx: Receiver<Stamped>,
+    rtp_rx: Receiver<Stamped>,
+    avtp_rx: Receiver<Stamped>,
+    cmd_rx: Receiver<Cmd>,
+    dir: PathBuf,
     mut ether: BufWriter<File>,
     mut app: BufWriter<File>,
 ) {
-    let mut ether_open = true;
-    let mut app_open = true;
-    while ether_open || app_open {
-        if ether_open {
-            match ether_rx.recv_timeout(Duration::from_millis(25)) {
-                Ok(packet) => {
-                    let _ = write_packet(&mut ether, &packet);
-                    while let Ok(more) = ether_rx.try_recv() {
-                        let _ = write_packet(&mut ether, &more);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => ether_open = false,
-            }
-        }
-        if app_open {
+    let mut rtp: Option<BufWriter<File>> = None;
+    let mut avtp: Option<BufWriter<File>> = None;
+    let mut rtp_hold: Vec<Stamped> = Vec::new();
+    let mut avtp_hold: Vec<Stamped> = Vec::new();
+    let mut ether_up = true;
+    let mut app_up = true;
+    let mut rtp_up = true;
+    let mut avtp_up = true;
+    let mut cmd_up = true;
+    while ether_up || app_up || rtp_up || avtp_up || cmd_up {
+        let mut idle = true;
+        if cmd_up {
             loop {
-                match app_rx.try_recv() {
-                    Ok(packet) => {
-                        let _ = write_packet(&mut app, &packet);
+                match cmd_rx.try_recv() {
+                    Ok(cmd) => {
+                        idle = false;
+                        apply_cmd(&dir, cmd, &mut rtp, &mut avtp, &mut rtp_hold, &mut avtp_hold);
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        app_open = false;
+                        cmd_up = false;
                         break;
                     }
                 }
             }
         }
-        if !ether_open && app_open {
-            match app_rx.recv_timeout(Duration::from_millis(25)) {
-                Ok(packet) => {
-                    let _ = write_packet(&mut app, &packet);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => app_open = false,
-            }
+        if take_some(&ether_rx, &mut ether_up, |packet| {
+            let _ = write_packet(&mut ether, &packet);
+        }) {
+            idle = false;
+        }
+        if take_some(&app_rx, &mut app_up, |packet| {
+            let _ = write_packet(&mut app, &packet);
+        }) {
+            idle = false;
+        }
+        if take_some(&rtp_rx, &mut rtp_up, |packet| {
+            push_extra(&mut rtp, &mut rtp_hold, packet);
+        }) {
+            idle = false;
+        }
+        if take_some(&avtp_rx, &mut avtp_up, |packet| {
+            push_extra(&mut avtp, &mut avtp_hold, packet);
+        }) {
+            idle = false;
+        }
+        if idle {
+            block_one(
+                &ether_rx,
+                &app_rx,
+                &rtp_rx,
+                &avtp_rx,
+                &cmd_rx,
+                &dir,
+                &mut ether,
+                &mut app,
+                &mut rtp,
+                &mut avtp,
+                &mut rtp_hold,
+                &mut avtp_hold,
+                &mut ether_up,
+                &mut app_up,
+                &mut rtp_up,
+                &mut avtp_up,
+                &mut cmd_up,
+            );
         }
     }
     let _ = ether.flush();
     let _ = app.flush();
+    if let Some(file) = rtp.as_mut() {
+        let _ = file.flush();
+    }
+    if let Some(file) = avtp.as_mut() {
+        let _ = file.flush();
+    }
+}
+
+fn take_some(rx: &Receiver<Stamped>, up: &mut bool, mut write: impl FnMut(Stamped)) -> bool {
+    if !*up {
+        return false;
+    }
+    match rx.try_recv() {
+        Ok(packet) => {
+            write(packet);
+            true
+        }
+        Err(TryRecvError::Empty) => false,
+        Err(TryRecvError::Disconnected) => {
+            *up = false;
+            false
+        }
+    }
+}
+
+fn push_extra(file: &mut Option<BufWriter<File>>, hold: &mut Vec<Stamped>, packet: Stamped) {
+    if let Some(out) = file.as_mut() {
+        let _ = write_packet(out, &packet);
+    } else {
+        hold.push(packet);
+    }
+}
+
+fn apply_cmd(
+    dir: &std::path::Path,
+    cmd: Cmd,
+    rtp: &mut Option<BufWriter<File>>,
+    avtp: &mut Option<BufWriter<File>>,
+    rtp_hold: &mut Vec<Stamped>,
+    avtp_hold: &mut Vec<Stamped>,
+) {
+    let Cmd::Open { id, done } = cmd;
+    match id {
+        3 | 5 => open_extra(dir, "rtp.pcap", LINKTYPE_USER1, rtp, rtp_hold),
+        4 => open_extra(dir, "avtp.pcap", LINKTYPE_ETHERNET, avtp, avtp_hold),
+        _ => {}
+    }
+    let _ = done.send(());
+}
+
+fn open_extra(
+    dir: &std::path::Path,
+    name: &str,
+    link: u32,
+    slot: &mut Option<BufWriter<File>>,
+    hold: &mut Vec<Stamped>,
+) {
+    if slot.is_none() {
+        if let Ok(mut file) = File::create(dir.join(name)) {
+            if write_global(&mut file, link).is_ok() && file.flush().is_ok() {
+                *slot = Some(BufWriter::new(file));
+            }
+        }
+    }
+    if let Some(out) = slot.as_mut() {
+        for packet in hold.drain(..) {
+            let _ = write_packet(out, &packet);
+        }
+    }
+}
+
+fn block_one(
+    ether_rx: &Receiver<Stamped>,
+    app_rx: &Receiver<Stamped>,
+    rtp_rx: &Receiver<Stamped>,
+    avtp_rx: &Receiver<Stamped>,
+    cmd_rx: &Receiver<Cmd>,
+    dir: &std::path::Path,
+    ether: &mut BufWriter<File>,
+    app: &mut BufWriter<File>,
+    rtp: &mut Option<BufWriter<File>>,
+    avtp: &mut Option<BufWriter<File>>,
+    rtp_hold: &mut Vec<Stamped>,
+    avtp_hold: &mut Vec<Stamped>,
+    ether_up: &mut bool,
+    app_up: &mut bool,
+    rtp_up: &mut bool,
+    avtp_up: &mut bool,
+    cmd_up: &mut bool,
+) {
+    let wait = Duration::from_millis(25);
+    if *ether_up {
+        match ether_rx.recv_timeout(wait) {
+            Ok(packet) => {
+                let _ = write_packet(ether, &packet);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => *ether_up = false,
+        }
+        return;
+    }
+    if *app_up {
+        match app_rx.recv_timeout(wait) {
+            Ok(packet) => {
+                let _ = write_packet(app, &packet);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => *app_up = false,
+        }
+        return;
+    }
+    if *rtp_up {
+        match rtp_rx.recv_timeout(wait) {
+            Ok(packet) => push_extra(rtp, rtp_hold, packet),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => *rtp_up = false,
+        }
+        return;
+    }
+    if *avtp_up {
+        match avtp_rx.recv_timeout(wait) {
+            Ok(packet) => push_extra(avtp, avtp_hold, packet),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => *avtp_up = false,
+        }
+        return;
+    }
+    if *cmd_up {
+        match cmd_rx.recv_timeout(wait) {
+            Ok(cmd) => apply_cmd(dir, cmd, rtp, avtp, rtp_hold, avtp_hold),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => *cmd_up = false,
+        }
+    }
 }
 
 fn write_global(out: &mut impl Write, network: u32) -> std::io::Result<()> {
@@ -396,6 +666,7 @@ mod tests {
         if capture_active() {
             let _ = capture_stop();
         }
+        set_capture_carrier(1);
         let dir = std::env::temp_dir().join(format!(
             "etherquic-capture-{}-{}",
             std::process::id(),
@@ -450,11 +721,128 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn rtp_and_avtp_open_only_for_the_active_carrier() {
+        let _hold = gate().lock().unwrap_or_else(|poison| poison.into_inner());
+        if capture_active() {
+            let _ = capture_stop();
+        }
+        set_capture_carrier(1);
+        let dir = std::env::temp_dir().join(format!(
+            "etherquic-capture-carrier-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _stop = StopGuard;
+        capture_start(Some(dir.clone())).unwrap();
+        let rtp = vec![0x80, 96, 0, 1, 0, 0, 0x10, 0, 0, 0, 0, 1, 0xAB];
+        let avtp = ethernet_avtp();
+        note_rtp(DIR_SEND, &rtp);
+        note_avtp(DIR_SEND, &avtp);
+        assert!(!dir.join("rtp.pcap").is_file(), "carrier 1 opened rtp.pcap");
+        assert!(!dir.join("avtp.pcap").is_file(), "carrier 1 opened avtp.pcap");
+
+        set_capture_carrier(3);
+        assert!(dir.join("rtp.pcap").is_file());
+        assert!(!dir.join("avtp.pcap").is_file(), "UDP/RTP opened avtp.pcap");
+        note_rtp(DIR_SEND, &rtp);
+        note_avtp(DIR_SEND, &avtp);
+
+        set_capture_carrier(5);
+        note_rtp(DIR_RECV, &rtp);
+        assert!(!dir.join("avtp.pcap").is_file(), "ST 2110 opened avtp.pcap");
+
+        set_capture_carrier(4);
+        assert!(dir.join("avtp.pcap").is_file());
+        note_avtp(DIR_SEND, &avtp);
+        note_rtp(DIR_SEND, &rtp);
+
+        set_capture_carrier(2);
+        note_rtp(DIR_SEND, &rtp);
+        note_avtp(DIR_SEND, &avtp);
+
+        capture_stop().unwrap();
+        let (network, packets) = read_pcap(&dir.join("rtp.pcap"));
+        assert_eq!(network, LINKTYPE_USER1);
+        assert_eq!(packets.len(), 2, "off-carrier RTP notes were stored");
+        assert_eq!(packets[0][0], DIR_SEND);
+        assert_eq!(&packets[0][1..], rtp.as_slice());
+        assert_eq!(packets[1][0], DIR_RECV);
+        assert_eq!(&packets[1][1..], rtp.as_slice());
+
+        let (network, packets) = read_pcap(&dir.join("avtp.pcap"));
+        assert_eq!(network, LINKTYPE_ETHERNET);
+        assert_eq!(packets.len(), 1, "off-carrier AVTP notes were stored");
+        assert_eq!(&packets[0][12..14], &0x22F0u16.to_be_bytes());
+        assert_eq!(packets[0][14], 3);
+        let _ = fs::remove_dir_all(&dir);
+        set_capture_carrier(1);
+    }
+
+    #[test]
+    fn the_seam_writes_rtp_or_avtp_only_for_its_carrier() {
+        let _hold = gate().lock().unwrap_or_else(|poison| poison.into_inner());
+        if capture_active() {
+            let _ = capture_stop();
+        }
+        set_capture_carrier(1);
+        let dir = std::env::temp_dir().join(format!(
+            "etherquic-capture-seam-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _stop = StopGuard;
+        capture_start(Some(dir.clone())).unwrap();
+        let mut rtp = crate::carrier::Seam::open(crate::carrier::UDP_RTP);
+        rtp.send(crate::carrier::Lane::Picture, b"picture-bytes", None, std::time::Duration::from_millis(1));
+        assert!(!dir.join("rtp.pcap").exists());
+        set_capture_carrier(crate::carrier::UDP_RTP);
+        rtp.send(crate::carrier::Lane::Picture, b"picture-bytes", None, std::time::Duration::from_millis(1));
+        set_capture_carrier(crate::carrier::ST2110);
+        let mut st = crate::carrier::Seam::open(crate::carrier::ST2110);
+        st.send(crate::carrier::Lane::Picture, b"jpeg-xs-body-bytes", None, std::time::Duration::from_millis(1));
+        assert!(!dir.join("avtp.pcap").exists());
+        set_capture_carrier(crate::carrier::AVB);
+        crate::carrier::note_avb_listener(true);
+        let mut avb = crate::carrier::Seam::open(crate::carrier::AVB);
+        avb.send(crate::carrier::Lane::Picture, b"avb-picture", None, std::time::Duration::from_millis(1));
+        set_capture_carrier(crate::carrier::QUIC_STREAMS);
+        avb.send(crate::carrier::Lane::Picture, b"not-captured", None, std::time::Duration::ZERO);
+        crate::carrier::note_avb_listener(false);
+        rtp.send(crate::carrier::Lane::Picture, b"not-captured", None, std::time::Duration::ZERO);
+        capture_stop().unwrap();
+        let (network, packets) = read_pcap(&dir.join("rtp.pcap"));
+        assert_eq!(network, LINKTYPE_USER1);
+        assert!(!packets.is_empty());
+        assert!(packets.iter().all(|packet| packet[0] == DIR_SEND));
+        let (network, packets) = read_pcap(&dir.join("avtp.pcap"));
+        assert_eq!(network, LINKTYPE_ETHERNET);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0][12..14], &0x22F0u16.to_be_bytes());
+        let _ = fs::remove_dir_all(&dir);
+        set_capture_carrier(1);
+    }
+
+    fn ethernet_avtp() -> Vec<u8> {
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x22;
+        frame[13] = 0xF0;
+        frame[14] = 3;
+        frame
+    }
+
     struct StopGuard;
 
     impl Drop for StopGuard {
         fn drop(&mut self) {
             let _ = capture_stop();
+            set_capture_carrier(1);
         }
     }
 }

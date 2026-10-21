@@ -116,6 +116,8 @@ pub struct HostMedia {
     pub log: etherquic_media::Log,
     /// Latest host cursor record. `None` until the host has sampled one.
     pub cursor: tokio::sync::watch::Receiver<Option<Vec<u8>>>,
+    /// Shared encoder, keyframe bus, and exclusive lock. Default is one session.
+    pub shared: etherquic_media::host::SharedEncode,
 }
 
 /// Send desktop and audio. Read player input until the player closes it.
@@ -152,6 +154,26 @@ pub async fn serve_session(
             magic_name(magic)
         )));
     }
+    let (view_only, seat) = match &negotiated {
+        etherquic_media::host::Negotiated::V2 { offer, .. } => {
+            let view_only = offer.view_only;
+            let seat = match &media.shared.room {
+                Some(room) => match room.admit(&conn, offer.exclusive) {
+                    etherquic_media::host::Admit::Ok(id) => Some(Seat {
+                        room: room.clone(),
+                        id,
+                    }),
+                    etherquic_media::host::Admit::Busy => {
+                        conn.close(1u32.into(), b"exclusive");
+                        return Err(Error::Wire("exclusive session".into()));
+                    }
+                },
+                None => None,
+            };
+            (view_only, seat)
+        }
+        etherquic_media::host::Negotiated::Legacy => (false, None),
+    };
     // Open picture and audio before reading input. A confirmation opened
     // earlier could be accepted in place of those two streams.
     let v2 = negotiated.is_v2();
@@ -164,11 +186,18 @@ pub async fn serve_session(
     let clipboard_in = pipes.clipboard_in;
     let chat_in = pipes.chat_in;
     let roster = pipes.roster;
+    let inject = if view_only {
+        let (drop_tx, mut drop_rx) = mpsc::channel(1);
+        tokio::spawn(async move { while drop_rx.recv().await.is_some() {} });
+        drop_tx
+    } else {
+        input
+    };
     let input_task = tokio::spawn(async move {
         read_from_player(
             input_conn,
             v2,
-            input,
+            inject,
             files_in,
             clipboard_in,
             chat_in,
@@ -194,29 +223,47 @@ pub async fn serve_session(
             }
         }
     });
+    let caps = tokio::task::spawn_blocking(etherquic_media::caps::host_caps)
+        .await
+        .unwrap_or_else(|_| etherquic_media::negotiate::HostCaps::baseline());
     let options = host::HostOptions {
         fps: media.fps,
         display_hz: media.display_hz,
-        caps: etherquic_media::caps::host_caps(),
+        caps,
         log: media.log,
+        cap_kbps: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        carrier_tap: Some(etherquic::carrier::open_carrier_tap()),
     };
-    let result = host::run(
+    let result = host::run_shared(
         streams,
         negotiated,
         media.frames,
         pcm_rx,
         options,
         media.cursor,
+        media.shared,
     )
     .await;
     forward.abort();
     if let Some(task) = ack_task {
         task.abort();
     }
+    drop(seat);
     result.map_err(wire_err)?;
     match input_task.await {
         Ok(result) => result,
         Err(error) => Err(Error::Wire(error.to_string())),
+    }
+}
+
+struct Seat {
+    room: etherquic_media::host::Room,
+    id: u64,
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.room.leave(self.id);
     }
 }
 
@@ -250,6 +297,36 @@ pub struct LiveOffer {
     pub dirty_rects: bool,
     pub yuv: etherquic::negotiate::YuvFormat,
     pub fps: etherquic::negotiate::FpsWish,
+    pub max_width: u32,
+    pub max_height: u32,
+    /// When set, the next offer lists only this picture codec.
+    pub video: Option<etherquic::negotiate::Video>,
+    /// When set, the next offer lists only this audio codec.
+    pub audio: Option<etherquic::negotiate::Audio>,
+    /// When set, the next offer asks for this carrier.
+    pub carrier: Option<u8>,
+}
+
+/// Codec, rate, and carrier the player can change on an open session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionTune {
+    pub video: Option<etherquic::negotiate::Video>,
+    pub audio: Option<etherquic::negotiate::Audio>,
+    pub carrier: Option<u8>,
+    pub fps: Option<etherquic::negotiate::FpsWish>,
+}
+
+pub type LiveTune = std::sync::Arc<std::sync::Mutex<SessionTune>>;
+
+pub fn live_tune(tune: SessionTune) -> LiveTune {
+    std::sync::Arc::new(std::sync::Mutex::new(tune))
+}
+
+pub fn snapshot_tune(tune: &LiveTune) -> SessionTune {
+    match tune.lock() {
+        Ok(tune) => *tune,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
 }
 
 /// What the player asks for, and where session events go.
@@ -263,11 +340,10 @@ pub struct PlayerMedia {
     pub live: tokio::sync::watch::Receiver<LiveOffer>,
 }
 
-async fn resend_live(
-    offer: &mut etherquic_media::negotiate::Offer,
-    live: LiveOffer,
-    offer_send: &mut Option<SendStream>,
-) {
+/// Write a live tune onto the offer this connection already has open.
+/// Codec, audio, fps, and carrier replace that offer's lists. Returns false
+/// when nothing changed.
+pub fn apply_live(offer: &mut etherquic_media::negotiate::Offer, live: &LiveOffer) -> bool {
     if offer.look == live.look
         && offer.dither == Some(live.dither)
         && offer.pixel_size == Some(live.pixel_size)
@@ -276,8 +352,25 @@ async fn resend_live(
         && offer.want_dirty_rects == Some(live.dirty_rects)
         && offer.yuv == Some(live.yuv)
         && offer.fps == live.fps
+        && offer.max.width == live.max_width
+        && offer.max.height == live.max_height
+        && live.video.is_none_or(|video| offer.video.as_slice() == [video])
+        && live.audio.is_none_or(|audio| offer.audio.as_slice() == [audio])
+        && live.carrier.is_none_or(|carrier| offer.carrier == Some(carrier))
     {
-        return;
+        return false;
+    }
+    let codec_changed = live.video.is_some() || live.audio.is_some() || live.carrier.is_some();
+    let size_changed =
+        offer.max.width != live.max_width || offer.max.height != live.max_height || codec_changed;
+    if let Some(video) = live.video {
+        offer.video = vec![video];
+    }
+    if let Some(audio) = live.audio {
+        offer.audio = vec![audio];
+    }
+    if let Some(carrier) = live.carrier {
+        offer.carrier = Some(carrier);
     }
     offer.look = live.look;
     offer.dither = Some(live.dither);
@@ -287,6 +380,20 @@ async fn resend_live(
     offer.want_dirty_rects = Some(live.dirty_rects);
     offer.yuv = Some(live.yuv);
     offer.fps = live.fps;
+    offer.max.width = live.max_width;
+    offer.max.height = live.max_height;
+    offer.want_keyframe = size_changed;
+    true
+}
+
+async fn resend_live(
+    offer: &mut etherquic_media::negotiate::Offer,
+    live: LiveOffer,
+    offer_send: &mut Option<SendStream>,
+) {
+    if !apply_live(offer, &live) {
+        return;
+    }
     let Some(send) = offer_send.as_mut() else {
         return;
     };
@@ -328,6 +435,47 @@ pub async fn play_session(
         live,
     } = media;
     let negotiates = etherquic::negotiates(&conn);
+    let mut lane_reset = None;
+    let (mut picture_rx, mut audio_rx) =
+        if offer.carrier == Some(etherquic::carrier::QUIC_DATAGRAMS) {
+            etherquic::carrier::apply_agreed_carrier(
+                &conn,
+                etherquic::carrier::QUIC_DATAGRAMS,
+            );
+            let (picture_tx, picture_rx) = mpsc::channel(16);
+            let (audio_tx, audio_rx) = mpsc::channel(16);
+            lane_reset = Some(player::spawn_lane_demux(conn.clone(), picture_tx, audio_tx));
+            (Some(picture_rx), Some(audio_rx))
+        } else if matches!(
+            offer.carrier,
+            Some(
+                etherquic::carrier::UDP_RTP
+                    | etherquic::carrier::AVB
+                    | etherquic::carrier::ST2110
+            )
+        ) {
+            let remote = conn.remote_address();
+            if let Some(input) = etherquic::carrier::player_host(Some(remote)) {
+                let (picture_tx, picture_rx) = mpsc::channel(16);
+                let (audio_tx, audio_rx) = mpsc::channel(16);
+                match offer.carrier {
+                    Some(etherquic::carrier::AVB) => {
+                        etherquic::carrier::spawn_player_avb(input, picture_tx, audio_tx);
+                    }
+                    Some(etherquic::carrier::ST2110) => {
+                        etherquic::carrier::spawn_player_st2110(input, picture_tx, audio_tx);
+                    }
+                    _ => {
+                        etherquic::carrier::spawn_player_rtp(input, picture_tx, audio_tx);
+                    }
+                }
+                (Some(picture_rx), Some(audio_rx))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
     let mut offer_send = if negotiates {
         Some(
             player::send_offer(&conn, &offer)
@@ -377,10 +525,21 @@ pub async fn play_session(
             let v2 = &magic == VIDEO2_MAGIC;
             let frames = frames.clone();
             let events = inner_tx.clone();
+            let expected_carrier = offer.carrier;
+            let pictures = picture_rx.take();
+            let reset = lane_reset.clone();
             tokio::spawn(async move {
-                let result = player::read_video(recv, v2, frames, events)
-                    .await
-                    .map_err(Error::Wire);
+                let result = player::read_video(
+                    recv,
+                    v2,
+                    frames,
+                    events,
+                    expected_carrier,
+                    pictures,
+                    reset,
+                )
+                .await
+                .map_err(Error::Wire);
                 let _ = done.send(result).await;
             });
         } else if is_audio && !got_audio {
@@ -388,8 +547,10 @@ pub async fn play_session(
             let v2 = &magic == AUDIO2_MAGIC;
             let pcm = pcm_tx.clone();
             let events = inner_tx.clone();
+            let packets = audio_rx.take();
+            let reset = lane_reset.clone();
             tokio::spawn(async move {
-                let result = player::read_audio(recv, v2, pcm, events)
+                let result = player::read_audio(recv, v2, pcm, events, packets, reset)
                     .await
                     .map_err(Error::Wire);
                 let _ = done.send(result).await;
@@ -463,6 +624,7 @@ pub async fn play_session(
                 if !offer.failed.contains(video) {
                     offer.failed.push(*video);
                 }
+                offer.want_keyframe = true;
                 if let Some(send) = offer_send.as_mut() {
                     if let Err(error) = player::resend_offer(send, &offer).await {
                         eprintln!("etherquic-play: renegotiate: {error}");
@@ -785,6 +947,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_live_tune_replaces_codec_audio_fps_and_carrier_on_the_same_offer() {
+        let mut offer = etherquic_media::negotiate::Offer {
+            version: 1,
+            video: vec![etherquic::negotiate::Video::H264Sw],
+            audio: vec![etherquic::negotiate::Audio::Pcm],
+            max: etherquic::negotiate::Limit::NONE,
+            bitrate_kbps: 0,
+            failed: Vec::new(),
+            knows_pyrowave_cpu: false,
+            knows_dirty_rects: true,
+            knows_yuv_444: false,
+            look: etherquic::look::Look::Off,
+            dither: Some(etherquic::look::Dither::Bayer4),
+            pixel_size: Some(2),
+            dither_strength: Some(60),
+            quality: 40,
+            want_dirty_rects: Some(false),
+            yuv: Some(etherquic::negotiate::YuvFormat::YUV420P8),
+            fps: etherquic::negotiate::FpsWish::Auto,
+            audio_bitrate_kbps: 0,
+            audio_channels: 0,
+            view_only: false,
+            exclusive: false,
+            want_keyframe: false,
+            carrier: Some(1),
+        };
+        let live = LiveOffer {
+            look: etherquic::look::Look::Blocks,
+            dither: etherquic::look::Dither::Bayer4,
+            pixel_size: 2,
+            dither_strength: 60,
+            quality: 70,
+            dirty_rects: true,
+            yuv: etherquic::negotiate::YuvFormat::YUV444P8,
+            fps: etherquic::negotiate::FpsWish::Fixed(30),
+            max_width: offer.max.width,
+            max_height: offer.max.height,
+            video: Some(etherquic::negotiate::Video::Mjpeg),
+            audio: Some(etherquic::negotiate::Audio::Opus),
+            carrier: Some(2),
+        };
+        assert!(apply_live(&mut offer, &live));
+        assert_eq!(offer.video, vec![etherquic::negotiate::Video::Mjpeg]);
+        assert_eq!(offer.audio, vec![etherquic::negotiate::Audio::Opus]);
+        assert_eq!(offer.fps, etherquic::negotiate::FpsWish::Fixed(30));
+        assert_eq!(offer.carrier, Some(2));
+        assert_eq!(offer.look, etherquic::look::Look::Blocks);
+        assert_eq!(offer.quality, 70);
+        assert_eq!(offer.want_dirty_rects, Some(true));
+        assert!(!apply_live(&mut offer, &live));
+    }
+
+    #[test]
     fn audio_chunk_round_trips() {
         let chunk = AudioChunk {
             sample_rate: 48_000,
@@ -793,6 +1008,194 @@ mod tests {
         };
         let back = AudioChunk::decode(&chunk.encode().unwrap()).unwrap();
         assert_eq!(back, chunk);
+    }
+
+    #[test]
+    fn connect_exchanges_picture_and_audio_without_quic() {
+        let frame = carrier_frame();
+        let pcm = etherquic_media::Pcm {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![1, -2, 3, -4, 5, 6, 7, -8],
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let discovery = std::thread::spawn(move || {
+            let card = etherquic::discover::HostCard {
+                name: "carrier".into(),
+                l2_mac: [0x02, 0, 0, 0, 0, 1],
+                l2_service: 4433,
+                l3_port: 4433,
+                video: None,
+                audio: None,
+                l2_backend: 0,
+            };
+            let _ = etherquic::discover::serve_udp(
+                None,
+                &card,
+                &etherquic::discover::NoExtras,
+                &flag,
+            );
+        });
+        struct StopDiscovery(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            Option<std::thread::JoinHandle<()>>,
+        );
+        impl Drop for StopDiscovery {
+            fn drop(&mut self) {
+                self.0
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = self.1.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let _stop = StopDiscovery(stop, Some(discovery));
+        struct ClearCarrier;
+        impl Drop for ClearCarrier {
+            fn drop(&mut self) {
+                etherquic::carrier::set_l3_port(0);
+            }
+        }
+        let _clear = ClearCarrier;
+        for id in [
+            etherquic::carrier::UDP_RTP,
+            etherquic::carrier::AVB,
+            etherquic::carrier::ST2110,
+        ] {
+            let before = etherquic::quic_binds();
+            let published = etherquic::carrier::prepare_host();
+            assert_ne!(published.port(), 0, "{id}");
+            // A client process has neither this atomic nor this machine's saved line.
+            etherquic::carrier::clear_published_input();
+            let quic = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4433));
+            let host = etherquic::carrier::player_host_for(Some(quic), false, None)
+                .unwrap_or_else(|| panic!("carrier {id} discovery had no rtp input"));
+            assert_ne!(host.port(), 4433, "{id}");
+            assert_eq!(host.port(), published.port(), "{id}");
+            let player = std::thread::spawn(move || {
+                etherquic::carrier::open_carrier_player(id, Some(quic), false, None)
+            });
+            let (picture, audio) = etherquic_media::host::serve_carrier(id, &frame, &pcm)
+                .unwrap_or_else(|err| panic!("carrier {id} host did not send: {err}"));
+            let (got_picture, got_audio) = player.join().expect("player");
+            assert_eq!(got_picture, picture, "carrier {id} picture");
+            assert_eq!(got_audio, audio, "carrier {id} audio");
+            assert_eq!(etherquic::quic_binds(), before, "carrier {id} opened QUIC");
+            etherquic::carrier::set_l3_port(0);
+        }
+        // Default L2 Connect has no QUIC address. The hello uses the scanned
+        // offer's host IP and RTP port, not 127.0.0.1 and not the local rtp= line.
+        for id in [
+            etherquic::carrier::UDP_RTP,
+            etherquic::carrier::AVB,
+            etherquic::carrier::ST2110,
+        ] {
+            let before = etherquic::quic_binds();
+            let published = etherquic::carrier::prepare_host();
+            assert_ne!(published.port(), 0, "{id}");
+            etherquic::carrier::clear_published_input();
+            etherquic::carrier::publish_input(19_999);
+            let local = etherquic::carrier::player_host(None);
+            assert_eq!(
+                local,
+                Some(std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    19_999
+                ))),
+                "{id} local line"
+            );
+            assert!(
+                etherquic::carrier::player_host_for(None, true, None).is_none(),
+                "{id} missing offer must not use the local line"
+            );
+            let payload = etherquic::discover::fetch_offer(std::net::Ipv4Addr::LOCALHOST.into())
+                .unwrap_or_else(|| panic!("carrier {id} discovery did not answer"));
+            let seen = etherquic::discover::offer_rtp_socket(&payload)
+                .unwrap_or_else(|| panic!("carrier {id} offer had no rtp socket"));
+            assert_ne!(seen.port(), 19_999, "{id}");
+            assert_ne!(seen.port(), 4433, "{id}");
+            assert_eq!(seen.port(), published.port(), "{id}");
+            // Same entry as `etherquic-play connect`: parse the argv, then decide
+            // the NIC, then the carrier hello. A failed raw NIC must not run.
+            let argv = vec![
+                "connect".to_string(),
+                "--peer-mac".into(),
+                "02:00:00:00:00:01".into(),
+                "--l2-offer".into(),
+                "--rtp".into(),
+                seen.to_string(),
+                "--carrier".into(),
+                id.to_string(),
+            ];
+            assert!(
+                argv.iter().all(|arg| arg != "--udp"),
+                "{id} argv dialed QUIC"
+            );
+            let crate::args::Command::Connect(connect) =
+                crate::args::parse(argv).unwrap_or_else(|err| panic!("carrier {id} argv: {err}"))
+            else {
+                panic!("carrier {id} was not connect");
+            };
+            assert!(connect.l2_offer, "{id}");
+            assert!(connect.udp.is_none(), "{id}");
+            assert_eq!(connect.rtp, Some(seen), "{id}");
+            assert_eq!(connect.codecs.carrier, Some(id), "{id}");
+            let mut opened = false;
+            let net: Result<Option<()>, &str> = etherquic::carrier::connect_net(
+                connect.udp,
+                connect.l2_offer,
+                connect.nic.as_deref(),
+                |_| {
+                    opened = true;
+                    Err("raw nic")
+                },
+            );
+            assert!(!opened, "{id} opened a raw nic");
+            assert!(
+                net.expect("opener must not run").is_none(),
+                "{id} net"
+            );
+            let host = etherquic::carrier::player_host_for(
+                connect.udp,
+                connect.l2_offer,
+                connect.rtp,
+            )
+            .unwrap_or_else(|| panic!("carrier {id} l2 offer was dropped"));
+            assert_eq!(host, seen, "{id}");
+            assert_ne!(host.port(), 19_999, "{id}");
+            let udp = connect.udp;
+            let l2_offer = connect.l2_offer;
+            let rtp = connect.rtp;
+            let player = std::thread::spawn(move || {
+                etherquic::carrier::open_carrier_player(id, udp, l2_offer, rtp)
+            });
+            let (picture, audio) = etherquic_media::host::serve_carrier(id, &frame, &pcm)
+                .unwrap_or_else(|err| panic!("carrier {id} l2 host did not send: {err}"));
+            let (got_picture, got_audio) = player.join().expect("player");
+            assert_eq!(got_picture, picture, "carrier {id} l2 picture");
+            assert_eq!(got_audio, audio, "carrier {id} l2 audio");
+            assert_eq!(etherquic::quic_binds(), before, "carrier {id} l2 opened QUIC");
+            etherquic::carrier::set_l3_port(0);
+        }
+    }
+
+    fn carrier_frame() -> etherquic_media::Frame {
+        let width = 16u32;
+        let height = 16u32;
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgb.push((x * 16) as u8);
+                rgb.push((y * 16) as u8);
+                rgb.push(40);
+            }
+        }
+        etherquic_media::Frame {
+            width,
+            height,
+            rgb,
+        }
     }
 
     #[test]

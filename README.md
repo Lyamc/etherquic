@@ -6,9 +6,9 @@ QUIC over Ethernet. Quinn sees datagrams, an opaque peer, and a max payload. It 
 
 | Piece | Where |
 | --- | --- |
-| QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule, `rustls-pure`, pin `a201190` |
-| TLS | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule, pin `9cba6e9` (AES-128-GCM for QUIC) |
-| PyroWave on Direct3D 11 | [Lyamc/pyrowave-dx11](https://github.com/Lyamc/pyrowave-dx11) submodule `vendor/pyrowave-dx11`, tag `v0.1.1`. Windows loads `pyrowave_d3d11.dll` when Vulkan is missing or only a CPU device answered |
+| QUIC | [Lyamc/quinn](https://github.com/Lyamc/quinn) submodule, `rustls-pure`, pin `b9b1c72` |
+| TLS | [Lyamc/rustls-rustcrypto](https://github.com/Lyamc/rustls-rustcrypto) submodule, pin `9a6404a` (AES-128-GCM for QUIC) |
+| PyroWave on Direct3D 11 | [Lyamc/pyrowave-dx11](https://github.com/Lyamc/pyrowave-dx11) submodule `vendor/pyrowave-dx11`, tag `v0.1.3`. Windows loads `pyrowave_d3d11.dll` when Vulkan is missing or only a CPU device answered |
 | Windows codecs | Submodules built into the MSI by `packaging/windows/build-codecs.ps1`: [xiph/opus](https://github.com/xiph/opus) `v1.6.1`, [Themaister/pyrowave](https://github.com/Themaister/pyrowave) `a0d2e71` with [Granite](https://github.com/Themaister/Granite) `fb178c8`, and [libjxl](https://github.com/libjxl/libjxl) `v0.12.0` (`cjxl`). Lavapipe is the pinned [mesa-dist-win](https://github.com/pal1000/mesa-dist-win) `26.2.4` release; the `vulkan-1.dll` shim is compiled from this tree |
 | L2, first choice | NDIS filter `membrane_ndis`, device `\\.\MembraneNdis`. [Install](docs/windows-membrane-ndis.md) |
 | L2, fallback | Npcap or libpcap (`src/pcap_link.rs`) when that device is not open. macOS uses BPF receive and AF_NDRV send (`src/macos_link.rs`) |
@@ -57,6 +57,10 @@ Same copy, 1 Gbps link, 5–16 ms ping. NDIS is `membrane_ndis`. Npcap is what r
 | 18 MB video | 2.46 s (7.0 MiB/s) | still running at 180 s |
 
 For the 2 MB file the receiver used about 0.016 s of CPU on NDIS and about 0.36 s on Npcap. A 1 ms idle wait later moved NDIS to 6.3–7.7 MiB/s (2 MB) and 9.2 MiB/s (video). One system call per frame is the gap. Round-trip time caps how full the QUIC window gets.
+
+## PyroWave on Direct3D 11
+
+On the Radeon HD 6670, 1280×720, at the 4 bit-per-pixel budget. A warm encode is about 10 ms for a gradient and about 15 ms for a desktop. Full noise does not fit that budget. `libpyrowave-shared` (pin `a0d2e71`) decodes the records that fit. A live desktop asked for 60 fps and held about 44–48 fps. The stage split and the record sizes are in [`vendor/pyrowave-dx11`](vendor/pyrowave-dx11/README.md).
 
 ## Commands
 

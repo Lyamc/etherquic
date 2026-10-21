@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use etherquic_play::{
-    CursorMode, Dither, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, PAD_SLOTS,
+    CursorMode, Dither, FrameGen, Look, PadSlot, ScaleMode, SizeMatch, Upscale, ViewOptions,
+    PAD_SLOTS,
 };
 
 use crate::overlay::OverlayLayout;
@@ -90,6 +91,8 @@ impl NetworkDriver {
 pub enum Field {
     Scale,
     SizeMatch,
+    Upscale,
+    FrameGen,
     SendKeyboard,
     SendMouse,
     SendPads,
@@ -113,9 +116,11 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 22] = [
+    pub const ALL: [Field; 24] = [
         Self::Scale,
         Self::SizeMatch,
+        Self::Upscale,
+        Self::FrameGen,
         Self::Look,
         Self::Dither,
         Self::PixelSize,
@@ -142,6 +147,8 @@ impl Field {
         match self {
             Self::Scale
             | Self::SizeMatch
+            | Self::Upscale
+            | Self::FrameGen
             | Self::Look
             | Self::Dither
             | Self::PixelSize
@@ -168,6 +175,10 @@ impl Field {
 pub struct Settings {
     pub scale: ScaleMode,
     pub size_match: SizeMatch,
+    /// Client FSR/DLSS/XeSS. On asks the host for 720p. Saved as `upscale=`.
+    pub upscale: Upscale,
+    /// Insert a synthesised picture between arrivals. Saved as `frame-gen=`.
+    pub frame_gen: FrameGen,
     pub send_keyboard: bool,
     pub send_mouse: bool,
     pub send_pads: bool,
@@ -208,6 +219,10 @@ pub struct Settings {
     /// macOS: hide the “install host service” prompt. The service can still
     /// be installed from Settings.
     pub skip_host_service_prompt: bool,
+    /// Connect without sending keyboard, mouse, or pads. Saved as `view-only=`.
+    pub view_only: bool,
+    /// Kick other viewers and refuse later joins. Saved as `exclusive=`.
+    pub exclusive: bool,
 }
 
 impl Default for Settings {
@@ -216,6 +231,8 @@ impl Default for Settings {
         Self {
             scale: view.scale,
             size_match: view.size_match,
+            upscale: view.upscale,
+            frame_gen: view.frame_gen,
             send_keyboard: view.send_keyboard,
             send_mouse: view.send_mouse,
             send_pads: view.send_pads,
@@ -237,6 +254,8 @@ impl Default for Settings {
             language: "en".into(),
             beta_releases: false,
             skip_host_service_prompt: false,
+            view_only: false,
+            exclusive: false,
         }
     }
 }
@@ -247,6 +266,8 @@ impl Settings {
         ViewOptions {
             scale: self.scale,
             size_match: self.size_match,
+            upscale: self.upscale,
+            frame_gen: self.frame_gen,
             send_keyboard: self.send_keyboard,
             send_mouse: self.send_mouse,
             send_pads: self.send_pads,
@@ -280,6 +301,8 @@ impl Settings {
         match field {
             Field::Scale => self.scale == other.scale,
             Field::SizeMatch => self.size_match == other.size_match,
+            Field::Upscale => self.upscale == other.upscale,
+            Field::FrameGen => self.frame_gen == other.frame_gen,
             Field::SendKeyboard => self.send_keyboard == other.send_keyboard,
             Field::SendMouse => self.send_mouse == other.send_mouse,
             Field::SendPads => self.send_pads == other.send_pads,
@@ -310,6 +333,8 @@ impl Settings {
         match field {
             Field::Scale => self.scale = from.scale,
             Field::SizeMatch => self.size_match = from.size_match,
+            Field::Upscale => self.upscale = from.upscale,
+            Field::FrameGen => self.frame_gen = from.frame_gen,
             Field::SendKeyboard => self.send_keyboard = from.send_keyboard,
             Field::SendMouse => self.send_mouse = from.send_mouse,
             Field::SendPads => self.send_pads = from.send_pads,
@@ -424,9 +449,11 @@ fn clean(text: &str) -> String {
 
 pub fn render_settings(settings: &Settings) -> String {
     let mut out = format!(
-        "scale={}\nsize-match={}\nlook={}\ndither={}\npixel-size={}\ndither-strength={}\nquality={}\nyuv={}\ndirty-rects={}\ndebug-dirty-rects={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nbeta-releases={}\nhost-service-prompt={}\n",
+        "scale={}\nsize-match={}\nupscale={}\nframe-gen={}\nlook={}\ndither={}\npixel-size={}\ndither-strength={}\nquality={}\nyuv={}\ndirty-rects={}\ndebug-dirty-rects={}\nsend-keyboard={}\nsend-mouse={}\nsend-pads={}\nclipboard-as-keystrokes={}\ncursor={}\noutput-device={}\nshare-device={}\nnetwork={}\nlanguage={}\nbeta-releases={}\nhost-service-prompt={}\nview-only={}\nexclusive={}\n",
         settings.scale.token(),
         settings.size_match.token(),
+        settings.upscale.token(),
+        settings.frame_gen.token(),
         settings.look.token(),
         settings.dither.token(),
         settings.pixel_size,
@@ -450,6 +477,8 @@ pub fn render_settings(settings: &Settings) -> String {
         } else {
             "ask"
         },
+        flag(settings.view_only),
+        flag(settings.exclusive),
     );
     for pin in &settings.pad_slots {
         out.push_str(&format!("pad-slot={}={}\n", pin.slot, clean(&pin.name)));
@@ -474,6 +503,14 @@ pub fn parse_settings(text: &str) -> Settings {
                     .filter(|choice| choice.available())
                     .unwrap_or(settings.size_match)
             }
+            "upscale" => {
+                settings.upscale = Upscale::from_token(value).unwrap_or(settings.upscale)
+            }
+            "frame-gen" => {
+                settings.frame_gen = FrameGen::from_token(value).unwrap_or(settings.frame_gen)
+            }
+            "view-only" => settings.view_only = value != "0",
+            "exclusive" => settings.exclusive = value != "0",
             "send-keyboard" => settings.send_keyboard = value != "0",
             "send-mouse" => settings.send_mouse = value != "0",
             "send-pads" => settings.send_pads = value != "0",
@@ -682,6 +719,8 @@ mod tests {
         let mut settings = Settings {
             scale: ScaleMode::Fill,
             size_match: SizeMatch::WindowToHost,
+            upscale: Upscale::Fsr,
+            frame_gen: FrameGen::On,
             send_keyboard: false,
             send_mouse: true,
             send_pads: false,
@@ -708,7 +747,7 @@ mod tests {
     #[test]
     fn unknown_or_bad_lines_keep_defaults() {
         let parsed = parse_settings(
-            "scale=zoom\nsize-match=host-to-window\nlook=crt\nfuture=1\nnetwork=wifi\nlanguage=fr\npad-slot=x\npad-slot=9=Pad\n",
+            "scale=zoom\nsize-match=host-to-window\nupscale=nis\nlook=crt\nfuture=1\nnetwork=wifi\nlanguage=fr\npad-slot=x\npad-slot=9=Pad\n",
         );
         assert_eq!(parsed, Settings::default());
     }
@@ -775,6 +814,8 @@ mod tests {
         let changed = Settings {
             scale: ScaleMode::Native,
             size_match: SizeMatch::WindowToHost,
+            upscale: Upscale::Auto,
+            frame_gen: FrameGen::On,
             send_keyboard: false,
             send_mouse: false,
             send_pads: false,
@@ -799,6 +840,8 @@ mod tests {
             language: "en-x".into(),
             beta_releases: true,
             skip_host_service_prompt: false,
+            view_only: false,
+            exclusive: false,
         };
         let factory = Settings::default();
         for field in Field::ALL {
@@ -812,6 +855,18 @@ mod tests {
             settings.reset(section, &factory);
         }
         assert_eq!(settings, factory);
+    }
+
+    #[test]
+    fn view_only_and_exclusive_round_trip() {
+        let mut settings = Settings::default();
+        settings.view_only = true;
+        settings.exclusive = true;
+        let parsed = parse_settings(&render_settings(&settings));
+        assert!(parsed.view_only);
+        assert!(parsed.exclusive);
+        assert!(!parse_settings("view-only=0\nexclusive=0\n").view_only);
+        assert!(parse_settings("view-only=1\nexclusive=1\n").exclusive);
     }
 
     #[test]

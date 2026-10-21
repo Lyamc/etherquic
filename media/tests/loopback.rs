@@ -94,6 +94,8 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
             display_hz: None,
             caps,
             log: Arc::new(|line: &str| eprintln!("host: {line}")),
+            cap_kbps: Arc::new(AtomicU64::new(0)),
+            carrier_tap: None,
         };
         let (_cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
         let result = host::run(streams, negotiated, slot, pcm_rx, options, cursor_rx).await;
@@ -151,6 +153,9 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
                 v2,
                 sink.clone(),
                 events_tx.clone(),
+                None,
+                None,
+                None,
             )));
         } else {
             let v2 = &magic == AUDIO2_MAGIC;
@@ -160,6 +165,8 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
                 v2,
                 pcm_tx.clone(),
                 events_tx.clone(),
+                None,
+                None,
             )));
         }
     }
@@ -206,6 +213,152 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
     }
     conn.close(0u32.into(), b"done");
     out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn carrier_3_pictures_leave_as_rtp_not_on_the_uni_stream() {
+    use std::sync::atomic::AtomicU64;
+    etherquic::carrier::set_l3_port(0);
+    etherquic::carrier::set_avb_enabled(false);
+    let mut port = 0u16;
+    for candidate in 21_000..21_200 {
+        if std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, candidate)).is_ok()
+            && std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, candidate + 1)).is_ok()
+            && std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, candidate + 2)).is_ok()
+        {
+            port = candidate;
+            break;
+        }
+    }
+    assert_ne!(port, 0, "no free rtp ports");
+    etherquic::carrier::set_l3_port(port);
+    let _reset = PortReset;
+    let offer = etherquic_media::negotiate::build_offer(&etherquic_media::negotiate::OfferInput {
+        video_order: &[Video::Mjpeg],
+        audio_order: &[Audio::Pcm],
+        decodes: &[VideoCodec::Mjpeg],
+        carrier: Some(etherquic::carrier::UDP_RTP),
+        ..Default::default()
+    });
+    etherquic::install_pure_crypto();
+    let (cert, key) = certs();
+    let listeners = etherquic::udp_listeners(free_port(), &cert, &key);
+    let server = listeners.v4.clone().expect("listener");
+    let listen = listeners.port;
+    let (pic_tx, pic_rx) = tokio::sync::mpsc::channel(8);
+    let (aud_tx, aud_rx) = tokio::sync::mpsc::channel(8);
+    let mut pic_rx = Some(pic_rx);
+    let mut aud_rx = Some(aud_rx);
+    etherquic::carrier::spawn_player_rtp(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port.saturating_add(2))),
+        pic_tx,
+        aud_tx,
+    );
+    let host_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let (negotiated, _) = host::accept_offer(&conn).await.unwrap();
+        let streams = host::open_streams(&conn, negotiated.is_v2()).await.unwrap();
+        let slot = FrameSlot::new();
+        let feeder_slot = slot.clone();
+        let feeder = std::thread::spawn(move || {
+            for i in 0..40 {
+                feeder_slot.put(frame(i));
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            feeder_slot.close();
+        });
+        let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            let _ = pcm_tx
+                .send(Pcm {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    samples: vec![1i16; 960 * 2],
+                })
+                .await;
+        });
+        let options = HostOptions {
+            fps: etherquic::negotiate::FpsWish::Fixed(30),
+            display_hz: None,
+            caps: HostCaps::baseline(),
+            log: Arc::new(|line: &str| eprintln!("host: {line}")),
+            cap_kbps: Arc::new(AtomicU64::new(0)),
+            carrier_tap: None,
+        };
+        let (_cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
+        let result = host::run(streams, negotiated, slot, pcm_rx, options, cursor_rx).await;
+        let _ = feeder.join();
+        result
+    });
+    let endpoint = etherquic::udp_client_endpoint_on("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listen));
+    let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let _offer_send = player::send_offer(&conn, &offer).await.unwrap();
+    let frames = Arc::new(AtomicU64::new(0));
+    let counted = frames.clone();
+    let sink: etherquic_media::Sink<Frame> = Arc::new(move |_| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        true
+    });
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pcm_tx, _pcm_rx) = tokio::sync::mpsc::channel(4);
+    let mut video_task = None;
+    let mut audio_task = None;
+    for _ in 0..2 {
+        let mut recv = conn.accept_uni().await.unwrap();
+        let magic = wire::read_magic(&mut recv).await.unwrap().unwrap();
+        if &magic == VIDEO2_MAGIC {
+            video_task = Some(tokio::spawn(player::read_video(
+                recv,
+                true,
+                sink.clone(),
+                events_tx.clone(),
+                Some(etherquic::carrier::UDP_RTP),
+                pic_rx.take(),
+                None,
+            )));
+        } else if &magic == AUDIO2_MAGIC {
+            audio_task = Some(tokio::spawn(player::read_audio(
+                recv,
+                true,
+                pcm_tx.clone(),
+                events_tx.clone(),
+                aud_rx.take(),
+                None,
+            )));
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while frames.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        frames.load(Ordering::Relaxed) > 0,
+        "player decoded no carrier-3 picture (sealed {})",
+        etherquic::carrier::rtp_sealed()
+    );
+    assert!(
+        etherquic::carrier::rtp_sealed() > 0,
+        "carrier 3 did not seal an RTP payload"
+    );
+    conn.close(0u32.into(), b"done");
+    let _ = host_task.await;
+    if let Some(task) = video_task {
+        let _ = task.await;
+    }
+    if let Some(task) = audio_task {
+        let _ = task.await;
+    }
+}
+
+struct PortReset;
+
+impl Drop for PortReset {
+    fn drop(&mut self) {
+        etherquic::carrier::release_rtp();
+        etherquic::carrier::set_l3_port(0);
+        etherquic::carrier::set_avb_enabled(false);
+    }
 }
 
 fn mjpeg_only_offer(video: &[Video]) -> Offer {
@@ -264,6 +417,11 @@ async fn real_codecs_and_renegotiation() {
         false,
         etherquic_media::negotiate::YuvFormat::YUV444P8,
         etherquic_media::negotiate::FpsWish::Auto,
+        0,
+        0,
+        false,
+        false,
+        None,
     );
     let expect =
         etherquic_media::negotiate::choose_video(&offer, &probe.caps, &[], Some((320, 180))).row;

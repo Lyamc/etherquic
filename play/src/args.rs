@@ -4,9 +4,9 @@ use std::env;
 use std::path::PathBuf;
 
 use etherquic::parse_mac;
-use etherquic_play::{
-    CursorMode, Dither, Look, PadSlot, ScaleMode, SizeMatch, ViewOptions, CLIENT_MAC,
-    DEFAULT_MAX_WIDTH, HOST_MAC, PAD_SLOTS, SERVICE_ID,
+use crate::{
+    CursorMode, Dither, FrameGen, Look, PadSlot, ScaleMode, SizeMatch, Upscale, ViewOptions,
+    CLIENT_MAC, DEFAULT_MAX_WIDTH, HOST_MAC, PAD_SLOTS, SERVICE_ID,
 };
 
 pub struct Host {
@@ -26,6 +26,10 @@ pub struct Connect {
     pub service_id: u16,
     /// Dial the host over UDP instead of raw Ethernet.
     pub udp: Option<std::net::SocketAddr>,
+    /// L2 Connect already holds a discovery offer. Carriers 3–5 use `rtp` only.
+    pub l2_offer: bool,
+    /// Host IP and RTP input port from that offer. Port 0 fails the view.
+    pub rtp: Option<std::net::SocketAddr>,
     /// Ask the host to confirm stamped input.
     pub trace_input: bool,
     /// Scale, what to send, pad slots, and the speaker.
@@ -34,7 +38,9 @@ pub struct Connect {
     /// the session cleanly.
     pub parent_pipe: bool,
     /// Codec order and pins for the offer.
-    pub codecs: etherquic_play::CodecChoice,
+    pub codecs: crate::CodecChoice,
+    /// `plain` or `gcm`. Absent leaves UDP/RTP on `gcm` and ST 2110 on `plain`.
+    pub profile: Option<String>,
 }
 
 pub enum Command {
@@ -94,10 +100,13 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
     let mut peer_mac = None;
     let mut service_id = SERVICE_ID;
     let mut udp = None;
+    let mut l2_offer = false;
+    let mut rtp = None;
     let mut trace_input = false;
     let mut view = ViewOptions::default();
     let mut parent_pipe = false;
-    let mut codecs = etherquic_play::CodecChoice::default();
+    let mut codecs = crate::CodecChoice::default();
+    let mut profile = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -149,34 +158,47 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
                 view.size_match = SizeMatch::from_token(&token)
                     .ok_or_else(|| format!("bad --size-match {token}"))?;
             }
+            "--upscale" => {
+                let token = need(args, &mut i, "--upscale")?;
+                view.upscale = Upscale::from_token(&token)
+                    .ok_or_else(|| format!("bad --upscale {token}"))?;
+            }
+            "--frame-gen" => {
+                let token = need(args, &mut i, "--frame-gen")?;
+                view.frame_gen = FrameGen::from_token(&token)
+                    .ok_or_else(|| format!("bad --frame-gen {token}"))?;
+            }
             "--output-device" => view.output_device = Some(need(args, &mut i, "--output-device")?),
             "--pad" => view.pad_slots.push(pad(need(args, &mut i, "--pad")?)?),
             "--peer-mac" => peer_mac = Some(mac(need(args, &mut i, "--peer-mac")?)?),
             "--service-id" => service_id = number(need(args, &mut i, "--service-id")?)?,
             "--udp" => udp = Some(number(need(args, &mut i, "--udp")?)?),
+            "--l2-offer" => flag(&mut i, &mut l2_offer),
+            "--rtp" => rtp = Some(number(need(args, &mut i, "--rtp")?)?),
             "--video" => {
                 codecs.video =
-                    etherquic_play::CodecChoice::parse_video(&need(args, &mut i, "--video")?)
+                    crate::CodecChoice::parse_video(&need(args, &mut i, "--video")?)
             }
             "--audio" => {
                 codecs.audio =
-                    etherquic_play::CodecChoice::parse_audio(&need(args, &mut i, "--audio")?)
+                    crate::CodecChoice::parse_audio(&need(args, &mut i, "--audio")?)
             }
             "--video-pin" => {
                 let token = need(args, &mut i, "--video-pin")?;
                 codecs.video_pin = Some(
-                    etherquic_play::PicturePref::from_token(&token)
+                    crate::PicturePref::from_token(&token)
                         .ok_or_else(|| format!("bad --video-pin {token}"))?,
                 );
             }
             "--audio-pin" => {
                 let token = need(args, &mut i, "--audio-pin")?;
                 codecs.audio_pin = Some(
-                    etherquic_play::AudioId::from_token(&token)
+                    crate::AudioId::from_token(&token)
                         .ok_or_else(|| format!("bad --audio-pin {token}"))?,
                 );
             }
             "--max-width" => codecs.max_width = number(need(args, &mut i, "--max-width")?)?,
+            "--max-height" => codecs.max_height = number(need(args, &mut i, "--max-height")?)?,
             "--bitrate" => codecs.bitrate_kbps = number(need(args, &mut i, "--bitrate")?)?,
             "--quality" => {
                 let value: u32 = number(need(args, &mut i, "--quality")?)?;
@@ -198,6 +220,39 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
                 codecs.yuv = yuv;
                 view.yuv = yuv;
             }
+            "--fps" => {
+                let token = need(args, &mut i, "--fps")?;
+                codecs.fps = etherquic::negotiate::FpsWish::from_token(&token);
+            }
+            "--audio-bitrate" => {
+                codecs.audio_bitrate_kbps = number(need(args, &mut i, "--audio-bitrate")?)?
+            }
+            "--audio-channels" => {
+                let n: u32 = number(need(args, &mut i, "--audio-channels")?)?;
+                if n > etherquic::negotiate::AUDIO_CHANNELS_MAX as u32 {
+                    return Err(format!(
+                        "--audio-channels {n} is above {}",
+                        etherquic::negotiate::AUDIO_CHANNELS_MAX
+                    ));
+                }
+                codecs.audio_channels = n as u16;
+            }
+            "--view-only" => flag(&mut i, &mut codecs.view_only),
+            "--exclusive" => flag(&mut i, &mut codecs.exclusive),
+            "--carrier" => {
+                let value: u32 = number(need(args, &mut i, "--carrier")?)?;
+                if !(1..=5).contains(&value) {
+                    return Err(format!("--carrier {value} is not 1-5"));
+                }
+                codecs.carrier = Some(value as u8);
+            }
+            "--profile" => {
+                let token = need(args, &mut i, "--profile")?;
+                if token != "plain" && token != "gcm" {
+                    return Err(format!("--profile {token} is not plain or gcm"));
+                }
+                profile = Some(token);
+            }
             other => return Err(format!("unknown arg {other}\n{}", usage())),
         }
     }
@@ -206,16 +261,22 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
         (None, Some(_)) => HOST_MAC,
         (None, None) => return Err(format!("missing --peer-mac or --udp\n{}", usage())),
     };
+    if rtp.is_some() {
+        l2_offer = true;
+    }
     Ok(Command::Connect(Connect {
         nic,
         local_mac,
         peer_mac,
         service_id,
         udp,
+        l2_offer,
+        rtp,
         trace_input,
         view,
         parent_pipe,
         codecs,
+        profile,
     }))
 }
 
@@ -294,13 +355,17 @@ etherquic-play connect --udp IP:PORT
     [--cursor native|copy|remote] [--size-match independent|window-to-host]
     [--look off|blocks|poster|gameboy|pico8|…] [--dither bayer4|bluenoise|floyd-steinberg|…]
     [--pixel-size 1-32] [--dither-strength 0-100]
+    [--upscale off|auto|fsr|dlss|xess] [--frame-gen off|auto|on]
     [--no-keyboard] [--no-mouse] [--no-pads]
     [--output-device NAME] [--pad SLOT=NAME]... [--parent-pipe]
     [--video av1-hw,h265-hw,h264-hw,pyrowave,jpegxs,openapv,mjpeg,h264-sw] [--audio opus,pcm]
-    [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--bitrate KBPS]
+    [--video-pin TOKEN] [--audio-pin TOKEN] [--max-width PX] [--max-height PX] [--bitrate KBPS]
     [--quality 1-100] [--dirty-rects] [--debug-dirty-rects] [--yuv 420p8|422p8|444p8|420p10|422p10|444p10]
+    [--fps auto|match|N] [--audio-bitrate KBPS] [--audio-channels 0-8]
+    [--view-only] [--exclusive] [--carrier 1-5] [--profile plain|gcm]
+    [--l2-offer] [--rtp IP:PORT]
 
-host shares this desktop, its audio, and takes keyboard, mouse, and gamepad from one player.
+host shares this desktop, its audio, and takes keyboard, mouse, and gamepad from connected players.
 connect opens the view. The player window has to be focused to send the keyboard and the mouse. Gamepads send while that view is open.
 "
     .to_string()
@@ -322,11 +387,21 @@ mod tests {
             "opus,pcm",
             "--video-pin",
             "h264-sw",
+            "--max-width",
+            "1280",
+            "--max-height",
+            "720",
             "--bitrate",
             "9000",
             "--quality",
             "7",
             "--dirty-rects",
+            "--fps",
+            "60",
+            "--audio-bitrate",
+            "96",
+            "--audio-channels",
+            "6",
         ];
         let Ok(Command::Connect(c)) = parse(args.iter().map(|s| s.to_string())) else {
             panic!()
@@ -334,20 +409,25 @@ mod tests {
         assert_eq!(
             c.codecs.video,
             vec![
-                etherquic_play::PicturePref::Pyrowave,
-                etherquic_play::PicturePref::Mjpeg
+                crate::PicturePref::Pyrowave,
+                crate::PicturePref::Mjpeg
             ]
         );
         assert_eq!(
             c.codecs.audio,
-            vec![etherquic_play::AudioId::Opus, etherquic_play::AudioId::Pcm]
+            vec![crate::AudioId::Opus, crate::AudioId::Pcm]
         );
         assert_eq!(
             c.codecs.video_pin,
-            Some(etherquic_play::PicturePref::H264Sw)
+            Some(crate::PicturePref::H264Sw)
         );
+        assert_eq!(c.codecs.max_width, 1280);
+        assert_eq!(c.codecs.max_height, 720);
         assert_eq!(c.codecs.bitrate_kbps, 9000);
         assert_eq!(c.codecs.quality, 7);
+        assert_eq!(c.codecs.fps, etherquic::negotiate::FpsWish::Fixed(60));
+        assert_eq!(c.codecs.audio_bitrate_kbps, 96);
+        assert_eq!(c.codecs.audio_channels, 6);
         assert_eq!(c.view.quality, 7);
         assert!(c.codecs.dirty_rects);
         assert!(c.view.dirty_rects);
@@ -366,6 +446,28 @@ mod tests {
             Ok(_) => panic!("not connect"),
             Err(err) => panic!("{err}"),
         }
+    }
+
+    #[test]
+    fn connect_takes_plain_or_gcm_and_rejects_other_tokens() {
+        let plain = connect(&[
+            "connect",
+            "--udp",
+            "127.0.0.1:9",
+            "--profile",
+            "plain",
+        ]);
+        assert_eq!(plain.profile.as_deref(), Some("plain"));
+        let gcm = connect(&["connect", "--udp", "127.0.0.1:9", "--profile", "gcm"]);
+        assert_eq!(gcm.profile.as_deref(), Some("gcm"));
+        let absent = connect(&["connect", "--udp", "127.0.0.1:9"]);
+        assert!(absent.profile.is_none());
+        let err = parse(
+            ["connect", "--udp", "127.0.0.1:9", "--profile", "none"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert!(err.is_err());
     }
 
     #[test]
@@ -397,6 +499,10 @@ mod tests {
             "70",
             "--size-match",
             "window-to-host",
+            "--upscale",
+            "fsr",
+            "--frame-gen",
+            "on",
             "--no-keyboard",
             "--no-pads",
             "--output-device",
@@ -413,6 +519,8 @@ mod tests {
         assert_eq!(c.view.pixel_size, 8);
         assert_eq!(c.view.dither_strength, 70);
         assert_eq!(c.view.size_match, SizeMatch::WindowToHost);
+        assert_eq!(c.view.upscale, Upscale::Fsr);
+        assert_eq!(c.view.frame_gen, FrameGen::On);
         assert!(!c.view.send_keyboard && c.view.send_mouse && !c.view.send_pads);
         assert_eq!(
             c.view.output_device.as_deref(),
@@ -433,6 +541,8 @@ mod tests {
             &["connect", "--udp", "1.2.3.4:1", "--scale", "zoom"][..],
             &["connect", "--udp", "1.2.3.4:1", "--cursor", "zoom"][..],
             &["connect", "--udp", "1.2.3.4:1", "--look", "zoom"][..],
+            &["connect", "--udp", "1.2.3.4:1", "--upscale", "nis"][..],
+            &["connect", "--udp", "1.2.3.4:1", "--frame-gen", "nis"][..],
             &["connect", "--udp", "1.2.3.4:1", "--dither", "zoom"][..],
             &["connect", "--udp", "1.2.3.4:1", "--pixel-size", "0"][..],
             &["connect", "--udp", "1.2.3.4:1", "--pad", "4=X"][..],

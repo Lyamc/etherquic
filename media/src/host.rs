@@ -8,7 +8,8 @@
 //! encoded. That keeps inter-frame codecs (H.264, H.265, AV1) valid: every
 //! coded frame that leaves the encoder reaches the player.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,18 @@ use crate::video::{EncodeSetup, VideoEncoder};
 use crate::{wire, yuv, Frame, Log, Pcm};
 
 static DIRTY_RECTS: AtomicBool = AtomicBool::new(false);
+static CAPTURE_FPS: AtomicU32 = AtomicU32::new(0);
+
+/// Capture rate the desk or the host service set while hosting. `0` keeps the
+/// rate the capture loop was started with.
+pub fn set_capture_fps(fps: u32) {
+    CAPTURE_FPS.store(fps, Ordering::Relaxed);
+}
+
+pub fn capture_fps_override() -> Option<u32> {
+    let fps = CAPTURE_FPS.load(Ordering::Relaxed);
+    (fps > 0).then_some(fps)
+}
 
 /// When this computer hosts: skip unchanged pictures, and send MJPEG/MJ2K
 /// dirty tiles, for a player that did not send `dirty-rects` in its offer.
@@ -34,6 +47,13 @@ pub fn set_dirty_rects(on: bool) {
 
 pub fn dirty_rects() -> bool {
     DIRTY_RECTS.load(Ordering::Relaxed)
+}
+
+/// Frame pacing for a capture loop that is already running. A desk or service
+/// override replaces the rate the loop started with. `0` clears the override.
+pub fn capture_period(started_fps: u32) -> Duration {
+    let fps = capture_fps_override().unwrap_or(started_fps).max(1);
+    Duration::from_millis((1000 / u64::from(fps)).max(1))
 }
 
 fn style_from_offer(offer: Option<&Offer>) -> etherquic::look::Style {
@@ -52,7 +72,7 @@ fn style_from_offer(offer: Option<&Offer>) -> etherquic::look::Style {
 
 /// The player's offer wins when it sent `dirty-rects`. An older player leaves
 /// the line off, and this host's Settings toggle still applies.
-fn offer_wants_dirty_rects(offer: Option<&Offer>) -> bool {
+pub fn offer_wants_dirty_rects(offer: Option<&Offer>) -> bool {
     match offer.and_then(|offer| offer.want_dirty_rects) {
         Some(want) => want,
         None => dirty_rects(),
@@ -107,6 +127,12 @@ impl FrameSlot {
         self.inner.0.lock().map(|s| s.closed).unwrap_or(true)
     }
 
+    /// The newest frame, if capture has stored one.
+    pub fn latest(&self) -> Option<Arc<Frame>> {
+        let (lock, _) = &*self.inner;
+        lock.lock().ok().and_then(|state| state.frame.clone())
+    }
+
     /// The newest frame after `seen`, waiting up to `timeout`.
     pub fn wait(&self, seen: u64, timeout: Duration) -> Wait {
         let (lock, cond) = &*self.inner;
@@ -132,6 +158,424 @@ impl FrameSlot {
                 Err(_) => return Wait::Closed,
             }
         }
+    }
+}
+
+/// Shrink a wide capture so one carrier record finishes inside the player wait.
+pub fn fit_width(frame: &Frame, max_width: u32) -> Frame {
+    let max_width = max_width.max(2);
+    if frame.width <= max_width || frame.width < 2 || frame.height < 2 {
+        return frame.clone();
+    }
+    let mut width = frame.width.min(max_width);
+    width -= width % 2;
+    let mut height =
+        ((u64::from(frame.height) * u64::from(width)) / u64::from(frame.width)).max(2) as u32;
+    height -= height % 2;
+    if height == 0 {
+        height = 2;
+    }
+    let mut rgb = vec![0u8; (width as usize) * (height as usize) * 3];
+    for y in 0..height {
+        let sy = (u64::from(y) * u64::from(frame.height)) / u64::from(height);
+        for x in 0..width {
+            let sx = (u64::from(x) * u64::from(frame.width)) / u64::from(width);
+            let from = ((sy * u64::from(frame.width) + sx) * 3) as usize;
+            let to = ((u64::from(y) * u64::from(width) + u64::from(x)) * 3) as usize;
+            if from + 3 <= frame.rgb.len() && to + 3 <= rgb.len() {
+                rgb[to..to + 3].copy_from_slice(&frame.rgb[from..from + 3]);
+            }
+        }
+    }
+    Frame { width, height, rgb }
+}
+
+/// JPEG-encode one frame and send it with raw PCM on carriers 3–5.
+///
+/// No Quinn connection. The audio body is even little-endian samples, with no
+/// record prefix, so ST 2110's sample rebuild matches the bytes UDP and AVB return.
+pub fn serve_carrier(id: u8, frame: &Frame, pcm: &Pcm) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let picture = crate::jpeg::encode(frame, crate::jpeg::QUALITY)?;
+    let mut audio = Vec::with_capacity(pcm.samples.len() * 2);
+    for sample in &pcm.samples {
+        audio.extend_from_slice(&sample.to_le_bytes());
+    }
+    if picture.is_empty() || audio.is_empty() {
+        return Err("carrier picture or audio is empty".into());
+    }
+    if !etherquic::carrier::host_push(id, &picture, &audio) {
+        return Err("carrier did not send".into());
+    }
+    Ok((picture, audio))
+}
+
+/// How long a queued keyframe may wait for a natural I-frame before the host
+/// forces one on every copy of the stream.
+pub const KEYFRAME_WAIT: Duration = Duration::from_millis(4000);
+
+/// Players ask for a keyframe; each encoder waits [`KEYFRAME_WAIT`] for a
+/// natural I-frame, then reopens so every subscriber gets the same IDR.
+#[derive(Clone, Default)]
+pub struct KeyframeBus {
+    gen: Arc<AtomicU64>,
+}
+
+impl KeyframeBus {
+    pub fn request(&self) {
+        self.gen.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn poll(&self, seen: &mut u64) -> bool {
+        let gen = self.gen.load(Ordering::SeqCst);
+        if gen > *seen {
+            *seen = gen;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct Member {
+    id: u64,
+    conn: Connection,
+    exclusive: bool,
+}
+
+struct RoomInner {
+    exclusive: AtomicBool,
+    next_id: AtomicU64,
+    members: Mutex<Vec<Member>>,
+}
+
+/// Who is in this host: exclusive lock, and the connections to kick.
+#[derive(Clone, Default)]
+pub struct Room {
+    inner: Arc<RoomInner>,
+}
+
+impl Default for RoomInner {
+    fn default() -> Self {
+        Self {
+            exclusive: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            members: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+/// Result of offering a seat in a [`Room`].
+pub enum Admit {
+    Ok(u64),
+    Busy,
+}
+
+impl Room {
+    pub fn locked(&self) -> bool {
+        self.inner.exclusive.load(Ordering::SeqCst)
+    }
+
+    /// Record this connection. An exclusive offer kicks everyone else.
+    pub fn admit(&self, conn: &Connection, exclusive: bool) -> Admit {
+        let Ok(mut members) = self.inner.members.lock() else {
+            return Admit::Busy;
+        };
+        if self.inner.exclusive.load(Ordering::SeqCst) {
+            return Admit::Busy;
+        }
+        if exclusive {
+            for member in members.drain(..) {
+                member.conn.close(1u32.into(), b"exclusive");
+            }
+            self.inner.exclusive.store(true, Ordering::SeqCst);
+        }
+        let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
+        members.push(Member {
+            id,
+            conn: conn.clone(),
+            exclusive,
+        });
+        Admit::Ok(id)
+    }
+
+    pub fn leave(&self, id: u64) {
+        let Ok(mut members) = self.inner.members.lock() else {
+            return;
+        };
+        if let Some(index) = members.iter().position(|member| member.id == id) {
+            let exclusive = members[index].exclusive;
+            members.remove(index);
+            if exclusive {
+                self.inner.exclusive.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Shared encode + exclusive lock for every player on this host.
+#[derive(Clone, Default)]
+pub struct SharedEncode {
+    pub keyframes: KeyframeBus,
+    pub hub: Option<EncodeHub>,
+    pub room: Option<Room>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum EncodeKey {
+    Legacy,
+    V2(Vec<u8>),
+}
+
+impl EncodeKey {
+    /// Fields [`Offer::same_codecs`] treats as encoder-preserving are stripped
+    /// so look, view-only, exclusive, and a keyframe pulse share one pump.
+    fn from_offer(offer: Option<&Offer>) -> Self {
+        match offer {
+            None => Self::Legacy,
+            Some(offer) => {
+                let mut offer = offer.clone();
+                offer.look = etherquic::look::Look::Off;
+                offer.dither = None;
+                offer.pixel_size = None;
+                offer.dither_strength = None;
+                offer.view_only = false;
+                offer.exclusive = false;
+                offer.want_keyframe = false;
+                Self::V2(offer.encode())
+            }
+        }
+    }
+}
+
+struct Sub {
+    id: u64,
+    tx: mpsc::Sender<VideoOut>,
+    wait_idr: bool,
+}
+
+#[derive(Clone)]
+struct FanOut {
+    subscribers: Arc<Mutex<Vec<Sub>>>,
+    last_config: Arc<Mutex<Option<Vec<u8>>>>,
+    keyframes: KeyframeBus,
+    intra: Arc<AtomicBool>,
+}
+
+impl FanOut {
+    fn set_intra(&self, intra: bool) {
+        self.intra.store(intra, Ordering::Relaxed);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.subscribers
+            .lock()
+            .map(|subs| subs.is_empty())
+            .unwrap_or(true)
+    }
+
+    fn send(&self, out: VideoOut) -> bool {
+        let must = matches!(&out, VideoOut::Config(_));
+        if let VideoOut::Config(bytes) = &out {
+            if let Ok(mut slot) = self.last_config.lock() {
+                *slot = Some(bytes.clone());
+            }
+        }
+        let intra = self.intra.load(Ordering::Relaxed);
+        let snapshot: Vec<(u64, mpsc::Sender<VideoOut>, bool)> = {
+            let Ok(subs) = self.subscribers.lock() else {
+                return false;
+            };
+            if subs.is_empty() {
+                return false;
+            }
+            subs.iter()
+                .map(|sub| (sub.id, sub.tx.clone(), sub.wait_idr))
+                .collect()
+        };
+        let mut lagged = false;
+        let mut dead = Vec::new();
+        let mut unblocked = Vec::new();
+        for (id, tx, wait_idr) in snapshot {
+            if wait_idr && !must && !intra {
+                continue;
+            }
+            let alive = if must {
+                tx.blocking_send(out.clone()).is_ok()
+            } else {
+                match tx.try_send(out.clone()) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        lagged = true;
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                }
+            };
+            if !alive {
+                dead.push(id);
+            } else if must {
+                unblocked.push(id);
+            }
+        }
+        if lagged {
+            self.keyframes.request();
+        }
+        let Ok(mut subs) = self.subscribers.lock() else {
+            return false;
+        };
+        subs.retain(|sub| !dead.contains(&sub.id));
+        if must {
+            for sub in subs.iter_mut() {
+                if unblocked.contains(&sub.id) {
+                    sub.wait_idr = false;
+                }
+            }
+        }
+        !subs.is_empty()
+    }
+}
+
+struct PumpSlot {
+    subscribers: Arc<Mutex<Vec<Sub>>>,
+    last_config: Arc<Mutex<Option<Vec<u8>>>>,
+    next_id: Arc<AtomicU64>,
+    offer_tx: watch::Sender<Option<Offer>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Drops every subscriber sender when the encode thread ends, including panic.
+struct PumpExit {
+    subscribers: Arc<Mutex<Vec<Sub>>>,
+}
+
+impl Drop for PumpExit {
+    fn drop(&mut self) {
+        if let Ok(mut subs) = self.subscribers.lock() {
+            subs.clear();
+        }
+    }
+}
+
+/// One encoder per matching offer. Late joiners share it and ask for a keyframe.
+#[derive(Clone)]
+pub struct EncodeHub {
+    frames: FrameSlot,
+    keyframes: KeyframeBus,
+    fps: FpsWish,
+    display_hz: Option<u32>,
+    caps: crate::negotiate::HostCaps,
+    log: Log,
+    cap_kbps: Arc<AtomicU64>,
+    inner: Arc<Mutex<HashMap<EncodeKey, PumpSlot>>>,
+}
+
+impl EncodeHub {
+    pub fn new(frames: FrameSlot, keyframes: KeyframeBus, options: &HostOptions) -> Self {
+        Self {
+            frames,
+            keyframes,
+            fps: options.fps,
+            display_hz: options.display_hz,
+            caps: options.caps.clone(),
+            log: options.log.clone(),
+            cap_kbps: options.cap_kbps.clone(),
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn pump_options(&self) -> HostOptions {
+        HostOptions {
+            fps: self.fps,
+            display_hz: self.display_hz,
+            caps: self.caps.clone(),
+            log: self.log.clone(),
+            cap_kbps: self.cap_kbps.clone(),
+            carrier_tap: None,
+        }
+    }
+
+    fn subscribe(&self, offer: Option<Offer>) -> mpsc::Receiver<VideoOut> {
+        let key = EncodeKey::from_offer(offer.as_ref());
+        let (tx, rx) = mpsc::channel(8);
+        let Ok(mut inner) = self.inner.lock() else {
+            return rx;
+        };
+        self.reap(&mut inner);
+        if let Some(slot) = inner.get_mut(&key) {
+            let _ = slot.offer_tx.send(offer);
+            if let Ok(config) = slot.last_config.lock() {
+                if let Some(bytes) = config.clone() {
+                    let _ = tx.try_send(VideoOut::Config(bytes));
+                }
+            }
+            let id = slot.next_id.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut subs) = slot.subscribers.lock() {
+                subs.push(Sub {
+                    id,
+                    tx,
+                    wait_idr: true,
+                });
+            }
+            self.keyframes.request();
+            return rx;
+        }
+        let subscribers = Arc::new(Mutex::new(vec![Sub {
+            id: 1,
+            tx,
+            wait_idr: false,
+        }]));
+        let last_config = Arc::new(Mutex::new(None));
+        let intra = Arc::new(AtomicBool::new(true));
+        let fan = FanOut {
+            subscribers: subscribers.clone(),
+            last_config: last_config.clone(),
+            keyframes: self.keyframes.clone(),
+            intra: intra.clone(),
+        };
+        let frames = self.frames.clone();
+        let options = self.pump_options();
+        let keyframes = self.keyframes.clone();
+        let (offer_tx, offer_rx) = watch::channel(offer);
+        let sent = Arc::new(AtomicU64::new(0));
+        let exit = PumpExit {
+            subscribers: subscribers.clone(),
+        };
+        let join = std::thread::Builder::new()
+            .name("etherquic-video-encode".into())
+            .spawn(move || {
+                let _exit = exit;
+                video_pump(frames, offer_rx, options, fan, sent, keyframes);
+            })
+            .ok();
+        inner.insert(
+            key,
+            PumpSlot {
+                subscribers,
+                last_config,
+                next_id: Arc::new(AtomicU64::new(2)),
+                offer_tx,
+                join,
+            },
+        );
+        rx
+    }
+
+    fn update_offer(&self, offer: Option<Offer>) {
+        let key = EncodeKey::from_offer(offer.as_ref());
+        let Ok(inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(slot) = inner.get(&key) {
+            let _ = slot.offer_tx.send(offer);
+        }
+    }
+
+    fn reap(&self, inner: &mut HashMap<EncodeKey, PumpSlot>) {
+        inner.retain(|_, slot| match &slot.join {
+            Some(handle) if handle.is_finished() => false,
+            None => false,
+            Some(_) => true,
+        });
     }
 }
 
@@ -185,10 +629,12 @@ pub async fn accept_offer(
     ))
 }
 
-/// The two host-to-player media streams.
+/// The two host-to-player media streams, plus the connection mode 2 uses
+/// for picture and audio datagrams.
 pub struct Streams {
     video: SendStream,
     audio: SendStream,
+    conn: Connection,
     v2: bool,
 }
 
@@ -208,7 +654,42 @@ pub async fn open_streams(conn: &Connection, v2: bool) -> Result<Streams, String
         .set_priority(etherquic::PRIORITY_AUDIO)
         .map_err(|e| e.to_string())?;
     wire::write_magic(&mut audio, am).await?;
-    Ok(Streams { video, audio, v2 })
+    Ok(Streams {
+        video,
+        audio,
+        conn: conn.clone(),
+        v2,
+    })
+}
+
+/// One media lane. Config and cursor stay on `send`. When the agreed carrier
+/// is QUIC datagrams, picture and audio records leave as datagrams after that
+/// config record has been written.
+struct LaneSend {
+    send: SendStream,
+    conn: Connection,
+    v2: bool,
+    lane: u8,
+    datagrams: bool,
+    next_id: u16,
+    seam: etherquic::carrier::Seam,
+    cap_kbps: Arc<AtomicU64>,
+    rate: etherquic::carrier::RateCap,
+    loss_at: Instant,
+    sent_base: u64,
+    lost_base: u64,
+    tap: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    capture_origin: Option<Instant>,
+}
+
+fn capture_at(lane: &mut LaneSend) -> Duration {
+    match lane.capture_origin {
+        Some(origin) => origin.elapsed(),
+        None => {
+            lane.capture_origin = Some(Instant::now());
+            Duration::ZERO
+        }
+    }
 }
 
 /// Host settings for one session.
@@ -220,8 +701,26 @@ pub struct HostOptions {
     pub display_hz: Option<u32>,
     pub caps: HostCaps,
     pub log: Log,
+    /// Encoder cap in kbit/s after a full second above 1% loss. Zero leaves the offer rate.
+    pub cap_kbps: Arc<AtomicU64>,
+    /// RTP, AVTP, and ST 2110 packets the session emitted. Empty for QUIC streams.
+    pub carrier_tap: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
+/// Offer bitrate, cut by the carrier cap once loss has reduced it.
+pub fn encoder_kbps(offer_kbps: u32, cap_kbps: u64) -> u32 {
+    if cap_kbps == 0 {
+        return offer_kbps;
+    }
+    let cap = u32::try_from(cap_kbps).unwrap_or(u32::MAX);
+    if offer_kbps == 0 {
+        cap
+    } else {
+        offer_kbps.min(cap)
+    }
+}
+
+#[derive(Clone)]
 enum VideoOut {
     Config(Vec<u8>),
     Data(Vec<u8>),
@@ -236,18 +735,92 @@ pub async fn run(
     frames: FrameSlot,
     audio: mpsc::Receiver<Pcm>,
     options: HostOptions,
+    cursor: watch::Receiver<Option<Vec<u8>>>,
+) -> Result<(), String> {
+    run_shared(
+        streams,
+        negotiated,
+        frames,
+        audio,
+        options,
+        cursor,
+        SharedEncode::default(),
+    )
+    .await
+}
+
+/// [`run`] with a room-wide encoder hub, keyframe bus, and exclusive lock.
+pub async fn run_shared(
+    streams: Streams,
+    negotiated: Negotiated,
+    frames: FrameSlot,
+    audio: mpsc::Receiver<Pcm>,
+    options: HostOptions,
     mut cursor: watch::Receiver<Option<Vec<u8>>>,
+    shared: SharedEncode,
 ) -> Result<(), String> {
     let Streams {
-        video: mut video_send,
+        video: video_send,
         audio: audio_send,
+        conn,
         v2,
     } = streams;
+    let agreed = match &negotiated {
+        Negotiated::V2 { offer, .. } => {
+            offer.carrier.unwrap_or(etherquic::carrier::QUIC_STREAMS)
+        }
+        Negotiated::Legacy => etherquic::carrier::QUIC_STREAMS,
+    };
+    let mut video_lane = LaneSend {
+        send: video_send,
+        conn: conn.clone(),
+        v2,
+        lane: etherquic::carrier::Lane::Picture as u8,
+        datagrams: agreed == etherquic::carrier::QUIC_DATAGRAMS,
+        next_id: 1,
+        seam: etherquic::carrier::Seam::open(agreed),
+        cap_kbps: options.cap_kbps.clone(),
+        rate: etherquic::carrier::RateCap::new(100_000_000),
+        loss_at: Instant::now(),
+        sent_base: 0,
+        lost_base: 0,
+        tap: options.carrier_tap.clone(),
+        capture_origin: None,
+    };
+    let audio_lane = LaneSend {
+        send: audio_send,
+        conn,
+        v2,
+        lane: etherquic::carrier::Lane::Audio as u8,
+        datagrams: agreed == etherquic::carrier::QUIC_DATAGRAMS,
+        next_id: 1,
+        seam: etherquic::carrier::Seam::open(agreed),
+        cap_kbps: options.cap_kbps.clone(),
+        rate: etherquic::carrier::RateCap::new(100_000_000),
+        loss_at: Instant::now(),
+        sent_base: 0,
+        lost_base: 0,
+        tap: options.carrier_tap.clone(),
+        capture_origin: None,
+    };
+    let keyframes = shared.keyframes.clone();
+    let owned_hub = shared
+        .hub
+        .is_none()
+        .then(|| EncodeHub::new(frames.clone(), keyframes.clone(), &options));
+    let hub = shared.hub.clone().or(owned_hub).expect("encode hub");
+    let _ = frames;
     let (offer_tx, offer_rx) = watch::channel::<Option<Offer>>(None);
+    let audio_offer = offer_rx.clone();
+    let mut offer_rx = offer_rx;
     let mut offer_task = None;
     if let Negotiated::V2 { offer, mut offers } = negotiated {
+        if offer.want_keyframe {
+            keyframes.request();
+        }
         let _ = offer_tx.send(Some(offer));
         let log = options.log.clone();
+        let keyframes = keyframes.clone();
         offer_task = Some(tokio::spawn(async move {
             loop {
                 match wire::read_record(&mut offers, OFFER_MAGIC).await {
@@ -259,6 +832,9 @@ pub async fn run(
                                 tokens(&next.failed),
                                 next.look.token()
                             ));
+                            if next.want_keyframe {
+                                keyframes.request();
+                            }
                             let _ = offer_tx.send(Some(next));
                         }
                         Err(error) => log(&format!("bad offer: {error}")),
@@ -269,16 +845,37 @@ pub async fn run(
         }));
     }
 
-    let (out_tx, mut out_rx) = mpsc::channel::<VideoOut>(4);
-    let sent = Arc::new(AtomicU64::new(0));
-    let pump_frames = frames;
-    let pump_options = options.clone();
-    let pump_offer = offer_rx.clone();
-    let pump_sent = sent.clone();
-    let pump = std::thread::Builder::new()
-        .name("etherquic-video-encode".into())
-        .spawn(move || video_pump(pump_frames, pump_offer, pump_options, out_tx, pump_sent))
-        .map_err(|e| e.to_string())?;
+    let (out_tx, mut out_rx) = mpsc::channel::<VideoOut>(8);
+    let mut sub_rx = hub.subscribe(offer_rx.borrow_and_update().clone());
+    let mut encode_key = EncodeKey::from_offer(offer_rx.borrow().as_ref());
+    let forward = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                out = sub_rx.recv() => {
+                    let Some(out) = out else {
+                        break;
+                    };
+                    if out_tx.send(out).await.is_err() {
+                        break;
+                    }
+                }
+                changed = offer_rx.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                    let next = offer_rx.borrow_and_update().clone();
+                    let next_key = EncodeKey::from_offer(next.as_ref());
+                    if next_key != encode_key {
+                        sub_rx = hub.subscribe(next);
+                        encode_key = next_key;
+                    } else {
+                        hub.update_offer(next);
+                    }
+                }
+            }
+        }
+    });
 
     let video_task = tokio::spawn(async move {
         let mut cursor_open = true;
@@ -290,72 +887,200 @@ pub async fn run(
                 // this frame instead of sitting in front of it.
                 out = out_rx.recv() => {
                     let Some(out) = out else { break };
-                    write_out(&mut video_send, v2, out).await?;
+                    write_out(&mut video_lane, out).await?;
                     if cursor_open {
-                        cursor_open = write_pending_cursor(&mut cursor, &mut video_send, v2).await?;
+                        cursor_open = write_pending_cursor(&mut cursor, &mut video_lane).await?;
                     }
                 }
                 changed = cursor.changed(), if cursor_open => {
                     match changed {
                         Ok(()) => {
-                            cursor_open = send_cursor(&mut cursor, &mut video_send, v2).await?;
+                            cursor_open = send_cursor(&mut cursor, &mut video_lane).await?;
                         }
                         Err(_) => cursor_open = false,
                     }
                 }
             }
         }
-        finish(&mut video_send).await
+        finish(&mut video_lane.send).await
     });
 
-    let audio_task = tokio::spawn(audio_loop(audio_send, v2, audio, offer_rx, options.clone()));
+    let audio_task = tokio::spawn(audio_loop(
+        audio_lane,
+        audio,
+        audio_offer,
+        options.clone(),
+    ));
 
-    let video_result = video_task.await.map_err(|e| e.to_string()).and_then(|r| r);
-    let audio_result = audio_task.await.map_err(|e| e.to_string()).and_then(|r| r);
-    let _ = tokio::task::spawn_blocking(move || pump.join()).await;
+    let (video_join, audio_join) = tokio::join!(video_task, audio_task);
+    forward.abort();
     if let Some(task) = offer_task {
         task.abort();
     }
+    let video_result = video_join.map_err(|e| e.to_string()).and_then(|r| r);
+    let audio_result = audio_join.map_err(|e| e.to_string()).and_then(|r| r);
     video_result.and(audio_result)
 }
 
-async fn write_out(send: &mut SendStream, v2: bool, out: VideoOut) -> Result<(), String> {
+async fn write_out(lane: &mut LaneSend, out: VideoOut) -> Result<(), String> {
     match out {
-        VideoOut::Config(bytes) if v2 => wire::write_record(send, VIDEO2_MAGIC, &bytes).await,
-        VideoOut::Config(_) => Ok(()),
-        VideoOut::Data(bytes) if v2 => {
-            wire::write_typed(send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await
+        VideoOut::Config(bytes) if lane.v2 => {
+            if let Ok(config) = StreamConfig::decode(&bytes) {
+                let id = config.carrier.unwrap_or(etherquic::carrier::QUIC_STREAMS);
+                lane.datagrams = id == etherquic::carrier::QUIC_DATAGRAMS;
+                lane.seam = etherquic::carrier::Seam::open(id);
+                etherquic::set_capture_carrier(id);
+                etherquic::carrier::apply_agreed_carrier(&lane.conn, id);
+            }
+            // The config record is on the reliable stream before any picture.
+            wire::write_record(&mut lane.send, VIDEO2_MAGIC, &bytes).await?;
+            if lane.seam.id() >= etherquic::carrier::UDP_RTP {
+                let capture = capture_at(lane);
+                let _ = lane
+                    .seam
+                    .send(etherquic::carrier::Lane::Picture, &bytes, None, capture);
+                flush_tap(lane);
+            }
+            Ok(())
         }
-        VideoOut::Data(bytes) => wire::write_record(send, LEGACY_VIDEO_MAGIC, &bytes).await,
-        VideoOut::Patch(bytes) if v2 => {
-            wire::write_typed(send, VIDEO2_MAGIC, RECORD_PATCH, &bytes).await
+        VideoOut::Config(_) => Ok(()),
+        VideoOut::Data(bytes) if lane.v2 && lane.seam.id() >= etherquic::carrier::UDP_RTP => {
+            send_seam(lane, RECORD_DATA, &bytes)
+        }
+        VideoOut::Data(bytes) if lane.v2 && lane.datagrams => {
+            send_datagram_record(lane, RECORD_DATA, &bytes).await
+        }
+        VideoOut::Data(bytes) if lane.v2 => {
+            wire::write_typed(&mut lane.send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await
+        }
+        VideoOut::Data(bytes) => wire::write_record(&mut lane.send, LEGACY_VIDEO_MAGIC, &bytes).await,
+        VideoOut::Patch(bytes) if lane.v2 && lane.seam.id() >= etherquic::carrier::UDP_RTP => {
+            send_seam(lane, RECORD_PATCH, &bytes)
+        }
+        VideoOut::Patch(bytes) if lane.v2 && lane.datagrams => {
+            send_datagram_record(lane, RECORD_PATCH, &bytes).await
+        }
+        VideoOut::Patch(bytes) if lane.v2 => {
+            wire::write_typed(&mut lane.send, VIDEO2_MAGIC, RECORD_PATCH, &bytes).await
         }
         VideoOut::Patch(_) => Ok(()),
     }
 }
 
+fn send_seam(lane: &mut LaneSend, kind: u8, payload: &[u8]) -> Result<(), String> {
+    let mut body = Vec::with_capacity(1 + payload.len());
+    body.push(kind);
+    body.extend_from_slice(payload);
+    let capture = capture_at(lane);
+    let _ = lane
+        .seam
+        .send(etherquic::carrier::Lane::Picture, &body, None, capture);
+    flush_tap(lane);
+    sample_loss(lane);
+    Ok(())
+}
+
+fn flush_tap(lane: &mut LaneSend) {
+    let packets = lane.seam.take_packets();
+    if let Some(tap) = &lane.tap {
+        for packet in packets {
+            let _ = tap.send(packet);
+        }
+    }
+}
+
+fn sample_loss(lane: &mut LaneSend) {
+    if lane.seam.id() == etherquic::carrier::UDP_RTP {
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(lane.loss_at);
+        if dt.is_zero() {
+            return;
+        }
+        lane.loss_at = now;
+        let cap = lane.seam.drive_cap(&mut lane.rate, dt);
+        if lane.rate.reduced() {
+            lane.cap_kbps.store(cap / 1000, Ordering::Relaxed);
+        } else {
+            lane.cap_kbps.store(0, Ordering::Relaxed);
+        }
+        return;
+    }
+    if lane.datagrams {
+        etherquic::carrier::observe_udp_rtt(lane.conn.rtt(), true);
+        etherquic::carrier::apply_agreed_carrier(
+            &lane.conn,
+            etherquic::carrier::QUIC_DATAGRAMS,
+        );
+    }
+    let stats = lane.conn.stats();
+    let now = Instant::now();
+    let dt = now.saturating_duration_since(lane.loss_at);
+    if dt.is_zero() {
+        return;
+    }
+    let sent = stats.path.sent_packets.saturating_sub(lane.sent_base);
+    let lost = stats.path.lost_packets.saturating_sub(lane.lost_base);
+    lane.sent_base = stats.path.sent_packets;
+    lane.lost_base = stats.path.lost_packets;
+    lane.loss_at = now;
+    let cap = lane.rate.apply_loss(dt, sent, lost);
+    if lane.rate.reduced() {
+        lane.cap_kbps.store(cap / 1000, Ordering::Relaxed);
+    } else {
+        lane.cap_kbps.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Lane byte, then the shared slice header, then a record body the player
+/// already understands (`D` or `R` plus the payload).
+async fn send_datagram_record(lane: &mut LaneSend, kind: u8, payload: &[u8]) -> Result<(), String> {
+    let mut body = Vec::with_capacity(1 + payload.len());
+    body.push(kind);
+    body.extend_from_slice(payload);
+    let id = lane.next_id;
+    lane.next_id = lane.next_id.wrapping_add(1);
+    let budget = lane
+        .conn
+        .max_datagram_size()
+        .unwrap_or(1200)
+        .saturating_sub(16)
+        .max(32);
+    for slice in etherquic::carrier::split_record(id, &body, budget) {
+        let mut packet = Vec::with_capacity(1 + slice.bytes.len() + 6);
+        packet.push(lane.lane);
+        packet.extend(slice.encode());
+        lane.conn
+            .send_datagram(packet.into())
+            .map_err(|e| e.to_string())?;
+    }
+    sample_loss(lane);
+    Ok(())
+}
+
 /// `false` when the cursor watch has closed.
 async fn write_pending_cursor(
     cursor: &mut watch::Receiver<Option<Vec<u8>>>,
-    send: &mut SendStream,
-    v2: bool,
+    lane: &mut LaneSend,
 ) -> Result<bool, String> {
     match cursor.has_changed() {
         Ok(false) => Ok(true),
         Err(_) => Ok(false),
-        Ok(true) => send_cursor(cursor, send, v2).await,
+        Ok(true) => send_cursor(cursor, lane).await,
     }
 }
 
 async fn send_cursor(
     cursor: &mut watch::Receiver<Option<Vec<u8>>>,
-    send: &mut SendStream,
-    v2: bool,
+    lane: &mut LaneSend,
 ) -> Result<bool, String> {
     let bytes = cursor.borrow_and_update().clone();
-    if v2 {
+    if lane.v2 {
         if let Some(bytes) = bytes {
-            wire::write_typed(send, VIDEO2_MAGIC, RECORD_CURSOR, &bytes).await?;
+            if lane.datagrams {
+                send_datagram_record(lane, RECORD_CURSOR, &bytes).await?;
+            } else {
+                wire::write_typed(&mut lane.send, VIDEO2_MAGIC, RECORD_CURSOR, &bytes).await?;
+            }
         }
     }
     Ok(true)
@@ -371,7 +1096,7 @@ fn send_patches(
     current: &Active,
     frame: &Frame,
     rects: &[dirty::Rect],
-    out: &mpsc::Sender<VideoOut>,
+    out: &FanOut,
     sent: &AtomicU64,
 ) -> Result<bool, String> {
     for rect in rects {
@@ -379,7 +1104,7 @@ fn send_patches(
         let coded = current.encoder.encode_intra(&tile)?;
         let payload = dirty::encode_payload(rect, &coded);
         sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
-        if out.blocking_send(VideoOut::Patch(payload)).is_err() {
+        if !out.send(VideoOut::Patch(payload)) {
             return Ok(false);
         }
     }
@@ -394,6 +1119,7 @@ struct Active {
     encoder: VideoEncoder,
     video: Video,
     size: (u32, u32),
+    requested_kbps: u32,
     /// Consecutive `push` failures. PyroWave reopens a few times before the
     /// host excludes it for the rest of the session.
     encode_fails: u32,
@@ -403,8 +1129,9 @@ fn video_pump(
     frames: FrameSlot,
     mut offer_rx: watch::Receiver<Option<Offer>>,
     options: HostOptions,
-    out: mpsc::Sender<VideoOut>,
+    out: FanOut,
     sent: Arc<AtomicU64>,
+    keyframes: KeyframeBus,
 ) {
     let log = options.log.clone();
     let mut offer = offer_rx.borrow_and_update().clone();
@@ -419,6 +1146,9 @@ fn video_pump(
     let mut tick_bytes = 0u64;
     let mut previous: Option<(u32, u32, Vec<u8>)> = None;
     let mut last_encode: Option<Instant> = None;
+    let mut keyframe_seen = 0u64;
+    let mut keyframe_wait: Option<Instant> = None;
+    let mut fresh_encoder = false;
     loop {
         if offer_rx.has_changed().unwrap_or(false) {
             let next = offer_rx.borrow_and_update().clone();
@@ -434,23 +1164,48 @@ fn video_pump(
                 reason = "the player sent a new offer".into();
             }
         }
+        if keyframes.poll(&mut keyframe_seen) && keyframe_wait.is_none() {
+            keyframe_wait = Some(Instant::now());
+        }
+        if keyframe_wait.is_some_and(|at| at.elapsed() >= KEYFRAME_WAIT) {
+            keyframe_wait = None;
+            previous = None;
+            if active
+                .as_ref()
+                .is_some_and(|current| !current.video.skip_bad_frame())
+            {
+                active = None;
+                reason = "keyframe requested".into();
+            }
+        }
+        if let Some(row) = active.as_ref() {
+            let wish = session_fps_wish(offer.as_ref().map(|o| o.fps), options.fps);
+            if let Some(period) = encode_period(wish, row.video.hardware(), options.display_hz) {
+                if let Some(last) = last_encode {
+                    let left = period.saturating_sub(last.elapsed());
+                    if !left.is_zero() {
+                        // Capture is paced to this same period. Discarding a
+                        // frame that arrived a little early skips a whole extra
+                        // capture and the session settles near 40 fps.
+                        // last_encode is when the previous frame was taken, so
+                        // this sleeps only the remainder after fit and encode.
+                        std::thread::sleep(left);
+                    }
+                }
+            }
+        }
         let frame = match frames.wait(seen, Duration::from_millis(250)) {
             Wait::Frame(seq, frame) => {
                 seen = seq;
+                // Start the period here. Stamping after push returns adds a
+                // full period on top of a codec that already finished.
+                last_encode = Some(Instant::now());
                 frame
             }
             Wait::Timeout if out.is_closed() => return,
             Wait::Timeout => continue,
             Wait::Closed => break,
         };
-        if let Some(active) = active.as_ref() {
-            let wish = session_fps_wish(offer.as_ref().map(|o| o.fps), options.fps);
-            if let Some(period) = encode_period(wish, active.video.hardware(), options.display_hz) {
-                if last_encode.is_some_and(|last| last.elapsed() < period) {
-                    continue;
-                }
-            }
-        }
         let (max_w, max_h) = offer
             .as_ref()
             .map(|o| (o.max.width, o.max.height))
@@ -462,6 +1217,12 @@ fn video_pump(
             frame.height,
             style_from_offer(offer.as_ref()),
         );
+        let offer_kbps = offer.as_ref().map(|o| o.bitrate_kbps).unwrap_or(0);
+        let capped = encoder_kbps(offer_kbps, options.cap_kbps.load(Ordering::Relaxed));
+        if active.as_ref().is_some_and(|row| row.requested_kbps != capped) {
+            active = None;
+            previous = None;
+        }
         if active
             .as_ref()
             .map(|a| a.size != (frame.width, frame.height))
@@ -485,7 +1246,7 @@ fn video_pump(
                         (pick.row, pick.encoder)
                     }
                 };
-                let kbps = offer.as_ref().map(|o| o.bitrate_kbps).unwrap_or(0);
+                let asked_kbps = capped;
                 let quality = offer.as_ref().map(|o| o.quality).unwrap_or(0);
                 let yuv = offer
                     .as_ref()
@@ -506,7 +1267,7 @@ fn video_pump(
                     width: frame.width,
                     height: frame.height,
                     fps,
-                    kbps,
+                    kbps: asked_kbps,
                     quality,
                     yuv,
                     dirty_rects: want_dirty,
@@ -515,10 +1276,10 @@ fn video_pump(
                 let sink_sent = sent.clone();
                 let sink: crate::Sink<Vec<u8>> = Arc::new(move |bytes: Vec<u8>| {
                     sink_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    sink_out.blocking_send(VideoOut::Data(bytes)).is_ok()
+                    sink_out.send(VideoOut::Data(bytes))
                 });
                 match VideoEncoder::open(&setup, sink) {
-                    Ok((encoder, kbps)) => {
+                    Ok((encoder, opened_kbps)) => {
                         let mut config = StreamConfig::video(
                             video,
                             &encoder_name,
@@ -526,9 +1287,32 @@ fn video_pump(
                             frame.height,
                             fps,
                         );
-                        config.bitrate_kbps = kbps;
+                        config.bitrate_kbps = opened_kbps;
                         config.yuv = yuv.bitstream();
                         config.dirty_rects = video.dirty_rects_mode(want_dirty, knows_patches);
+                        if v2 {
+                            if let Some(offer) = offer.as_ref() {
+                                let picture_ok = offer
+                                    .video
+                                    .iter()
+                                    .any(|video| matches!(video, Video::JpegXs));
+                                let opus = offer.audio.iter().any(|audio| matches!(audio, Audio::Opus));
+                                let pcm = offer.audio.iter().any(|audio| matches!(audio, Audio::Pcm));
+                                etherquic::carrier::prepare_announce(picture_ok, opus && !pcm);
+                            }
+                            let requested = offer.as_ref().and_then(|row| row.carrier);
+                            match etherquic::carrier::agree(
+                                true,
+                                requested,
+                                &etherquic::carrier::local_carriers(0),
+                            ) {
+                                Ok(id) => config.carrier = Some(id),
+                                Err(error) => {
+                                    log(&error);
+                                    return;
+                                }
+                            }
+                        }
                         config.reason = std::mem::take(&mut reason);
                         if first_config {
                             config.host = options.caps.clone();
@@ -541,8 +1325,8 @@ fn video_pump(
                             frame.width,
                             frame.height,
                             fps,
-                            if kbps > 0 {
-                                format!(" {kbps} kbit/s")
+                            if opened_kbps > 0 {
+                                format!(" {opened_kbps} kbit/s")
                             } else {
                                 String::new()
                             },
@@ -552,17 +1336,16 @@ fn video_pump(
                                 format!(", because {}", config.reason)
                             },
                         ));
-                        if v2
-                            && out
-                                .blocking_send(VideoOut::Config(config.encode()))
-                                .is_err()
-                        {
+                        if v2 && !out.send(VideoOut::Config(config.encode())) {
                             return;
                         }
+                        out.set_intra(video.skip_bad_frame());
+                        fresh_encoder = true;
                         active = Some(Active {
                             encoder,
                             video,
                             size: (frame.width, frame.height),
+                            requested_kbps: asked_kbps,
                             encode_fails: 0,
                         });
                         break;
@@ -600,7 +1383,23 @@ fn video_pump(
             frame.height,
         ) {
             dirty::Action::Skip => {
-                last_encode = Some(Instant::now());
+                // The newest PyroWave picture is still on the GPU. A skip
+                // never calls push, so map it now or it never goes out.
+                if let Some(current) = active.as_mut() {
+                    match current.encoder.flush() {
+                        Ok(true) => {
+                            current.encode_fails = 0;
+                            frames_in += 1;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            log(&format!(
+                                "{} encoder failed to finish the frame: {error}",
+                                current.video.name()
+                            ));
+                        }
+                    }
+                }
                 continue;
             }
             dirty::Action::Patches(rects) => {
@@ -608,7 +1407,6 @@ fn video_pump(
                     Ok(true) => {
                         current.encode_fails = 0;
                         frames_in += 1;
-                        last_encode = Some(Instant::now());
                         previous = Some((frame.width, frame.height, frame.rgb.clone()));
                         continue;
                     }
@@ -622,8 +1420,11 @@ fn video_pump(
             Ok(true) => {
                 current.encode_fails = 0;
                 frames_in += 1;
-                last_encode = Some(Instant::now());
                 previous = Some((frame.width, frame.height, frame.rgb.clone()));
+                if current.video.skip_bad_frame() || fresh_encoder {
+                    keyframe_wait = None;
+                }
+                fresh_encoder = false;
             }
             Ok(false) => return,
             Err(error) => {
@@ -686,14 +1487,14 @@ fn encode_period(wish: FpsWish, hardware: bool, display_hz: Option<u32>) -> Opti
         FpsWish::Match if display_hz.is_none() => None,
         wish => {
             let fps = wish.resolve(hardware, display_hz).max(1);
-            Some(Duration::from_millis((1000 / u64::from(fps)).max(1)))
+            // Milliseconds truncate 60 fps to 16 ms. That never meets the display.
+            Some(Duration::from_nanos(1_000_000_000 / u64::from(fps)))
         }
     }
 }
 
 async fn audio_loop(
-    mut send: SendStream,
-    v2: bool,
+    mut lane: LaneSend,
     mut audio: mpsc::Receiver<Pcm>,
     mut offer_rx: watch::Receiver<Option<Offer>>,
     options: HostOptions,
@@ -703,8 +1504,8 @@ async fn audio_loop(
     let mut excluded: Vec<Audio> = Vec::new();
     let mut encoder: Option<(AudioEncoder, Audio)> = None;
     while let Some(pcm) = audio.recv().await {
-        if !v2 {
-            wire::write_record(&mut send, LEGACY_AUDIO_MAGIC, &pcm.encode()).await?;
+        if !lane.v2 {
+            wire::write_record(&mut lane.send, LEGACY_AUDIO_MAGIC, &pcm.encode()).await?;
             continue;
         }
         if offer_rx.has_changed().unwrap_or(false) {
@@ -723,14 +1524,49 @@ async fn audio_loop(
                     Some(offer) => choose_audio(offer, &options.caps, &excluded),
                     None => break,
                 };
-                match AudioEncoder::open(pick.row, pcm.sample_rate, pcm.channels) {
+                let max_channels = offer.as_ref().map(|o| o.audio_channels).unwrap_or(0);
+                let stereo_kbps = offer.as_ref().map(|o| o.audio_bitrate_kbps).unwrap_or(0);
+                match AudioEncoder::open(
+                    pick.row,
+                    pcm.sample_rate,
+                    pcm.channels,
+                    max_channels,
+                    stereo_kbps,
+                ) {
                     Ok((enc, rate, channels)) => {
                         let mut config =
                             StreamConfig::audio(pick.row, &pick.encoder, rate, channels);
                         config.reason = std::mem::take(&mut reason);
                         if pick.row == Audio::Opus {
-                            config.bitrate_kbps = (crate::opus::DEFAULT_BITRATE / 1000) as u32;
+                            config.bitrate_kbps =
+                                crate::negotiate::scale_audio_kbps(stereo_kbps, channels);
                         }
+                        if let Some(offer) = offer.as_ref() {
+                            let picture_ok = offer
+                                .video
+                                .iter()
+                                .any(|video| matches!(video, Video::JpegXs));
+                            let opus = offer.audio.iter().any(|audio| matches!(audio, Audio::Opus));
+                            let pcm = offer.audio.iter().any(|audio| matches!(audio, Audio::Pcm));
+                            etherquic::carrier::prepare_announce(picture_ok, opus && !pcm);
+                        }
+                        let requested = offer.as_ref().and_then(|row| row.carrier);
+                        match etherquic::carrier::agree(
+                            true,
+                            requested,
+                            &etherquic::carrier::local_carriers(0),
+                        ) {
+                            Ok(id) => config.carrier = Some(id),
+                            Err(error) => {
+                                log(&error);
+                                return Err(error);
+                            }
+                        }
+                        lane.datagrams = config.carrier == Some(etherquic::carrier::QUIC_DATAGRAMS);
+                        let id = config.carrier.unwrap_or(etherquic::carrier::QUIC_STREAMS);
+                        lane.seam = etherquic::carrier::Seam::open(id);
+                        etherquic::set_capture_carrier(id);
+                        etherquic::carrier::apply_agreed_carrier(&lane.conn, id);
                         log(&format!(
                             "audio {} {} Hz {} ch (capture {} Hz {} ch)",
                             pick.row.name(),
@@ -739,7 +1575,18 @@ async fn audio_loop(
                             pcm.sample_rate,
                             pcm.channels
                         ));
-                        wire::write_record(&mut send, AUDIO2_MAGIC, &config.encode()).await?;
+                        let encoded = config.encode();
+                        wire::write_record(&mut lane.send, AUDIO2_MAGIC, &encoded).await?;
+                        if lane.seam.id() >= etherquic::carrier::UDP_RTP {
+                            let capture = capture_at(&mut lane);
+                            let _ = lane.seam.send(
+                                etherquic::carrier::Lane::Audio,
+                                &encoded,
+                                None,
+                                capture,
+                            );
+                            flush_tap(&mut lane);
+                        }
                         encoder = Some((enc, pick.row));
                     }
                     Err(error) => {
@@ -762,7 +1609,25 @@ async fn audio_loop(
         match enc.push(&pcm) {
             Ok(packets) => {
                 for packet in packets {
-                    wire::write_typed(&mut send, AUDIO2_MAGIC, RECORD_DATA, &packet).await?;
+                    if lane.seam.id() >= etherquic::carrier::UDP_RTP {
+                        let mut body = Vec::with_capacity(1 + packet.len());
+                        body.push(RECORD_DATA);
+                        body.extend_from_slice(&packet);
+                        let capture = capture_at(&mut lane);
+                        let _ = lane.seam.send(
+                            etherquic::carrier::Lane::Audio,
+                            &body,
+                            None,
+                            capture,
+                        );
+                        flush_tap(&mut lane);
+                        sample_loss(&mut lane);
+                    } else if lane.datagrams {
+                        send_datagram_record(&mut lane, RECORD_DATA, &packet).await?;
+                    } else {
+                        wire::write_typed(&mut lane.send, AUDIO2_MAGIC, RECORD_DATA, &packet)
+                            .await?;
+                    }
                 }
             }
             Err(error) => {
@@ -775,5 +1640,159 @@ async fn audio_loop(
             }
         }
     }
-    finish(&mut send).await
+    finish(&mut lane.send).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EncodeHub, FrameSlot, HostOptions, KeyframeBus, Room};
+    use crate::negotiate::{FpsWish, HostCaps};
+    use crate::Frame;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn capture_fps_changes_the_period_while_the_loop_is_up() {
+        super::set_capture_fps(0);
+        assert_eq!(
+            super::capture_period(60),
+            Duration::from_millis(1000 / 60)
+        );
+        super::set_capture_fps(30);
+        assert_eq!(super::capture_period(60), Duration::from_millis(1000 / 30));
+        super::set_dirty_rects(true);
+        assert!(super::dirty_rects());
+        super::set_dirty_rects(false);
+        assert!(!super::dirty_rects());
+        super::set_capture_fps(0);
+    }
+
+    #[test]
+    fn a_full_second_of_loss_cuts_the_encoder_cap() {
+        let mut cap = etherquic::carrier::RateCap::new(100_000_000);
+        assert_eq!(cap.apply_loss(Duration::from_millis(1), 100, 100), 100_000_000);
+        let bits = cap.apply_loss(Duration::from_secs(1), 100, 2);
+        assert_eq!(bits, 80_000_000);
+        assert_eq!(super::encoder_kbps(0, bits / 1000), 80_000);
+        assert_eq!(super::encoder_kbps(10_000, 0), 10_000);
+    }
+
+    #[test]
+    fn keyframe_bus_wakes_every_subscriber() {
+        let bus = KeyframeBus::default();
+        let mut a = 0u64;
+        let mut b = 0u64;
+        assert!(!bus.poll(&mut a));
+        bus.request();
+        assert!(bus.poll(&mut a));
+        assert!(bus.poll(&mut b));
+        assert!(!bus.poll(&mut a));
+        bus.request();
+        assert!(bus.poll(&mut a));
+        assert!(bus.poll(&mut b));
+    }
+
+    #[test]
+    fn exclusive_room_refuses_a_second_seat() {
+        let room = Room::default();
+        assert!(!room.locked());
+        room.inner.exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(room.locked());
+        room.inner.exclusive.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!room.locked());
+    }
+
+    fn tiny_frame() -> Frame {
+        Frame {
+            width: 4,
+            height: 4,
+            rgb: vec![180u8; 4 * 4 * 3],
+        }
+    }
+
+    fn test_hub(frames: FrameSlot) -> EncodeHub {
+        EncodeHub::new(
+            frames,
+            KeyframeBus::default(),
+            &HostOptions {
+                fps: FpsWish::Fixed(30),
+                display_hz: None,
+                caps: HostCaps::baseline(),
+                log: Arc::new(|_: &str| {}),
+                cap_kbps: Arc::new(AtomicU64::new(0)),
+                carrier_tap: None,
+            },
+        )
+    }
+
+    fn wait_closed(rx: &mut tokio::sync::mpsc::Receiver<super::VideoOut>, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            match rx.try_recv() {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    if Instant::now() > deadline {
+                        panic!("encode hub kept the subscriber open after capture closed");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_hub_closes_subscribers_when_capture_closes() {
+        let frames = FrameSlot::new();
+        let hub = test_hub(frames.clone());
+        let mut rx = hub.subscribe(None);
+        frames.put(tiny_frame());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rx.try_recv().is_err() {
+            if Instant::now() > deadline {
+                panic!("encode hub sent no picture");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        frames.close();
+        wait_closed(&mut rx, 2);
+    }
+
+    #[test]
+    fn encode_hub_fans_out_one_encode_to_two_subscribers() {
+        let frames = FrameSlot::new();
+        let hub = test_hub(frames.clone());
+        let mut a = hub.subscribe(None);
+        frames.put(tiny_frame());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while a.try_recv().is_err() {
+            if Instant::now() > deadline {
+                panic!("first subscriber got no picture");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut b = hub.subscribe(None);
+        hub.keyframes.request();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut got_b = false;
+        let mut n = 1u8;
+        while Instant::now() < deadline {
+            n = n.wrapping_add(1);
+            frames.put(Frame {
+                width: 4,
+                height: 4,
+                rgb: vec![n; 4 * 4 * 3],
+            });
+            if b.try_recv().is_ok() {
+                got_b = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(got_b, "late subscriber got no picture after a keyframe request");
+        frames.close();
+        wait_closed(&mut a, 2);
+        wait_closed(&mut b, 2);
+    }
 }

@@ -95,6 +95,58 @@ pub fn clamp_fps(fps: u32) -> u32 {
     fps.clamp(1, MAX_FPS)
 }
 
+/// Stereo-equivalent Auto audio bitrate. 96 kbps stereo ≡ 108 2.1 ≡ 128 5.1 ≡ 144 7.1.
+pub const AUDIO_STEREO_DEFAULT_KBPS: u32 = 96;
+/// Auto max channels is stereo. The host never upmixes past capture.
+pub const AUDIO_CHANNELS_AUTO: u16 = 2;
+/// Highest channel count an offer may ask for (7.1).
+pub const AUDIO_CHANNELS_MAX: u16 = 8;
+
+/// Zero in the offer is Auto (stereo).
+pub fn audio_channels_or_auto(max: u16) -> u16 {
+    if max == 0 {
+        AUDIO_CHANNELS_AUTO
+    } else {
+        max.min(AUDIO_CHANNELS_MAX)
+    }
+}
+
+/// Scale a stereo-equivalent bitrate to a channel layout.
+///
+/// 96 kbps stereo ≡ 108 2.1 ≡ 128 5.1 ≡ 144 7.1. Zero stereo kbps uses
+/// [`AUDIO_STEREO_DEFAULT_KBPS`].
+pub fn scale_audio_kbps(stereo_kbps: u32, channels: u16) -> u32 {
+    let stereo = if stereo_kbps == 0 {
+        AUDIO_STEREO_DEFAULT_KBPS
+    } else {
+        stereo_kbps
+    };
+    (stereo * audio_kbps_numerator(channels)) / 96
+}
+
+/// Inverse of [`scale_audio_kbps`]: layout kbps back to a stereo equivalent.
+pub fn stereo_audio_kbps(layout_kbps: u32, channels: u16) -> u32 {
+    let num = audio_kbps_numerator(channels);
+    if num == 0 {
+        layout_kbps
+    } else {
+        (layout_kbps * 96) / num
+    }
+}
+
+fn audio_kbps_numerator(channels: u16) -> u32 {
+    match audio_channels_or_auto(channels) {
+        1 => 64,
+        2 => 96,
+        3 => 108,
+        4 => 115,
+        5 => 121,
+        6 => 128,
+        7 => 136,
+        _ => 144,
+    }
+}
+
 /// Player Auto (or an old offer) defers to the host. A number or Match wins.
 pub fn session_fps_wish(player: Option<FpsWish>, host: FpsWish) -> FpsWish {
     match player {
@@ -689,6 +741,21 @@ pub struct Offer {
     pub yuv: Option<YuvFormat>,
     /// Pictures per second. An older offer with no `fps` line is [`FpsWish::Auto`].
     pub fps: FpsWish,
+    /// Stereo-equivalent audio bitrate in kbit/s. Zero is Auto (96 stereo).
+    pub audio_bitrate_kbps: u32,
+    /// Max channels the player wants. Zero is Auto (2-channel stereo). The host
+    /// caps at capture and does not upmix.
+    pub audio_channels: u16,
+    /// Watch without injecting keyboard, mouse, or pads (`view-only 1`).
+    pub view_only: bool,
+    /// Take the room: kick everyone else and refuse later joins (`exclusive 1`).
+    pub exclusive: bool,
+    /// Queue a keyframe. If none arrives in a few seconds the host sends an
+    /// I-frame on every copy of this stream (`keyframe 1`).
+    pub want_keyframe: bool,
+    /// Carrier the player asked for (`carrier N`). `None` is an older offer:
+    /// the host stays on QUIC streams.
+    pub carrier: Option<u8>,
 }
 
 /// Format the host encodes, given the player's request and whether it can
@@ -749,19 +816,38 @@ impl Offer {
             let _ = writeln!(out, "yuv {}", yuv.token());
         }
         let _ = writeln!(out, "fps {}", self.fps.token());
+        let _ = writeln!(out, "audio-bitrate {}", self.audio_bitrate_kbps);
+        let _ = writeln!(out, "audio-channels {}", self.audio_channels);
+        if self.view_only {
+            let _ = writeln!(out, "view-only 1");
+        }
+        if self.exclusive {
+            let _ = writeln!(out, "exclusive 1");
+        }
+        if self.want_keyframe {
+            let _ = writeln!(out, "keyframe 1");
+        }
+        if let Some(carrier) = self.carrier {
+            let _ = writeln!(out, "carrier {carrier}");
+        }
         out.into_bytes()
     }
 
     /// Codec lists, limits, and failures match. Picture look, dither, and
     /// pixel size may differ so the host can keep the encoder it already
     /// opened. Quality and the dirty-rect request reopen it: GOP and
-    /// skip-unchanged follow those flags.
+    /// skip-unchanged follow those flags. View-only, exclusive, and a
+    /// keyframe pulse do not reopen it.
     pub fn same_codecs(&self, other: &Offer) -> bool {
         let mut other = other.clone();
         other.look = self.look;
         other.dither = self.dither;
         other.pixel_size = self.pixel_size;
         other.dither_strength = self.dither_strength;
+        other.view_only = self.view_only;
+        other.exclusive = self.exclusive;
+        other.want_keyframe = self.want_keyframe;
+        other.carrier = self.carrier;
         *self == other
     }
 
@@ -785,6 +871,12 @@ impl Offer {
             want_dirty_rects: None,
             yuv: None,
             fps: FpsWish::Auto,
+            audio_bitrate_kbps: 0,
+            audio_channels: 0,
+            view_only: false,
+            exclusive: false,
+            want_keyframe: false,
+            carrier: None,
         };
         for (key, words) in &lines.rows {
             match key.as_str() {
@@ -836,6 +928,31 @@ impl Offer {
                 "fps" => {
                     offer.fps = FpsWish::from_token(words.first().copied().unwrap_or("auto"))
                 }
+                "audio-bitrate" => {
+                    offer.audio_bitrate_kbps =
+                        words.first().and_then(|w| w.parse().ok()).unwrap_or(0)
+                }
+                "audio-channels" => {
+                    offer.audio_channels = words
+                        .first()
+                        .and_then(|w| w.parse().ok())
+                        .map(|n: u16| n.min(AUDIO_CHANNELS_MAX))
+                        .unwrap_or(0)
+                }
+                "view-only" => {
+                    offer.view_only = parse_flag(words.first().copied().unwrap_or("1"))
+                }
+                "exclusive" => {
+                    offer.exclusive = parse_flag(words.first().copied().unwrap_or("1"))
+                }
+                "keyframe" => {
+                    offer.want_keyframe = parse_flag(words.first().copied().unwrap_or("1"))
+                }
+                "carrier" => {
+                    offer.carrier = words.first().and_then(|word| word.parse().ok()).filter(|id: &u8| {
+                        (1..=crate::carrier::MAX_CARRIERS as u8).contains(id)
+                    });
+                }
                 _ => {}
             }
         }
@@ -866,6 +983,8 @@ pub struct StreamConfig {
     /// How the host handles unchanged pictures. Missing on an older config is
     /// [`DirtyRectsMode::Off`].
     pub dirty_rects: DirtyRectsMode,
+    /// Carrier the host will use. Missing on an older config is QUIC streams.
+    pub carrier: Option<u8>,
 }
 
 impl StreamConfig {
@@ -885,6 +1004,7 @@ impl StreamConfig {
             host: HostCaps::default(),
             yuv: YuvFormat::YUV420P8,
             dirty_rects: DirtyRectsMode::Off,
+            carrier: None,
         }
     }
 
@@ -904,6 +1024,7 @@ impl StreamConfig {
             host: HostCaps::default(),
             yuv: YuvFormat::YUV420P8,
             dirty_rects: DirtyRectsMode::Off,
+            carrier: None,
         }
     }
 
@@ -927,6 +1048,9 @@ impl StreamConfig {
         }
         if self.video.is_some() {
             let _ = writeln!(out, "dirty-rects {}", self.dirty_rects.token());
+        }
+        if let Some(carrier) = self.carrier {
+            let _ = writeln!(out, "carrier {carrier}");
         }
         if !self.reason.is_empty() {
             let _ = writeln!(out, "reason {}", self.reason.replace('\n', " "));
@@ -961,6 +1085,7 @@ impl StreamConfig {
             host: HostCaps::default(),
             yuv: YuvFormat::YUV420P8,
             dirty_rects: DirtyRectsMode::Off,
+            carrier: None,
         };
         for (key, words) in &lines.rows {
             let first = words.first().copied().unwrap_or("");
@@ -988,6 +1113,11 @@ impl StreamConfig {
                     if let Some(mode) = DirtyRectsMode::from_token(first) {
                         config.dirty_rects = mode;
                     }
+                }
+                "carrier" => {
+                    config.carrier = first.parse().ok().filter(|id: &u8| {
+                        (1..=crate::carrier::MAX_CARRIERS as u8).contains(id)
+                    });
                 }
                 other => config.host.read_line(other, words),
             }
@@ -1060,6 +1190,16 @@ pub struct OfferInput<'a> {
     pub yuv: YuvFormat,
     /// Pictures per second. Default is Auto (15 software / 30 hardware).
     pub fps: FpsWish,
+    /// Stereo-equivalent audio bitrate in kbit/s. Zero is Auto (96 stereo).
+    pub audio_bitrate_kbps: u32,
+    /// Max channels. Zero is Auto (stereo).
+    pub audio_channels: u16,
+    /// Watch without injecting input.
+    pub view_only: bool,
+    /// Take the room exclusively.
+    pub exclusive: bool,
+    /// `carrier N` on the offer. `None` leaves the line off (QUIC streams).
+    pub carrier: Option<u8>,
 }
 
 /// Pin first, then the Settings order, then anything left over, keeping only
@@ -1105,6 +1245,12 @@ pub fn build_offer(input: &OfferInput<'_>) -> Offer {
         want_dirty_rects: Some(input.want_dirty_rects),
         yuv: Some(input.yuv),
         fps: input.fps,
+        audio_bitrate_kbps: input.audio_bitrate_kbps,
+        audio_channels: input.audio_channels,
+        view_only: input.view_only,
+        exclusive: input.exclusive,
+        want_keyframe: true,
+        carrier: input.carrier,
     }
 }
 
@@ -1444,6 +1590,34 @@ mod tests {
         assert!(!parse_flag("0"));
         assert!(parse_flag("1"));
         assert!(!parse_flag("off"));
+    }
+
+    #[test]
+    fn view_only_exclusive_and_keyframe_round_trip_without_reopening() {
+        let mut offer = offer(&[Video::Mjpeg], &[VideoCodec::Mjpeg]);
+        assert!(offer.want_keyframe);
+        assert!(!offer.view_only);
+        assert!(!offer.exclusive);
+        offer.view_only = true;
+        offer.exclusive = true;
+        let text = String::from_utf8(offer.encode()).unwrap();
+        assert!(text.contains("view-only 1\n"), "{text}");
+        assert!(text.contains("exclusive 1\n"), "{text}");
+        assert!(text.contains("keyframe 1\n"), "{text}");
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert!(back.view_only);
+        assert!(back.exclusive);
+        assert!(back.want_keyframe);
+        assert!(offer.same_codecs(&back));
+        let mut other = offer.clone();
+        other.view_only = false;
+        other.exclusive = false;
+        other.want_keyframe = false;
+        assert!(offer.same_codecs(&other));
+        let old = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\n").unwrap();
+        assert!(!old.view_only);
+        assert!(!old.exclusive);
+        assert!(!old.want_keyframe);
     }
 
     #[test]
@@ -1814,5 +1988,43 @@ mod tests {
         assert!(Offer::decode(&[0xff, 0xfe]).is_err());
         assert!(StreamConfig::decode(b"Dxyz").is_err());
         assert!(StreamConfig::decode(b"Ceqneg 1\nvideo nope\n").is_err());
+    }
+
+    #[test]
+    fn audio_bitrate_scales_with_channel_layout() {
+        assert_eq!(scale_audio_kbps(96, 2), 96);
+        assert_eq!(scale_audio_kbps(96, 3), 108);
+        assert_eq!(scale_audio_kbps(96, 6), 128);
+        assert_eq!(scale_audio_kbps(96, 8), 144);
+        assert_eq!(scale_audio_kbps(0, 2), AUDIO_STEREO_DEFAULT_KBPS);
+        assert_eq!(scale_audio_kbps(0, 6), 128);
+        assert_eq!(stereo_audio_kbps(108, 3), 96);
+        assert_eq!(stereo_audio_kbps(128, 6), 96);
+        assert_eq!(stereo_audio_kbps(144, 8), 96);
+        assert_eq!(audio_channels_or_auto(0), 2);
+        assert_eq!(audio_channels_or_auto(8), 8);
+        assert_eq!(audio_channels_or_auto(99), 8);
+    }
+
+    #[test]
+    fn audio_bitrate_and_channels_round_trip_and_renegotiate() {
+        let mut offer = offer(&[Video::Mjpeg], &[VideoCodec::Mjpeg]);
+        assert_eq!(offer.audio_bitrate_kbps, 0);
+        assert_eq!(offer.audio_channels, 0);
+        offer.audio_bitrate_kbps = 96;
+        offer.audio_channels = 6;
+        let back = Offer::decode(&offer.encode()).unwrap();
+        assert_eq!(back.audio_bitrate_kbps, 96);
+        assert_eq!(back.audio_channels, 6);
+        assert!(offer.same_codecs(&back));
+        let mut other = back.clone();
+        other.audio_channels = 2;
+        assert!(!offer.same_codecs(&other));
+        other.audio_channels = 6;
+        other.audio_bitrate_kbps = 128;
+        assert!(!offer.same_codecs(&other));
+        let old = Offer::decode(b"eqneg 1\nvideo mjpeg\naudio pcm\nbitrate 0\n").unwrap();
+        assert_eq!(old.audio_bitrate_kbps, 0);
+        assert_eq!(old.audio_channels, 0);
     }
 }

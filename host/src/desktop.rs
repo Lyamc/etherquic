@@ -21,7 +21,7 @@ use winapi::shared::mmreg::{
     WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT,
     WAVE_FORMAT_PCM,
 };
-use winapi::shared::windef::{HDESK, HGDIOBJ, POINT};
+use winapi::shared::windef::{HBITMAP, HDC, HDESK, HGDIOBJ, POINT};
 use winapi::um::audioclient::{
     IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED,
@@ -37,9 +37,15 @@ use winapi::um::d3d11::{
 };
 use winapi::um::d3dcommon::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use winapi::um::errhandlingapi::GetLastError;
+use winapi::shared::guiddef::GUID;
+use winapi::shared::minwindef::UINT;
+use winapi::shared::wtypes::{PROPERTYKEY, VARTYPE, VT_LPWSTR};
 use winapi::um::mmdeviceapi::{
-    eConsole, eRender, CLSID_MMDeviceEnumerator, IMMDevice, IMMDeviceEnumerator,
+    eConsole, eRender, CLSID_MMDeviceEnumerator, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE,
 };
+use winapi::um::propidl::PROPVARIANT;
+use winapi::um::propsys::IPropertyStore;
 use winapi::um::processthreadsapi::GetCurrentThreadId;
 use winapi::um::unknwnbase::IUnknown;
 use winapi::um::winbase::SetThreadExecutionState;
@@ -93,8 +99,9 @@ pub fn display_hz() -> Option<u32> {
 /// GDI capture plus an optional duplication subscription.
 ///
 /// The subscription is what makes DWM compose. An acquired frame is copied from
-/// its texture. A timeout falls back to `BitBlt`. `desk.conf` `duplication=no`
-/// skips DXGI entirely.
+/// its texture. A timeout repeats that frame. `BitBlt` runs only until the
+/// first one, or when duplication is off. `desk.conf` `duplication=no` skips
+/// DXGI entirely.
 pub struct ScreenCapture {
     duplication: Option<Duplication>,
     mode: String,
@@ -106,6 +113,8 @@ pub struct ScreenCapture {
     stale: u32,
     /// Last attempt to get duplication back after it fell to GDI.
     retried: Instant,
+    /// DIB kept across frames. Building a new one each BitBlt misses 60 fps.
+    gdi: Option<GdiScratch>,
 }
 
 /// Held-only frames before duplication is torn down and enumerated again.
@@ -150,6 +159,11 @@ struct Duplication {
     device: *mut ID3D11Device,
     context: *mut ID3D11DeviceContext,
     output: *mut IDXGIOutputDuplication,
+    /// Reused readback target. Creating one per frame costs more than a
+    /// 60 fps period on the HD 6670.
+    staging: *mut ID3D11Texture2D,
+    stage_w: u32,
+    stage_h: u32,
 }
 
 enum PumpError {
@@ -171,6 +185,7 @@ impl ScreenCapture {
                 desktop: thread_desktop_name(),
                 stale: 0,
                 retried: Instant::now(),
+                gdi: None,
             },
             Err(error) => Self::gdi(&format!("gdi ({})", clip(error))),
         }
@@ -207,6 +222,7 @@ impl ScreenCapture {
             Recover::Nothing => {}
             Recover::NewDesktop | Recover::Stale => {
                 self.held = None;
+                self.gdi = None;
                 self.stale = 0;
                 if crate::config::desk_duplication() {
                     self.retried = Instant::now();
@@ -226,7 +242,7 @@ impl ScreenCapture {
             return self.bitblt_or_held();
         }
         let timeout = if self.primed { 0 } else { 50 };
-        let acquired = unsafe { acquire(self.duplication.as_ref().unwrap(), timeout) };
+        let acquired = unsafe { acquire(self.duplication.as_mut().unwrap(), timeout) };
         match acquired {
             Ok(Some(picture)) => {
                 self.primed = true;
@@ -237,7 +253,15 @@ impl ScreenCapture {
                 }
                 Ok(picture)
             }
-            Ok(None) => self.bitblt_or_held(),
+            // The desktop did not change. A fresh BitBlt of that same image
+            // takes longer than one 60 fps period, so repeat the last frame
+            // and let the capture pace sleep out the rest.
+            Ok(None) => {
+                if let Some(picture) = self.held.clone() {
+                    return Ok(picture);
+                }
+                self.bitblt_or_held()
+            }
             Err(PumpError::Lost) => {
                 self.reopen_after_loss();
                 if let Some(picture) = self.held.clone() {
@@ -270,28 +294,66 @@ impl ScreenCapture {
             desktop: thread_desktop_name(),
             stale: 0,
             retried: Instant::now(),
+            gdi: None,
         }
     }
 
     fn bitblt_or_held(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
-        let mut result = unsafe { capture_rgba_gdi() };
+        let mut result = self.gdi_capture();
         if result.is_err() {
             // BitBlt fails (win32 6) from a desktop that is not the input desktop.
+            self.gdi = None;
             if let Ok(Some(name)) = follow_input_desktop() {
                 self.desktop = name;
                 self.held = None;
-                result = unsafe { capture_rgba_gdi() };
+                result = self.gdi_capture();
             }
         }
         match result {
             Ok(picture) => {
                 self.stale = 0;
+                self.held = Some(picture.clone());
                 Ok(picture)
             }
             Err(error) => {
                 self.stale = self.stale.saturating_add(1);
                 self.held.clone().ok_or(error)
             }
+        }
+    }
+
+    /// BitBlt into a DIB that stays allocated. The first call builds it.
+    fn gdi_capture(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+        unsafe {
+            let width = GetSystemMetrics(SM_CXSCREEN);
+            let height = GetSystemMetrics(SM_CYSCREEN);
+            if width <= 0 || height <= 0 {
+                return Err("no screen".into());
+            }
+            let same = self
+                .gdi
+                .as_ref()
+                .is_some_and(|gdi| gdi.width == width && gdi.height == height);
+            if !same {
+                self.gdi = Some(GdiScratch::open(width, height)?);
+            }
+            let blitted = {
+                let gdi = self.gdi.as_mut().unwrap();
+                BitBlt(gdi.mem, 0, 0, width, height, gdi.screen, 0, 0, SRCCOPY) != 0
+            };
+            if !blitted {
+                let error = GetLastError();
+                self.gdi = None;
+                return Err(format!("BitBlt: win32 {error}"));
+            }
+            let count = (width as usize).saturating_mul(height as usize);
+            let mut rgba = vec![0u8; count.saturating_mul(4)];
+            if rgba.len() == count * 4 {
+                let bits = self.gdi.as_ref().unwrap().bits;
+                let src = std::slice::from_raw_parts(bits, count * 4);
+                bgra_to_rgba(src, &mut rgba);
+            }
+            Ok((rgba, width as u32, height as u32))
         }
     }
 
@@ -305,7 +367,7 @@ impl ScreenCapture {
         self.duplication = None;
         self.primed = false;
         match unsafe { open_duplication() } {
-            Ok(dup) => match unsafe { acquire(&dup, 50) } {
+            Ok(mut dup) => match unsafe { acquire(&mut dup, 50) } {
                 Ok(Some(picture)) => {
                     self.primed = true;
                     self.held = Some(picture);
@@ -336,6 +398,10 @@ impl Drop for Duplication {
             if !self.output.is_null() {
                 (*self.output).Release();
                 self.output = ptr::null_mut();
+            }
+            if !self.staging.is_null() {
+                (*self.staging).Release();
+                self.staging = ptr::null_mut();
             }
             if !self.context.is_null() {
                 (*self.context).Release();
@@ -477,7 +543,7 @@ pub fn hold_display(on: bool) {
 
 /// Release every acquired frame. Leaving one held stalls the desktop.
 unsafe fn acquire(
-    dup: &Duplication,
+    dup: &mut Duplication,
     timeout_ms: u32,
 ) -> Result<Option<(Vec<u8>, u32, u32)>, PumpError> {
     let mut info: DXGI_OUTDUPL_FRAME_INFO = mem::zeroed();
@@ -520,7 +586,7 @@ unsafe fn acquire(
 }
 
 unsafe fn copy_texture(
-    dup: &Duplication,
+    dup: &mut Duplication,
     resource: *mut IDXGIResource,
 ) -> Result<(Vec<u8>, u32, u32), String> {
     let mut texture: *mut ID3D11Texture2D = ptr::null_mut();
@@ -537,21 +603,32 @@ unsafe fn copy_texture(
         (*texture).Release();
         return Err("desktop texture is empty".into());
     }
-    let mut staging = desc;
-    staging.MipLevels = 1;
-    staging.ArraySize = 1;
-    staging.SampleDesc.Count = 1;
-    staging.SampleDesc.Quality = 0;
-    staging.Usage = D3D11_USAGE_STAGING;
-    staging.BindFlags = 0;
-    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    staging.MiscFlags = 0;
-    let mut readable: *mut ID3D11Texture2D = ptr::null_mut();
-    let hr = (*dup.device).CreateTexture2D(&staging, ptr::null(), &mut readable);
-    if hr < 0 || readable.is_null() {
-        (*texture).Release();
-        return Err(format!("staging texture: hresult {}", hresult(hr)));
+    if dup.staging.is_null() || dup.stage_w != desc.Width || dup.stage_h != desc.Height {
+        if !dup.staging.is_null() {
+            (*dup.staging).Release();
+            dup.staging = ptr::null_mut();
+        }
+        let mut staging = desc;
+        staging.MipLevels = 1;
+        staging.ArraySize = 1;
+        staging.SampleDesc.Count = 1;
+        staging.SampleDesc.Quality = 0;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.BindFlags = 0;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging.MiscFlags = 0;
+        let hr = (*dup.device).CreateTexture2D(&staging, ptr::null(), &mut dup.staging);
+        if hr < 0 || dup.staging.is_null() {
+            dup.staging = ptr::null_mut();
+            dup.stage_w = 0;
+            dup.stage_h = 0;
+            (*texture).Release();
+            return Err(format!("staging texture: hresult {}", hresult(hr)));
+        }
+        dup.stage_w = desc.Width;
+        dup.stage_h = desc.Height;
     }
+    let readable = dup.staging;
     (*dup.context).CopyResource(
         readable as *mut ID3D11Resource,
         texture as *mut ID3D11Resource,
@@ -565,7 +642,10 @@ unsafe fn copy_texture(
         &mut mapped,
     );
     if hr < 0 || mapped.pData.is_null() {
-        (*readable).Release();
+        (*dup.staging).Release();
+        dup.staging = ptr::null_mut();
+        dup.stage_w = 0;
+        dup.stage_h = 0;
         (*texture).Release();
         return Err(format!("Map desktop: hresult {}", hresult(hr)));
     }
@@ -576,20 +656,18 @@ unsafe fn copy_texture(
     let short_pitch = pitch < width.saturating_mul(4) || rgba.len() != width * height * 4;
     if !short_pitch {
         let src = mapped.pData as *const u8;
-        for y in 0..height {
-            let row = src.add(y * pitch);
-            for x in 0..width {
-                let pixel = row.add(x * 4);
-                let at = (y * width + x) * 4;
-                rgba[at] = *pixel.add(2);
-                rgba[at + 1] = *pixel.add(1);
-                rgba[at + 2] = *pixel;
-                rgba[at + 3] = 255;
+        if pitch == width * 4 {
+            let packed = std::slice::from_raw_parts(src, width * height * 4);
+            bgra_to_rgba(packed, &mut rgba);
+        } else {
+            for y in 0..height {
+                let row = std::slice::from_raw_parts(src.add(y * pitch), width * 4);
+                let at = y * width * 4;
+                bgra_to_rgba(row, &mut rgba[at..at + width * 4]);
             }
         }
     }
     (*dup.context).Unmap(readable as *mut ID3D11Resource, 0);
-    (*readable).Release();
     (*texture).Release();
     if short_pitch {
         return Err("desktop texture pitch is short".into());
@@ -691,6 +769,9 @@ unsafe fn duplicate_with(
                     device,
                     context,
                     output,
+                    staging: ptr::null_mut(),
+                    stage_w: 0,
+                    stage_h: 0,
                 })
             }
             Ok(None) => {}
@@ -812,15 +893,31 @@ pub struct Loopback {
     tag: u16,
     bits: u16,
     com: bool,
+    label: String,
+}
+
+/// Active render endpoints, by friendly name. Empty when the names cannot be read.
+pub fn output_names() -> Vec<String> {
+    unsafe { render_output_names().unwrap_or_default() }
 }
 
 impl Loopback {
     pub fn open() -> Result<Self, String> {
-        unsafe { open_loopback() }
+        unsafe { open_render(None) }
+    }
+
+    /// Open the render endpoint whose friendly name matches `label`.
+    /// A blank label, or one that matches nothing, opens the default endpoint.
+    pub fn open_named(label: &str) -> Result<Self, String> {
+        let label = label.trim();
+        if label.is_empty() || label.eq_ignore_ascii_case("default output") {
+            return Self::open();
+        }
+        unsafe { open_render(Some(label)) }
     }
 
     pub fn name(&self) -> &str {
-        "default output"
+        &self.label
     }
 
     pub fn rate(&self) -> u32 {
@@ -1174,59 +1271,118 @@ fn send_once(input: &mut INPUT) -> bool {
     unsafe { SendInput(1, input, mem::size_of::<INPUT>() as i32) != 0 }
 }
 
+/// One screen DIB. Reused by the capture loop so 60 fps does not allocate a
+/// bitmap on every frame.
+struct GdiScratch {
+    screen: HDC,
+    mem: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+}
+
+impl GdiScratch {
+    unsafe fn open(width: i32, height: i32) -> Result<Self, String> {
+        let screen = GetDC(ptr::null_mut());
+        if screen.is_null() {
+            return Err(win32("GetDC"));
+        }
+        let mem = CreateCompatibleDC(screen);
+        if mem.is_null() {
+            ReleaseDC(ptr::null_mut(), screen);
+            return Err(win32("CreateCompatibleDC"));
+        }
+        let mut info: BITMAPINFO = mem::zeroed();
+        info.bmiHeader.biSize = mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        let mut bits: *mut c_void = ptr::null_mut();
+        let bitmap = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, ptr::null_mut(), 0);
+        if bitmap.is_null() || bits.is_null() {
+            DeleteDC(mem);
+            ReleaseDC(ptr::null_mut(), screen);
+            return Err(win32("CreateDIBSection"));
+        }
+        let previous = SelectObject(mem, bitmap as HGDIOBJ);
+        Ok(Self {
+            screen,
+            mem,
+            bitmap,
+            previous,
+            bits: bits as *mut u8,
+            width,
+            height,
+        })
+    }
+}
+
+impl Drop for GdiScratch {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.mem.is_null() && !self.previous.is_null() {
+                SelectObject(self.mem, self.previous);
+            }
+            if !self.bitmap.is_null() {
+                DeleteObject(self.bitmap as HGDIOBJ);
+            }
+            if !self.mem.is_null() {
+                DeleteDC(self.mem);
+            }
+            if !self.screen.is_null() {
+                ReleaseDC(ptr::null_mut(), self.screen);
+            }
+        }
+    }
+}
+
+/// BGRA (GDI and DXGI) to straight RGBA. `src` and `dst` are tightly packed.
+fn bgra_to_rgba(src: &[u8], dst: &mut [u8]) {
+    let pixels = src.len() / 4;
+    for i in 0..pixels {
+        let s = i * 4;
+        let d = i * 4;
+        if d + 3 >= dst.len() || s + 3 >= src.len() {
+            break;
+        }
+        dst[d] = src[s + 2];
+        dst[d + 1] = src[s + 1];
+        dst[d + 2] = src[s];
+        dst[d + 3] = 255;
+    }
+}
+
 unsafe fn capture_rgba_gdi() -> Result<(Vec<u8>, u32, u32), String> {
     let width = GetSystemMetrics(SM_CXSCREEN);
     let height = GetSystemMetrics(SM_CYSCREEN);
     if width <= 0 || height <= 0 {
         return Err("no screen".into());
     }
-    let screen = GetDC(ptr::null_mut());
-    if screen.is_null() {
-        return Err(win32("GetDC"));
+    let scratch = GdiScratch::open(width, height)?;
+    let copied = BitBlt(
+        scratch.mem,
+        0,
+        0,
+        width,
+        height,
+        scratch.screen,
+        0,
+        0,
+        SRCCOPY,
+    );
+    if copied == 0 {
+        let error = GetLastError();
+        return Err(format!("BitBlt: win32 {error}"));
     }
-    let mem = CreateCompatibleDC(screen);
-    if mem.is_null() {
-        ReleaseDC(ptr::null_mut(), screen);
-        return Err(win32("CreateCompatibleDC"));
-    }
-    let mut info: BITMAPINFO = mem::zeroed();
-    info.bmiHeader.biSize = mem::size_of::<BITMAPINFOHEADER>() as u32;
-    info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -height;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    let mut bits: *mut winapi::ctypes::c_void = ptr::null_mut();
-    let bitmap = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, ptr::null_mut(), 0);
-    if bitmap.is_null() || bits.is_null() {
-        DeleteDC(mem);
-        ReleaseDC(ptr::null_mut(), screen);
-        return Err(win32("CreateDIBSection"));
-    }
-    let previous = SelectObject(mem, bitmap as HGDIOBJ);
-    let copied = BitBlt(mem, 0, 0, width, height, screen, 0, 0, SRCCOPY);
-    let bitblt_error = if copied == 0 { GetLastError() } else { 0 };
     let count = (width as usize).saturating_mul(height as usize);
     let mut rgba = vec![0u8; count.saturating_mul(4)];
-    if copied != 0 && rgba.len() == count * 4 {
-        let src = std::slice::from_raw_parts(bits as *const u8, count * 4);
-        for index in 0..count {
-            let src_at = index * 4;
-            let dst_at = index * 4;
-            rgba[dst_at] = src[src_at + 2];
-            rgba[dst_at + 1] = src[src_at + 1];
-            rgba[dst_at + 2] = src[src_at];
-            rgba[dst_at + 3] = 255;
-        }
-    }
-    if !previous.is_null() {
-        SelectObject(mem, previous);
-    }
-    DeleteObject(bitmap as HGDIOBJ);
-    DeleteDC(mem);
-    ReleaseDC(ptr::null_mut(), screen);
-    if copied == 0 {
-        return Err(format!("BitBlt: win32 {bitblt_error}"));
+    if rgba.len() == count * 4 {
+        let src = std::slice::from_raw_parts(scratch.bits, count * 4);
+        bgra_to_rgba(src, &mut rgba);
     }
     Ok((rgba, width as u32, height as u32))
 }
@@ -1236,9 +1392,143 @@ fn win32(what: &str) -> String {
     format!("{what}: win32 {code}")
 }
 
-unsafe fn open_loopback() -> Result<Loopback, String> {
-    let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+const STGM_READ: u32 = 0;
+/// COM is already initialized on this thread in a different apartment.
+const RPC_E_CHANGED_MODE: i32 = 0x80010106u32 as i32;
+
+fn friendly_name_key() -> PROPERTYKEY {
+    PROPERTYKEY {
+        fmtid: GUID {
+            Data1: 0xa45c254e,
+            Data2: 0xdf1c,
+            Data3: 0x4efd,
+            Data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
+        },
+        pid: 14,
+    }
+}
+
+unsafe fn wide_string(text: *const u16) -> String {
+    if text.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *text.add(len) != 0 && len < 512 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+}
+
+unsafe fn device_friendly_name(device: *mut IMMDevice) -> Option<String> {
+    let mut store: *mut IPropertyStore = ptr::null_mut();
+    let hr = (*device).OpenPropertyStore(STGM_READ, &mut store);
+    if hr < 0 || store.is_null() {
+        return None;
+    }
+    let mut value: PROPVARIANT = mem::zeroed();
+    let key = friendly_name_key();
+    let hr = (*store).GetValue(&key, &mut value);
+    let name = if hr >= 0 && value.vt == VT_LPWSTR as VARTYPE {
+        let text = *value.data.pwszVal();
+        let name = wide_string(text);
+        if !text.is_null() {
+            CoTaskMemFree(text as LPVOID);
+        }
+        (!name.is_empty()).then_some(name)
+    } else {
+        None
+    };
+    (*store).Release();
+    name
+}
+
+unsafe fn render_devices(enumerator: *mut IMMDeviceEnumerator) -> Vec<(*mut IMMDevice, String)> {
+    let mut collection: *mut IMMDeviceCollection = ptr::null_mut();
+    let hr = (*enumerator).EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &mut collection);
+    if hr < 0 || collection.is_null() {
+        return Vec::new();
+    }
+    let mut count: UINT = 0;
+    let hr = (*collection).GetCount(&mut count as *mut UINT as *const UINT);
     if hr < 0 {
+        (*collection).Release();
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for index in 0..count {
+        let mut device: *mut IMMDevice = ptr::null_mut();
+        if (*collection).Item(index, &mut device) < 0 || device.is_null() {
+            continue;
+        }
+        match device_friendly_name(device) {
+            Some(name) => found.push((device, name)),
+            None => (*device).Release(),
+        }
+    }
+    (*collection).Release();
+    found
+}
+
+unsafe fn render_output_names() -> Result<Vec<String>, String> {
+    with_enumerator(|enumerator| Ok(render_devices(enumerator).into_iter().map(|(device, name)| {
+        (*device).Release();
+        name
+    }).collect()))
+}
+
+/// `wanted` selects one active render endpoint. The others are released.
+unsafe fn take_render(
+    enumerator: *mut IMMDeviceEnumerator,
+    wanted: &str,
+) -> Option<(*mut IMMDevice, String)> {
+    let found = render_devices(enumerator);
+    let names: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
+    let picked = etherquic::pick_audio_device(Some(wanted), &names).map(str::to_string);
+    let mut chosen = None;
+    for (device, name) in found {
+        if chosen.is_none() && picked.as_deref() == Some(name.as_str()) {
+            chosen = Some((device, name));
+        } else {
+            (*device).Release();
+        }
+    }
+    chosen
+}
+
+unsafe fn with_enumerator<T>(
+    body: impl FnOnce(*mut IMMDeviceEnumerator) -> Result<T, String>,
+) -> Result<T, String> {
+    let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+    let own_com = hr >= 0;
+    if hr < 0 && hr != RPC_E_CHANGED_MODE {
+        return Err(format!("CoInitializeEx: hresult {hr:#x}"));
+    }
+    let mut enumerator: *mut IMMDeviceEnumerator = ptr::null_mut();
+    let hr = CoCreateInstance(
+        &CLSID_MMDeviceEnumerator,
+        ptr::null_mut(),
+        CLSCTX_ALL,
+        &IMMDeviceEnumerator::uuidof(),
+        &mut enumerator as *mut *mut IMMDeviceEnumerator as *mut LPVOID,
+    );
+    if hr < 0 || enumerator.is_null() {
+        if own_com {
+            CoUninitialize();
+        }
+        return Err(format!("CoCreateInstance audio: hresult {hr:#x}"));
+    }
+    let result = body(enumerator);
+    (*enumerator).Release();
+    if own_com {
+        CoUninitialize();
+    }
+    result
+}
+
+unsafe fn open_render(wanted: Option<&str>) -> Result<Loopback, String> {
+    let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+    let own_com = hr >= 0;
+    if hr < 0 && hr != RPC_E_CHANGED_MODE {
         return Err(format!("CoInitializeEx: hresult {hr:#x}"));
     }
     let mut opened = Loopback {
@@ -1248,7 +1538,8 @@ unsafe fn open_loopback() -> Result<Loopback, String> {
         channels: 0,
         tag: 0,
         bits: 0,
-        com: true,
+        com: own_com,
+        label: "default output".into(),
     };
     let mut enumerator: *mut IMMDeviceEnumerator = ptr::null_mut();
     let hr = CoCreateInstance(
@@ -1259,14 +1550,30 @@ unsafe fn open_loopback() -> Result<Loopback, String> {
         &mut enumerator as *mut *mut IMMDeviceEnumerator as *mut LPVOID,
     );
     if hr < 0 || enumerator.is_null() {
+        opened.com = false;
+        if own_com {
+            CoUninitialize();
+        }
         return Err(format!("CoCreateInstance audio: hresult {hr:#x}"));
     }
-    let mut device: *mut IMMDevice = ptr::null_mut();
-    let hr = (*enumerator).GetDefaultAudioEndpoint(eRender, eConsole, &mut device);
-    if hr < 0 || device.is_null() {
-        (*enumerator).Release();
-        return Err(format!("default output: hresult {hr:#x}"));
-    }
+    let picked = wanted.and_then(|label| take_render(enumerator, label));
+    let (device, label) = match picked {
+        Some((device, name)) => (device, name),
+        None => {
+            let mut device: *mut IMMDevice = ptr::null_mut();
+            let hr = (*enumerator).GetDefaultAudioEndpoint(eRender, eConsole, &mut device);
+            if hr < 0 || device.is_null() {
+                (*enumerator).Release();
+                opened.com = false;
+                if own_com {
+                    CoUninitialize();
+                }
+                return Err(format!("default output: hresult {hr:#x}"));
+            }
+            (device, "default output".to_string())
+        }
+    };
+    opened.label = label;
     let mut format: *mut WAVEFORMATEX = ptr::null_mut();
     let started = (|| {
         let mut client: *mut IAudioClient = ptr::null_mut();
