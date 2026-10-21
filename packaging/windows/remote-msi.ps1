@@ -6,7 +6,11 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $env:PATH = "C:\Program Files\Git\cmd;C:\Program Files\Git\usr\bin;C:\Users\Lyam\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\bin;C:\Users\Lyam\.dotnet\tools;" + $env:PATH
-$env:CARGO_BUILD_JOBS = "1"
+$llvm = "C:\Program Files\LLVM\bin"
+if (Test-Path (Join-Path $llvm "libclang.dll")) {
+    $env:LIBCLANG_PATH = $llvm
+    $env:PATH = "$llvm;" + $env:PATH
+}
 $env:GIT_TERMINAL_PROMPT = "0"
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Set-Location $root

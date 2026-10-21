@@ -100,6 +100,9 @@ impl Pipe {
             "-an",
             "-c:v",
             "mjpeg",
+            // Frame threads hold this JPEG until the next picture.
+            "-threads",
+            "1",
             "-q:v",
             &scale,
             "-flush_packets",

@@ -63,6 +63,22 @@ fn encoder_format(codec: VideoCodec) -> &'static str {
     }
 }
 
+/// One raw picture on stdout. rawvideo is frame-threaded, so more than one
+/// thread holds the picture until the next packet or the stream closes.
+fn rawvideo_pipe(width: u32, height: u32) -> Vec<String> {
+    vec![
+        "-threads".into(),
+        "1".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "rgb24".into(),
+        "-s".into(),
+        format!("{width}x{height}"),
+        "pipe:1".into(),
+    ]
+}
+
 fn decoder_format(codec: VideoCodec) -> &'static str {
     match codec {
         VideoCodec::OpenApv => "apv",
@@ -251,7 +267,24 @@ pub fn encoder_args(name: &str, fps: u32, kbps: u32, long_gop: bool) -> Vec<Stri
         "-bufsize".into(),
         buffer,
     ]);
+    // Frame threads keep the newest picture until the next one. A still
+    // desktop never sends that next picture.
+    if one_thread(name) {
+        args.extend(["-threads".into(), "1".into()]);
+    }
     args
+}
+
+/// Hardware encoders do not use ffmpeg's frame-thread pool.
+fn one_thread(name: &str) -> bool {
+    !name.contains("videotoolbox")
+        && !name.ends_with("_nvenc")
+        && !name.ends_with("_amf")
+        && !name.ends_with("_qsv")
+        && !name.ends_with("_vaapi")
+        && !name.ends_with("_vulkan")
+        && !name.ends_with("_mf")
+        && !name.ends_with("_d3d12va")
 }
 
 fn codec_of(name: &str) -> VideoCodec {
@@ -588,15 +621,7 @@ impl Decoder {
             cmd.args(["-hwaccel", "videotoolbox"]);
         }
         cmd.args(["-c:v", name, "-f", decoder_format(codec), "-i", "pipe:0"]);
-        cmd.args([
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            &format!("{width}x{height}"),
-            "pipe:1",
-        ]);
+        cmd.args(rawvideo_pipe(width, height));
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -705,6 +730,11 @@ mod tests {
             "{}",
             joined(&short)
         );
+        assert!(
+            !joined(&short).contains("-threads"),
+            "{}",
+            joined(&short)
+        );
     }
 
     #[test]
@@ -718,6 +748,7 @@ mod tests {
         assert_eq!(decoder_format(VideoCodec::JpegXs), "nut");
         let jxs = joined(&encoder_args("libsvtjpegxs", 30, 2000, false));
         assert!(jxs.contains("-tag:v jxs"), "{jxs}");
+        assert!(jxs.contains("-threads 1"), "{jxs}");
         assert_eq!(encoder_format(VideoCodec::H264), "nut");
         assert_eq!(encoder_pix_fmt("liboapv"), "yuv422p10le");
         assert_eq!(encoder_pix_fmt("libsvtjpegxs"), "yuv422p");
@@ -726,8 +757,19 @@ mod tests {
         assert!(args.contains("-preset fastest"), "{args}");
         assert!(args.contains("-bf 0"), "{args}");
         assert!(args.contains("-b:v 2000k"), "{args}");
+        assert!(args.contains("-threads 1"), "{args}");
+        let x264 = joined(&encoder_args("libx264", 30, 2000, false));
+        assert!(x264.contains("-threads 1"), "{x264}");
+        let toolbox = joined(&encoder_args("h264_videotoolbox", 30, 2000, false));
+        assert!(
+            !toolbox.contains("-threads"),
+            "hardware encode keeps its own threading: {toolbox}"
+        );
         assert_eq!(candidates(Video::OpenApv), &["liboapv"]);
         assert_eq!(candidates(Video::JpegXs), &["libsvtjpegxs"]);
+        let raw = joined(&rawvideo_pipe(1280, 720));
+        assert!(raw.contains("-threads 1 -f rawvideo"), "{raw}");
+        assert!(raw.contains("1280x720"), "{raw}");
     }
 
     #[test]

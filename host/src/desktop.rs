@@ -1462,7 +1462,9 @@ unsafe fn render_devices(enumerator: *mut IMMDeviceEnumerator) -> Vec<(*mut IMMD
         }
         match device_friendly_name(device) {
             Some(name) => found.push((device, name)),
-            None => (*device).Release(),
+            None => {
+                (*device).Release();
+            }
         }
     }
     (*collection).Release();

@@ -367,10 +367,14 @@ impl FanOut {
     }
 
     fn is_closed(&self) -> bool {
-        self.subscribers
-            .lock()
-            .map(|subs| subs.is_empty())
-            .unwrap_or(true)
+        let Ok(mut subs) = self.subscribers.lock() else {
+            return true;
+        };
+        // A dropped player leaves its sender here until the next packet.
+        // Capture never goes idle, so the encode thread has to notice the
+        // closed sender itself or it keeps a dead ffmpeg forever.
+        subs.retain(|sub| !sub.tx.is_closed());
+        subs.is_empty()
     }
 
     fn send(&self, out: VideoOut) -> bool {
@@ -1197,6 +1201,9 @@ fn video_pump(
         let frame = match frames.wait(seen, Duration::from_millis(250)) {
             Wait::Frame(seq, frame) => {
                 seen = seq;
+                if out.is_closed() {
+                    return;
+                }
                 // Start the period here. Stamping after push returns adds a
                 // full period on top of a codec that already finished.
                 last_encode = Some(Instant::now());
@@ -1428,11 +1435,18 @@ fn video_pump(
             }
             Ok(false) => return,
             Err(error) => {
+                if out.is_closed() {
+                    return;
+                }
                 log(&format!(
                     "{} encoder failed mid-session: {error}",
                     current.video.name()
                 ));
                 if current.video == Video::Mjpeg {
+                    // The pipe's error sticks after ffmpeg exits. Reopen it
+                    // once the next picture arrives.
+                    active = None;
+                    previous = None;
                     continue;
                 }
                 current.encode_fails = current.encode_fails.saturating_add(1);
