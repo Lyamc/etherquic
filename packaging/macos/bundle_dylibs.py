@@ -66,6 +66,37 @@ def rpaths(path):
     return found
 
 
+def cellar_match(name):
+    """A Homebrew Cellar file with the same basename.
+
+    `opt` can point at a newer major while the binary still names the
+    previous soname, which remains installed under Cellar.
+    """
+    leaf = os.path.basename(name)
+    if not leaf:
+        return None
+    roots = []
+    parts = name.split("/")
+    if "opt" in parts:
+        i = parts.index("opt")
+        if i + 1 < len(parts):
+            formula = parts[i + 1]
+            roots.append(f"/opt/homebrew/Cellar/{formula}")
+            roots.append(f"/usr/local/Cellar/{formula}")
+    roots.extend(("/opt/homebrew/Cellar", "/usr/local/Cellar"))
+    seen = set()
+    for root in roots:
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if leaf in filenames:
+                candidate = os.path.join(dirpath, leaf)
+                if os.path.exists(candidate):
+                    return os.path.realpath(candidate)
+    return None
+
+
 def resolve(name, referrer, original_dir):
     """The file `name` refers to, seen from `referrer` before it moved."""
     if name.startswith("@rpath/"):
@@ -81,13 +112,15 @@ def resolve(name, referrer, original_dir):
             candidate = os.path.join(d, leaf)
             if os.path.exists(candidate):
                 return os.path.realpath(candidate)
-        return None
+        return cellar_match(leaf)
     if name.startswith("@loader_path/"):
         candidate = os.path.join(original_dir, name[len("@loader_path/"):])
         return os.path.realpath(candidate) if os.path.exists(candidate) else None
     if name.startswith("@executable_path/"):
         return None
-    return os.path.realpath(name) if os.path.exists(name) else None
+    if os.path.exists(name):
+        return os.path.realpath(name)
+    return cellar_match(name)
 
 
 def main():
