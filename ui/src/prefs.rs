@@ -14,7 +14,7 @@ use etherquic::discover::{
     AnnouncedCodec, AUDIO_OPUS, AUDIO_PCM, VIDEO_APV, VIDEO_AV1, VIDEO_H264, VIDEO_H265,
     VIDEO_JPEGXS, VIDEO_MJ2K, VIDEO_MJPEG, VIDEO_PYROWAVE,
 };
-use etherquic::negotiate::Video;
+use etherquic::negotiate::{HostCaps, Video, VideoCodec};
 use etherquic::{BackendProbe, MediaBackend};
 use etherquic_play::etherquic_media::{caps::Probe, ffmpeg};
 use etherquic_play::{
@@ -634,6 +634,149 @@ fn skipped_without_hardware(pref: PicturePref) -> bool {
     )
 }
 
+/// What the top-right override can see. The host encodes. This computer decodes.
+pub struct OverrideFacts<'a> {
+    pub probe: Option<&'a Probe>,
+    /// Parsed `host-video` lines. `None` when that host did not send them.
+    pub host: Option<&'a HostCaps>,
+    /// A computer is selected, even if it announced no encoders.
+    pub host_known: bool,
+    pub skip_without_hw: bool,
+    pub local: &'a MachineCodecs,
+    pub local_audio: &'a AudioMachine,
+    /// `None` until a host is selected. PCM stays available either way.
+    pub remote_audio: Option<&'a AudioMachine>,
+}
+
+/// Why the top-right video row cannot be chosen. `None` means it is available.
+pub fn video_override_reason(pref: PicturePref, facts: &OverrideFacts<'_>) -> Option<String> {
+    let mut parts = Vec::new();
+    if facts.skip_without_hw && skipped_without_hardware(pref) {
+        parts.push("Skipped because Skip when there's no HW encoder is on".to_string());
+    }
+    if let Some(sentence) = this_computer_blocks(pref, facts) {
+        parts.push(sentence);
+    }
+    if let Some(sentence) = host_blocks(pref, facts) {
+        parts.push(sentence);
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
+/// Why the top-right audio row cannot be chosen.
+pub fn audio_override_reason(codec: AudioId, facts: &OverrideFacts<'_>) -> Option<String> {
+    let (local_ok, remote_ok) = match codec {
+        AudioId::Pcm => return None,
+        AudioId::Opus => (
+            facts.local_audio.opus,
+            facts.remote_audio.map(|audio| audio.opus),
+        ),
+        AudioId::Aac => (
+            facts.local_audio.aac,
+            facts.remote_audio.map(|audio| audio.aac),
+        ),
+    };
+    let mut parts = Vec::new();
+    if !local_ok {
+        parts.push(format!("This computer has no {}", codec.name()));
+    }
+    if remote_ok == Some(false) {
+        parts.push(format!("The host has no {}", codec.name()));
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
+fn this_computer_blocks(pref: PicturePref, facts: &OverrideFacts<'_>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(probe) = facts.probe {
+        if !this_computer_decodes(pref, probe) {
+            parts.push(decode_sentence(pref, probe));
+        }
+    }
+    if needs_hardware_decode(pref) && !facts.local.get(pref.codec()).hardware_decode {
+        parts.push(format!(
+            "This computer has no hardware {} decoder",
+            pref.name()
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
+fn this_computer_decodes(pref: PicturePref, probe: &Probe) -> bool {
+    match pref {
+        PicturePref::Mjpeg => true,
+        PicturePref::Mj2k => probe.decodes.contains(&VideoCodec::Mj2k),
+        PicturePref::Pyrowave | PicturePref::PyrowaveCpu => {
+            probe.decodes.contains(&VideoCodec::Pyrowave)
+        }
+        PicturePref::JpegXs => probe.decodes.contains(&VideoCodec::JpegXs),
+        PicturePref::OpenApv => probe.decodes.contains(&VideoCodec::OpenApv),
+        PicturePref::H264Hw | PicturePref::H264Sw => probe.decodes.contains(&VideoCodec::H264),
+        PicturePref::H265Hw => probe.decodes.contains(&VideoCodec::H265),
+        PicturePref::Av1Hw | PicturePref::Av1Sw => probe.decodes.contains(&VideoCodec::Av1),
+    }
+}
+
+fn needs_hardware_decode(pref: PicturePref) -> bool {
+    matches!(pref, PicturePref::H265Hw | PicturePref::Av1Hw)
+}
+
+fn decode_sentence(pref: PicturePref, probe: &Probe) -> String {
+    if let Some(note) = probe.notes.iter().find(|note| {
+        is_error_note(note) && note_matches(pref.codec(), note)
+    }) {
+        return format!("This computer: {note}");
+    }
+    if needs_ffmpeg(pref.codec())
+        && probe
+            .notes
+            .iter()
+            .any(|note| note.eq_ignore_ascii_case("ffmpeg: not found"))
+    {
+        return format!("This computer cannot decode {}: ffmpeg was not found", pref.name());
+    }
+    format!(
+        "This computer cannot decode {}: {} was not found",
+        pref.name(),
+        decoder_label(pref)
+    )
+}
+
+fn decoder_label(pref: PicturePref) -> &'static str {
+    match pref {
+        PicturePref::JpegXs => "libsvtjpegxs",
+        PicturePref::OpenApv => "liboapv",
+        PicturePref::H264Hw | PicturePref::H264Sw => "h264",
+        PicturePref::H265Hw => "hevc",
+        PicturePref::Av1Hw | PicturePref::Av1Sw => "libdav1d",
+        PicturePref::Mj2k => "jpeg2000",
+        PicturePref::Pyrowave | PicturePref::PyrowaveCpu => "the PyroWave library",
+        PicturePref::Mjpeg => "mjpeg",
+    }
+}
+
+fn host_blocks(pref: PicturePref, facts: &OverrideFacts<'_>) -> Option<String> {
+    if !facts.host_known {
+        return None;
+    }
+    let host = facts.host?;
+    let row = Video::from_token(pref.token())?;
+    if host.encodes(row).is_some() {
+        return None;
+    }
+    let names = ffmpeg::candidates(row);
+    Some(if names.is_empty() {
+        format!("The host has no {} encoder", pref.name())
+    } else if matches!(
+        pref,
+        PicturePref::H264Hw | PicturePref::H265Hw | PicturePref::Av1Hw
+    ) {
+        format!("The host has no hardware encoder ({})", names.join(", "))
+    } else {
+        format!("The host has no {} encoder", names.join(", "))
+    })
+}
+
 /// The offer for one connection: the applied order with any pin first.
 ///
 /// With "Skip when there's no HW encoder" on, H.264 (SW), AV1 (SW), and
@@ -918,6 +1061,10 @@ pub struct Preferences {
     pub opus: Vec<MediaBackend>,
     pub skip_without_hw: bool,
     pub trace_input: bool,
+    /// Draw input, picture, audio, and transfer on the picture.
+    pub latency_graph: bool,
+    /// Append those samples under the temp directory.
+    pub latency_log: bool,
     /// Default rate for every connection, and the rate this PC captures at.
     pub fps: FrameRate,
     /// Stereo-equivalent audio bitrate in kbit/s. Zero is Auto (96 stereo).
@@ -935,6 +1082,8 @@ impl Preferences {
             opus: etherquic::default_backend_order().to_vec(),
             skip_without_hw: false,
             trace_input: false,
+            latency_graph: true,
+            latency_log: false,
             fps: FrameRate::Auto,
             audio_bitrate_kbps: 0,
             audio_channels: 0,
@@ -998,13 +1147,15 @@ fn store_preferences_at(path: &Path, prefs: &Preferences) -> Result<(), String> 
 
 fn render_preferences(prefs: &Preferences) -> String {
     format!(
-        "video={}\nvideo-off={}\naudio={}\nopus={}\nskip-without-hw={}\ntrace-input={}\nfps={}\naudio-bitrate={}\naudio-channels={}\n",
+        "video={}\nvideo-off={}\naudio={}\nopus={}\nskip-without-hw={}\ntrace-input={}\nlatency-graph={}\nlatency-log={}\nfps={}\naudio-bitrate={}\naudio-channels={}\n",
         join_tokens(prefs.video.iter().map(|pref| pref.token())),
         join_tokens(prefs.video_off.iter().map(|pref| pref.token())),
         join_tokens(prefs.audio.iter().map(|codec| codec.token())),
         join_tokens(prefs.opus.iter().copied().map(backend_token)),
         yes_no(prefs.skip_without_hw),
         yes_no(prefs.trace_input),
+        yes_no(prefs.latency_graph),
+        yes_no(prefs.latency_log),
         prefs.fps.token(),
         if prefs.audio_bitrate_kbps == 0 {
             "auto".to_string()
@@ -1026,6 +1177,8 @@ fn parse_preferences(text: &str) -> Preferences {
     let mut opus = None;
     let mut skip_without_hw = false;
     let mut trace_input = false;
+    let mut latency_graph = true;
+    let mut latency_log = false;
     let mut fps = FrameRate::Auto;
     let mut audio_bitrate_kbps = 0;
     let mut audio_channels = 0;
@@ -1040,6 +1193,8 @@ fn parse_preferences(text: &str) -> Preferences {
             "opus" => opus = Some(parse_list(value, backend_from_token)),
             "skip-without-hw" => skip_without_hw = parse_yes(value),
             "trace-input" => trace_input = parse_yes(value),
+            "latency-graph" => latency_graph = parse_yes(value),
+            "latency-log" => latency_log = parse_yes(value),
             "fps" => {
                 if let Some(rate) = FrameRate::from_token(value) {
                     fps = rate;
@@ -1064,6 +1219,8 @@ fn parse_preferences(text: &str) -> Preferences {
         ),
         skip_without_hw,
         trace_input,
+        latency_graph,
+        latency_log,
         fps,
         audio_bitrate_kbps,
         audio_channels,
@@ -1730,6 +1887,8 @@ mod tests {
         ];
         prefs.skip_without_hw = true;
         prefs.trace_input = true;
+        prefs.latency_graph = false;
+        prefs.latency_log = true;
         prefs.fps = FrameRate::Fixed(30);
         let loaded = parse_preferences(&render_preferences(&prefs));
         assert_eq!(loaded, prefs);
@@ -1745,6 +1904,8 @@ mod tests {
         assert_eq!(partial.opus[0], MediaBackend::Ffmpeg);
         assert_eq!(partial.opus.len(), 3);
         assert!(!partial.skip_without_hw);
+        assert!(partial.latency_graph);
+        assert!(!partial.latency_log);
         assert_eq!(partial.fps, FrameRate::Auto);
         assert_eq!(partial.audio_bitrate_kbps, 0);
         assert_eq!(partial.audio_channels, 0);
@@ -2037,5 +2198,105 @@ rtp=nope
         let text = codec_table_text(&rows);
         assert!(text.contains("codec\tSW\tHW\tbackend\terror"));
         assert!(text.contains("H.264\tno\tyes\th264_nvenc"));
+    }
+
+    fn facts<'a>(
+        probe: Option<&'a Probe>,
+        host: Option<&'a HostCaps>,
+        local: &'a MachineCodecs,
+        local_audio: &'a AudioMachine,
+        remote_audio: Option<&'a AudioMachine>,
+        skip: bool,
+        host_known: bool,
+    ) -> OverrideFacts<'a> {
+        OverrideFacts {
+            probe,
+            host,
+            host_known,
+            skip_without_hw: skip,
+            local,
+            local_audio,
+            remote_audio,
+        }
+    }
+
+    fn decode_probe(codecs: &[VideoCodec]) -> Probe {
+        Probe {
+            caps: HostCaps::baseline(),
+            decodes: codecs.to_vec(),
+            audio_decodes: Vec::new(),
+            notes: vec!["ffmpeg: /usr/bin/ffmpeg".into()],
+        }
+    }
+
+    #[test]
+    fn the_override_names_the_side_that_cannot_run_the_codec() {
+        let local = MachineCodecs::default();
+        let audio = AudioMachine {
+            pcm: true,
+            opus: false,
+            aac: false,
+        };
+        let host_audio = AudioMachine {
+            pcm: true,
+            opus: true,
+            aac: false,
+        };
+        let probe = decode_probe(&[VideoCodec::H264, VideoCodec::Av1, VideoCodec::Mjpeg]);
+        let host = HostCaps::from_text(
+            "host-video mjpeg=jpeg:0x0@0 h264-sw=libx264:4096x4096@0 av1-sw=libsvtav1:0x0@0\nhost-audio pcm opus\n",
+        )
+        .unwrap();
+        let open = facts(
+            Some(&probe),
+            Some(&host),
+            &local,
+            &audio,
+            Some(&host_audio),
+            false,
+            true,
+        );
+        assert_eq!(video_override_reason(PicturePref::Mjpeg, &open), None);
+        assert_eq!(video_override_reason(PicturePref::H264Sw, &open), None);
+        assert_eq!(video_override_reason(PicturePref::Av1Sw, &open), None);
+        let jpeg = video_override_reason(PicturePref::JpegXs, &open).unwrap();
+        assert!(jpeg.contains("This computer cannot decode JPEG XS"), "{jpeg}");
+        assert!(jpeg.contains("libsvtjpegxs"), "{jpeg}");
+        assert!(jpeg.contains("The host has no libsvtjpegxs encoder"), "{jpeg}");
+        let av1_hw = video_override_reason(PicturePref::Av1Hw, &open).unwrap();
+        assert!(
+            av1_hw.contains("This computer has no hardware AV1 (HW) decoder"),
+            "{av1_hw}"
+        );
+        assert!(av1_hw.contains("no hardware encoder"), "{av1_hw}");
+        let h264_hw = video_override_reason(PicturePref::H264Hw, &open).unwrap();
+        assert!(h264_hw.contains("The host has no hardware encoder"), "{h264_hw}");
+        assert!(!h264_hw.contains("This computer"), "{h264_hw}");
+
+        let skipped = facts(
+            Some(&probe),
+            Some(&host),
+            &local,
+            &audio,
+            Some(&host_audio),
+            true,
+            true,
+        );
+        let sw = video_override_reason(PicturePref::Av1Sw, &skipped).unwrap();
+        assert!(
+            sw.contains("Skip when there's no HW encoder is on"),
+            "{sw}"
+        );
+        assert_eq!(video_override_reason(PicturePref::JpegXs, &skipped).as_deref(), Some(jpeg.as_str()));
+
+        let unseen = facts(Some(&probe), None, &local, &audio, None, false, false);
+        let only_local = video_override_reason(PicturePref::OpenApv, &unseen).unwrap();
+        assert!(only_local.contains("This computer"), "{only_local}");
+        assert!(!only_local.contains("The host"), "{only_local}");
+
+        let opus = audio_override_reason(AudioId::Opus, &open).unwrap();
+        assert!(opus.contains("This computer has no Opus"), "{opus}");
+        assert!(!opus.contains("The host"), "{opus}");
+        assert_eq!(audio_override_reason(AudioId::Pcm, &open), None);
     }
 }

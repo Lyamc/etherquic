@@ -61,21 +61,24 @@ impl crate::traits::ResourceDevice for super::Context {
             crate::Memory::External(_) => unimplemented!(),
         };
 
+        // ANGLE on Waydroid advertises buffer_storage, then serves storage-buffer
+        // reads from a map the CPU writes never reliably land in.
+        let staged = cfg!(target_os = "android")
+            || !self
+                .capabilities
+                .contains(super::Capabilities::BUFFER_STORAGE);
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(raw));
-            if self
-                .capabilities
-                .contains(super::Capabilities::BUFFER_STORAGE)
-            {
+            if staged {
+                gl.buffer_data_size(glow::ARRAY_BUFFER, desc.size as _, usage);
+                let data_vec = vec![0; desc.size as usize];
+                data = Vec::leak(data_vec).as_mut_ptr();
+            } else {
                 gl.buffer_storage(glow::ARRAY_BUFFER, desc.size as _, None, storage_flags);
                 if map_flags != 0 {
                     data = gl.map_buffer_range(glow::ARRAY_BUFFER, 0, desc.size as _, map_flags);
                     assert!(!data.is_null());
                 }
-            } else {
-                gl.buffer_data_size(glow::ARRAY_BUFFER, desc.size as _, usage);
-                let data_vec = vec![0; desc.size as usize];
-                data = Vec::leak(data_vec).as_mut_ptr();
             }
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             #[cfg(not(target_arch = "wasm32"))]
@@ -87,14 +90,12 @@ impl crate::traits::ResourceDevice for super::Context {
             raw,
             size: desc.size,
             data,
+            staged,
         }
     }
 
     fn sync_buffer(&self, buffer: super::Buffer) {
-        if !self
-            .capabilities
-            .contains(super::Capabilities::BUFFER_STORAGE)
-        {
+        if buffer.staged {
             let gl = self.lock();
             unsafe {
                 let data = slice::from_raw_parts(buffer.data, buffer.size as usize);
@@ -107,11 +108,7 @@ impl crate::traits::ResourceDevice for super::Context {
     fn destroy_buffer(&self, buffer: super::Buffer) {
         let gl = self.lock();
         unsafe { gl.delete_buffer(buffer.raw) };
-        if !buffer.data.is_null()
-            && !self
-                .capabilities
-                .contains(super::Capabilities::BUFFER_STORAGE)
-        {
+        if buffer.staged && !buffer.data.is_null() {
             unsafe {
                 Vec::from_raw_parts(buffer.data, buffer.size as usize, buffer.size as usize);
             }

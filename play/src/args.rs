@@ -32,6 +32,8 @@ pub struct Connect {
     pub rtp: Option<std::net::SocketAddr>,
     /// Ask the host to confirm stamped input.
     pub trace_input: bool,
+    pub latency_graph: bool,
+    pub latency_log: bool,
     /// Scale, what to send, pad slots, and the speaker.
     pub view: ViewOptions,
     /// Stop when stdin closes. A parent process (the macOS app) uses this to end
@@ -103,6 +105,8 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
     let mut l2_offer = false;
     let mut rtp = None;
     let mut trace_input = false;
+    let mut latency_graph = false;
+    let mut latency_log = false;
     let mut view = ViewOptions::default();
     let mut parent_pipe = false;
     let mut codecs = crate::CodecChoice::default();
@@ -115,6 +119,8 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
                 local_mac = mac(need(args, &mut i, "--local-mac")?)?;
             }
             "--trace-input" => flag(&mut i, &mut trace_input),
+            "--latency-graph" => flag(&mut i, &mut latency_graph),
+            "--latency-log" => flag(&mut i, &mut latency_log),
             "--no-keyboard" => off(&mut i, &mut view.send_keyboard),
             "--no-mouse" => off(&mut i, &mut view.send_mouse),
             "--no-pads" => off(&mut i, &mut view.send_pads),
@@ -273,6 +279,8 @@ fn parse_connect(args: &[String]) -> Result<Command, String> {
         l2_offer,
         rtp,
         trace_input,
+        latency_graph,
+        latency_log,
         view,
         parent_pipe,
         codecs,
@@ -351,7 +359,7 @@ fn usage() -> String {
 etherquic-play host [--nic IFACE] [--local-mac MAC] [--service-id 4433] [--max-width 1280] [--fps 15]
 etherquic-play connect --peer-mac MAC [--nic IFACE] [--local-mac MAC] [--service-id 4433]
 etherquic-play connect --udp IP:PORT
-  connect also takes: [--trace-input] [--scale fit|fill|stretch|native]
+  connect also takes: [--trace-input] [--latency-graph] [--latency-log] [--scale fit|fill|stretch|native]
     [--cursor native|copy|remote] [--size-match independent|window-to-host]
     [--look off|blocks|poster|gameboy|pico8|…] [--dither bayer4|bluenoise|floyd-steinberg|…]
     [--pixel-size 1-32] [--dither-strength 0-100]

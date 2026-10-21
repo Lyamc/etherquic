@@ -17,6 +17,7 @@
 //! `eqneg <version>`.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use crate::look::{Dither, Look};
 
@@ -355,6 +356,32 @@ pub const RECORD_CURSOR: u8 = b'P';
 /// skips the record. The host only sends these when the offer has
 /// `knows dirty-rects`.
 pub const RECORD_PATCH: u8 = b'R';
+/// First byte of an `EVI2` or `EAU2` record: how long the host held this
+/// block before sending it. Payload is a stream id then `u32le` microseconds.
+/// A player that does not know the record skips it.
+pub const RECORD_CLOCK: u8 = b'T';
+/// [`RECORD_CLOCK`] stream id for a picture.
+pub const CLOCK_VIDEO: u8 = 1;
+/// [`RECORD_CLOCK`] stream id for audio.
+pub const CLOCK_AUDIO: u8 = 2;
+
+/// Five bytes after the record type: stream id, then host delay in microseconds.
+pub fn clock_payload(stream: u8, delay: Duration) -> [u8; 5] {
+    let us = u32::try_from(delay.as_micros()).unwrap_or(u32::MAX);
+    let mut out = [0u8; 5];
+    out[0] = stream;
+    out[1..].copy_from_slice(&us.to_le_bytes());
+    out
+}
+
+/// `None` when `record` is not a clock. `record` includes the type byte.
+pub fn decode_clock(record: &[u8]) -> Option<(u8, Duration)> {
+    if record.first().copied() != Some(RECORD_CLOCK) || record.len() < 6 {
+        return None;
+    }
+    let us = u32::from_le_bytes(record[2..6].try_into().ok()?);
+    Some((record[1], Duration::from_micros(u64::from(us))))
+}
 
 /// One row of a picture preference list. The suffix is the sender's encoder:
 /// `-hw` is an encode ASIC (NVENC, VideoToolbox, AMF, Quick Sync), `-sw` the CPU.

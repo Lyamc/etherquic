@@ -52,6 +52,10 @@ pub struct Buffer {
     raw: glow::Buffer,
     size: u64,
     data: *mut u8,
+    /// CPU copy uploaded with `buffer_sub_data` on bind. Android's ANGLE
+    /// reports `GL_EXT_buffer_storage` but persistent coherent maps do not
+    /// reach the shader, so quads and glyphs show up one frame and not the next.
+    staged: bool,
 }
 
 unsafe impl Send for Buffer {}
@@ -167,12 +171,17 @@ impl Frame {
 struct BufferPart {
     raw: glow::Buffer,
     offset: u64,
+    data: *mut u8,
+    staged: bool,
 }
+unsafe impl Send for BufferPart {}
 impl From<crate::BufferPiece> for BufferPart {
     fn from(piece: crate::BufferPiece) -> Self {
         Self {
             raw: piece.buffer.raw,
             offset: piece.offset,
+            data: piece.buffer.data,
+            staged: piece.buffer.staged,
         }
     }
 }

@@ -21,7 +21,9 @@ use crate::{
     format_mac, lanes, list_nics, listed_top, load_connections, load_preferences, local_codec_rows,
     mac_key, qr_grid, remote_backend_line, remote_hardware_line, scale_audio_kbps,
     store_connections, store_preferences, swap_earlier, swap_later, this_pc, top_selection,
-    video_hint, video_match_line, Applied, ConnectionOverride, ConnectionPrefs, ConnectionTabs,
+    video_hint, video_match_line, audio_override_reason, remote_audio, video_override_reason,
+    Applied,
+    ConnectionOverride, ConnectionPrefs, ConnectionTabs, OverrideFacts,
     DialTarget, FrameRate, HexMac, Layer, Link, NicChoice, Preferences, QrGrid, Role, Share,
     AUDIO_BITRATE_CHOICES, AUDIO_LAYOUTS, CLIENT_MAC, FPS_CHOICES, HARDWARE_FPS, HOST_MAC,
     SOFTWARE_FPS,
@@ -37,7 +39,7 @@ use crate::{
 };
 use crate::{codec_choice_for, last_session, predicted_pair, Predicted};
 use etherquic::discover::Found;
-use etherquic::negotiate::{YuvChroma, YuvDepth};
+use etherquic::negotiate::{HostCaps, YuvChroma, YuvDepth};
 use etherquic::{BackendProbe, MediaBackend};
 use etherquic_play::{
     choose_codec, display_hz, this_computer, AudioId, AudioMachine, MachineCodecs, PicturePref,
@@ -134,7 +136,7 @@ impl Launch {
         if args.is_empty() {
             return Ok(Self {
                 command: Command::Window,
-                peer: HexMac::from_bytes(HOST_MAC),
+                peer: HexMac::default(),
                 nic: None,
                 udp: None,
                 tray,
@@ -184,7 +186,8 @@ impl Launch {
         }
         Ok(Self {
             command,
-            peer: peer.unwrap_or_else(|| HexMac::from_bytes(HOST_MAC)),
+            // The Connect field stays empty until --peer-mac or a picked host.
+            peer: peer.unwrap_or_default(),
             nic,
             udp,
             tray,
@@ -367,6 +370,10 @@ struct Desk {
     skip_without_hw: bool,
     /// Ask the remote to confirm input and show how long that took.
     trace_input: bool,
+    /// Draw input, picture, audio, and transfer on the picture.
+    latency_graph: bool,
+    /// Keep those samples in the temp directory for a day.
+    latency_log: bool,
     /// Default rate, and the rate this PC captures at while hosting.
     fps: FrameRate,
     /// Stereo-equivalent audio bitrate. Zero is Auto (96 kbps stereo).
@@ -528,6 +535,8 @@ impl Desk {
             audio_pref: saved.audio,
             skip_without_hw: saved.skip_without_hw,
             trace_input: saved.trace_input,
+            latency_graph: saved.latency_graph,
+            latency_log: saved.latency_log,
             fps: saved.fps,
             audio_bitrate_kbps: saved.audio_bitrate_kbps,
             audio_channels: saved.audio_channels,
@@ -606,6 +615,8 @@ impl Desk {
             service_hosting: false,
             shelves: Vec::new(),
         };
+        etherquic_play::set_graph(desk.latency_graph);
+        etherquic_play::set_log(desk.latency_log);
         if let Some(name) = desk.nic.clone() {
             if !desk.listen.select_only(&name) {
                 desk.nic = None;
@@ -639,6 +650,10 @@ impl Desk {
             Command::Connect => match (launch.udp, desk.peer.parse()) {
                 (Some(addr), peer) => {
                     let peer = peer.unwrap_or(HOST_MAC);
+                    desk.direct = Some(HostAddr::Ip {
+                        ip: addr.ip(),
+                        port: addr.port(),
+                    });
                     desk.pending_recent = Some((
                         addr.to_string(),
                         HostAddr::Ip {
@@ -1500,9 +1515,11 @@ impl Desk {
             } else {
                 self.peer.backspace();
             }
+            self.drop_connect_menus_without_target();
             return;
         }
         if ev.is_held || mods.control || mods.alt || mods.platform {
+            self.drop_connect_menus_without_target();
             return;
         }
         if let Some(ch) = ev
@@ -1513,6 +1530,26 @@ impl Desk {
             .or_else(|| (key.len() == 1).then(|| key.chars().next()).flatten())
         {
             self.peer.push(ch);
+        }
+        self.drop_connect_menus_without_target();
+    }
+
+    /// A picked computer, or a finished MAC, is who the Connect menus apply to.
+    fn connect_choices_ready(&self) -> bool {
+        self.direct.is_some() || self.peer.parse().is_some()
+    }
+
+    fn drop_connect_menus_without_target(&mut self) {
+        if self.connect_choices_ready() {
+            return;
+        }
+        if matches!(
+            self.menu,
+            Some(
+                Menu::Video | Menu::Audio | Menu::Fps | Menu::AudioBitrate | Menu::AudioChannels
+            )
+        ) {
+            self.menu = None;
         }
     }
 
@@ -2022,7 +2059,7 @@ impl Desk {
         };
         let field_color = if typed.is_empty() { MUTED } else { TEXT };
         let field_text = if typed.is_empty() {
-            "Host MAC address".to_string()
+            "Host MAC, aa:bb:cc:dd:ee:ff".to_string()
         } else {
             typed
         };
@@ -2113,6 +2150,7 @@ impl Desk {
                     .w_full()
                     .min_w_0()
                     .child(video)
+                    .child(row_label("FPS"))
                     .child(fps),
             )
             .child(
@@ -2125,7 +2163,9 @@ impl Desk {
                     .w_full()
                     .min_w_0()
                     .child(audio)
+                    .child(row_label("Bitrate"))
                     .child(kbps)
+                    .child(row_label("Channels"))
                     .child(channels),
             )
             .child(quality)
@@ -4529,6 +4569,8 @@ impl Desk {
             opus: self.backend_pref.clone(),
             skip_without_hw: self.skip_without_hw,
             trace_input: self.trace_input,
+            latency_graph: self.latency_graph,
+            latency_log: self.latency_log,
             fps: self.fps,
             audio_bitrate_kbps: self.audio_bitrate_kbps,
             audio_channels: self.audio_channels,
@@ -5499,7 +5541,13 @@ impl Desk {
                     self.session_video = None;
                     self.session_audio = None;
                 }
-                Section::Input => self.trace_input = false,
+                Section::Input => {
+                    self.trace_input = false;
+                    self.latency_graph = true;
+                    self.latency_log = false;
+                    etherquic_play::set_graph(true);
+                    etherquic_play::set_log(false);
+                }
                 Section::Appearance | Section::Network | Section::Language | Section::Updates => {}
             }
         }
@@ -5828,7 +5876,8 @@ impl Desk {
         } else {
             format!("Auto · {value}")
         };
-        let open = self.menu == Some(which);
+        let choices_ready = self.connect_choices_ready();
+        let open = self.menu == Some(which) && choices_ready;
         let id = match which {
             Menu::Video => "codec-video",
             Menu::Audio => "codec-audio",
@@ -5842,6 +5891,31 @@ impl Desk {
         };
         let mac = self.peer.parse();
         let name = self.target_label();
+        // The host encodes. This computer decodes. A host that has not been
+        // seen, or that sent no host-video lines, is not blamed for a missing encoder.
+        let device = self.selected_device();
+        let host_caps = device.as_ref().and_then(|device| {
+            device
+                .caps
+                .as_ref()
+                .and_then(|caps| HostCaps::from_text(&caps.codecs))
+        });
+        let heard = device
+            .as_ref()
+            .map(|device| remote_audio(device.audio.as_deref()));
+        let skip_without_hw = match mac {
+            Some(mac) => self.applied(mac).skip_without_hw,
+            None => self.skip_without_hw,
+        };
+        let facts = OverrideFacts {
+            probe: etherquic_play::etherquic_media::caps::ready(),
+            host: host_caps.as_ref(),
+            host_known: device.is_some(),
+            skip_without_hw,
+            local: &self.local_video,
+            local_audio: &self.local_audio,
+            remote_audio: heard.as_ref(),
+        };
         let items: Vec<(String, Option<usize>)> = match which {
             Menu::Video => std::iter::once(("Auto".to_string(), None))
                 .chain(
@@ -5893,6 +5967,17 @@ impl Desk {
                 }
                 (Some(_), _) => false,
             };
+            let why = match (which, pick) {
+                (Menu::Video, Some(i)) => PicturePref::order()
+                    .get(i)
+                    .copied()
+                    .and_then(|pref| video_override_reason(pref, &facts)),
+                (Menu::Audio, Some(i)) => AudioId::order()
+                    .get(i)
+                    .copied()
+                    .and_then(|codec| audio_override_reason(codec, &facts)),
+                _ => None,
+            };
             menu = menu.child(
                 div()
                     .id(SharedString::from(format!("{id}-item-{index}")))
@@ -5901,39 +5986,47 @@ impl Desk {
                     .flex()
                     .items_center()
                     .rounded_sm()
-                    .cursor_pointer()
+                    .text_color(rgb(if why.is_some() { MUTED } else { TEXT }))
                     .when(on, |item| {
                         item.bg(rgb(0x243044)).font_weight(FontWeight::BOLD)
                     })
-                    .hover(|item| item.bg(rgb(0x2a3242)))
+                    .when(why.is_none(), |item| {
+                        item.cursor_pointer()
+                            .hover(|item| item.bg(rgb(0x2a3242)))
+                            .on_click(cx.listener(move |desk, _, _, cx| {
+                                match (which, pick) {
+                                    (Menu::Video, None) => {
+                                        desk.session_video = None;
+                                        if let Some(mac) = mac {
+                                            desk.edit_connection(mac, |over| over.video = None);
+                                        }
+                                    }
+                                    (Menu::Audio, None) => {
+                                        desk.session_audio = None;
+                                        if let Some(mac) = mac {
+                                            desk.edit_connection(mac, |over| over.audio = None);
+                                        }
+                                    }
+                                    (Menu::Video, Some(i)) => {
+                                        desk.session_video = PicturePref::order().get(i).copied()
+                                    }
+                                    (Menu::Audio, Some(i)) => {
+                                        desk.session_audio = AudioId::order().get(i).copied()
+                                    }
+                                    _ => {}
+                                }
+                                desk.menu = None;
+                                cx.notify();
+                            }))
+                    })
+                    .when_some(why, |item, why| {
+                        item.opacity(0.6)
+                            .cursor_default()
+                            .tooltip(shared_tip(why))
+                    })
                     .justify_between()
                     .child(text)
-                    .when(pick.is_none(), |item| item.child(faint_default()))
-                    .on_click(cx.listener(move |desk, _, _, cx| {
-                        match (which, pick) {
-                            (Menu::Video, None) => {
-                                desk.session_video = None;
-                                if let Some(mac) = mac {
-                                    desk.edit_connection(mac, |over| over.video = None);
-                                }
-                            }
-                            (Menu::Audio, None) => {
-                                desk.session_audio = None;
-                                if let Some(mac) = mac {
-                                    desk.edit_connection(mac, |over| over.audio = None);
-                                }
-                            }
-                            (Menu::Video, Some(i)) => {
-                                desk.session_video = PicturePref::order().get(i).copied()
-                            }
-                            (Menu::Audio, Some(i)) => {
-                                desk.session_audio = AudioId::order().get(i).copied()
-                            }
-                            _ => {}
-                        }
-                        desk.menu = None;
-                        cx.notify();
-                    })),
+                    .when(pick.is_none(), |item| item.child(faint_default())),
             );
         }
         let save_for = overridden.then(|| {
@@ -6040,9 +6133,32 @@ impl Desk {
                             .px_2()
                             .rounded_sm()
                             .border_1()
-                            .border_color(rgb(if overridden { PLAYER_BLUE } else { CARD_EDGE }))
+                            .border_color(rgb(
+                                if choices_ready && overridden {
+                                    PLAYER_BLUE
+                                } else {
+                                    CARD_EDGE
+                                },
+                            ))
                             .bg(rgb(BG))
-                            .cursor_pointer()
+                            .text_color(rgb(if choices_ready { TEXT } else { MUTED }))
+                            .when(!choices_ready, |chip| {
+                                chip.opacity(0.45).cursor_default().tooltip(why_tip(
+                                    "Pick a computer or enter its MAC address first",
+                                ))
+                            })
+                            .when(choices_ready, |chip| {
+                                chip.cursor_pointer().on_click(cx.listener(
+                                    move |desk, _, _, cx| {
+                                        desk.menu = if desk.menu == Some(which) {
+                                            None
+                                        } else {
+                                            Some(which)
+                                        };
+                                        cx.notify();
+                                    },
+                                ))
+                            })
                             .child(
                                 div()
                                     .min_w_0()
@@ -6052,15 +6168,7 @@ impl Desk {
                                     .whitespace_normal()
                                     .child(shown),
                             )
-                            .child(chevron(open))
-                            .on_click(cx.listener(move |desk, _, _, cx| {
-                                desk.menu = if desk.menu == Some(which) {
-                                    None
-                                } else {
-                                    Some(which)
-                                };
-                                cx.notify();
-                            })),
+                            .child(chevron(open)),
                     )
                     .when(open, |anchor| {
                         anchor.child(div().absolute().top(px(30.)).left_0().child(
@@ -6266,7 +6374,12 @@ impl Desk {
     fn side_pick(&mut self, which: Menu, cx: &mut Context<Self>) -> impl IntoElement {
         let (shown, width) = self.side_pick_shown(which);
         let items = self.side_pick_items(which);
-        let open = self.menu == Some(which);
+        let session_menu = matches!(
+            which,
+            Menu::Fps | Menu::AudioBitrate | Menu::AudioChannels
+        );
+        let choices_ready = !session_menu || self.connect_choices_ready();
+        let open = self.menu == Some(which) && choices_ready;
         let id = match which {
             Menu::Fps => "connect-fps",
             Menu::AudioBitrate => "connect-audio-kbps",
@@ -6336,7 +6449,22 @@ impl Desk {
                     .border_1()
                     .border_color(rgb(CARD_EDGE))
                     .bg(rgb(BG))
-                    .cursor_pointer()
+                    .text_color(rgb(if choices_ready { TEXT } else { MUTED }))
+                    .when(!choices_ready, |chip| {
+                        chip.opacity(0.45).cursor_default().tooltip(why_tip(
+                            "Pick a computer or enter its MAC address first",
+                        ))
+                    })
+                    .when(choices_ready, |chip| {
+                        chip.cursor_pointer().on_click(cx.listener(move |desk, _, _, cx| {
+                            desk.menu = if desk.menu == Some(which) {
+                                None
+                            } else {
+                                Some(which)
+                            };
+                            cx.notify();
+                        }))
+                    })
                     .child(
                         div()
                             .min_w_0()
@@ -6346,15 +6474,7 @@ impl Desk {
                             .whitespace_normal()
                             .child(shown),
                     )
-                    .child(chevron(open))
-                    .on_click(cx.listener(move |desk, _, _, cx| {
-                        desk.menu = if desk.menu == Some(which) {
-                            None
-                        } else {
-                            Some(which)
-                        };
-                        cx.notify();
-                    })),
+                    .child(chevron(open)),
             )
             .when(open, |anchor| {
                 anchor.child(
@@ -7316,6 +7436,26 @@ impl Desk {
                         desk.persist();
                         cx.notify();
                     })))
+                    .child(toggle_chip("latency-graph", "Latency graph", self.latency_graph, Some(true), cx.listener(|desk, _, _, cx| {
+                        desk.latency_graph = !desk.latency_graph;
+                        etherquic_play::set_graph(desk.latency_graph);
+                        let on = if desk.latency_graph { "yes" } else { "no" };
+                        for slot in desk.session_live.values() {
+                            let _ = slot.tx.send(format!("set latency-graph={on}"));
+                        }
+                        desk.persist();
+                        cx.notify();
+                    })))
+                    .child(toggle_chip("latency-log", "Save latency log", self.latency_log, Some(false), cx.listener(|desk, _, _, cx| {
+                        desk.latency_log = !desk.latency_log;
+                        etherquic_play::set_log(desk.latency_log);
+                        let on = if desk.latency_log { "yes" } else { "no" };
+                        for slot in desk.session_live.values() {
+                            let _ = slot.tx.send(format!("set latency-log={on}"));
+                        }
+                        desk.persist();
+                        cx.notify();
+                    })))
                     .child(toggle_chip("net-trace", "Network trace", self.trace_log.on, Some(false), cx.listener(|desk, _, _, cx| {
                         desk.trace_log.toggle();
                         etherquic_play::set_debug_trace(desk.trace_log.on);
@@ -7377,7 +7517,7 @@ impl Desk {
                     )),
             )
             .child(muted_line(
-                "Send toggles apply to an open view at once. Trace input asks the remote to confirm each key and click; turn it on, then connect.".into(),
+                "Send toggles apply to an open view at once. Trace input asks the remote to confirm each key and click and prints that on the title. The latency graph draws input until that confirmation, picture from capture until this window shows it, audio until the samples are heard, and how much data the session is moving. Save latency log writes those samples under the temp folder and deletes files older than 24 hours.".into(),
             ))
             .child(muted_line(
                 "Paste clipboard, and Ctrl+V in the picture, send this computer's clipboard text into the open view. Send clipboard as keystrokes types that text. The switch is saved.".into(),
@@ -8228,6 +8368,11 @@ fn disclosure(
 }
 
 /// A small drawn triangle, so no font needs the glyph.
+/// Muted name beside a Connect menu. Same size as the Video and Audio names.
+fn row_label(text: &'static str) -> impl IntoElement {
+    div().flex_none().text_color(rgb(MUTED)).child(text)
+}
+
 fn chevron(open: bool) -> impl IntoElement {
     // Bars of 2 px stepping down by 2 px on each side make a clean triangle.
     let bars: [f32; 5] = [10., 8., 6., 4., 2.];
@@ -9964,4 +10109,38 @@ fn flag_en() -> impl IntoElement {
                 .h(px(8.))
                 .bg(rgb(0x3c3b6e)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, Launch};
+
+    #[test]
+    fn the_window_opens_with_an_empty_connect_field() {
+        let launch = Launch::parse(std::iter::empty()).unwrap();
+        assert!(launch.command == Command::Window);
+        assert!(launch.peer.digits().is_empty());
+        assert!(launch.peer.parse().is_none());
+    }
+
+    #[test]
+    fn hosting_leaves_the_connect_field_empty() {
+        let launch = Launch::parse(["host".into()].into_iter()).unwrap();
+        assert!(launch.peer.digits().is_empty());
+    }
+
+    #[test]
+    fn a_given_mac_fills_the_connect_field() {
+        let launch = Launch::parse(
+            [
+                "connect".into(),
+                "--peer-mac".into(),
+                "ab:cd:ef:01:23:45".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(launch.peer.display(), "ab:cd:ef:01:23:45");
+        assert!(launch.peer.parse().is_some());
+    }
 }

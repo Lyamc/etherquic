@@ -759,6 +759,21 @@ impl super::Command {
                     bytes_per_row / block_info.size as u32 * block_info.dimensions.0 as u32;
                 gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
                 gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, row_texels as i32);
+                // Glyphs are uploaded through this path. A staged buffer's bytes
+                // live in the CPU copy until something puts them in the GL buffer.
+                if src.staged && !src.data.is_null() && bytes_per_row > 0 {
+                    let len = bytes_per_row as usize
+                        * size.height.max(1) as usize
+                        * size.depth.max(1) as usize;
+                    let bytes =
+                        std::slice::from_raw_parts(src.data.add(src.offset as usize), len);
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(src.raw));
+                    gl.buffer_sub_data_u8_slice(
+                        glow::PIXEL_UNPACK_BUFFER,
+                        src.offset as i32,
+                        bytes,
+                    );
+                }
                 gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(src.raw));
                 gl.bind_texture(dst.target, Some(dst.raw));
                 let unpack_data = glow::PixelUnpackData::BufferOffset(src.offset as u32);
@@ -836,6 +851,11 @@ impl super::Command {
                 ref size,
             } => unimplemented!(),
             Self::ResetFramebuffer => {
+                // Finish before detach. ANGLE drops tiles that are still in the
+                // draw framebuffer when the renderbuffer is unbound, so the
+                // swap then shows an older copy of those elements.
+                #[cfg(target_os = "android")]
+                gl.finish();
                 for &attachment in COLOR_ATTACHMENTS.iter() {
                     gl.framebuffer_renderbuffer(
                         glow::DRAW_FRAMEBUFFER,
@@ -1125,6 +1145,15 @@ impl super::Command {
                 ref buffer,
                 size,
             } => {
+                if buffer.staged && size > 0 {
+                    let bytes = std::slice::from_raw_parts(
+                        buffer.data.add(buffer.offset as usize),
+                        size as usize,
+                    );
+                    gl.bind_buffer(target, Some(buffer.raw));
+                    gl.buffer_sub_data_u8_slice(target, buffer.offset as i32, bytes);
+                    gl.memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT);
+                }
                 gl.bind_buffer_range(
                     target,
                     slot,

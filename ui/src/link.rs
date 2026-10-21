@@ -939,6 +939,8 @@ fn child_view(
         local_mac: CLIENT_MAC,
         service_id: PLAY_SERVICE_ID,
         trace_input,
+        latency_graph: etherquic_play::graph_enabled(),
+        latency_log: etherquic_play::log_enabled(),
         view,
         codecs,
     };

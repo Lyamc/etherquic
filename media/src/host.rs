@@ -20,7 +20,8 @@ use crate::audio::AudioEncoder;
 use crate::dirty;
 use crate::negotiate::{
     choose_audio, choose_video, session_fps_wish, Audio, FpsWish, HostCaps, Offer, StreamConfig,
-    Video, AUDIO2_MAGIC, OFFER_MAGIC, RECORD_CURSOR, RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
+    Video, AUDIO2_MAGIC, CLOCK_AUDIO, CLOCK_VIDEO, OFFER_MAGIC, RECORD_CLOCK, RECORD_CURSOR,
+    RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
 };
 use crate::video::{EncodeSetup, VideoEncoder};
 use crate::{wire, yuv, Frame, Log, Pcm};
@@ -86,6 +87,8 @@ pub const LEGACY_AUDIO_MAGIC: &[u8; 4] = b"EAUD";
 struct SlotState {
     frame: Option<Arc<Frame>>,
     seq: u64,
+    /// When [`FrameSlot::put`] stored the frame now in `frame`.
+    captured: Option<Instant>,
     closed: bool,
 }
 
@@ -96,7 +99,8 @@ pub struct FrameSlot {
 }
 
 pub enum Wait {
-    Frame(u64, Arc<Frame>),
+    /// Sequence, frame, and the instant [`FrameSlot::put`] stored it.
+    Frame(u64, Arc<Frame>, Instant),
     Timeout,
     Closed,
 }
@@ -110,6 +114,7 @@ impl FrameSlot {
         let (lock, cond) = &*self.inner;
         if let Ok(mut state) = lock.lock() {
             state.frame = Some(Arc::new(frame));
+            state.captured = Some(Instant::now());
             state.seq += 1;
             cond.notify_all();
         }
@@ -146,7 +151,8 @@ impl FrameSlot {
             }
             if state.seq > seen {
                 if let Some(frame) = &state.frame {
-                    return Wait::Frame(state.seq, frame.clone());
+                    let captured = state.captured.unwrap_or_else(Instant::now);
+                    return Wait::Frame(state.seq, frame.clone(), captured);
                 }
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -727,8 +733,9 @@ pub fn encoder_kbps(offer_kbps: u32, cap_kbps: u64) -> u32 {
 #[derive(Clone)]
 enum VideoOut {
     Config(Vec<u8>),
-    Data(Vec<u8>),
-    Patch(Vec<u8>),
+    /// Coded picture. `Some` asks for a clock record on the first chunk of this frame.
+    Data(Vec<u8>, Option<Instant>),
+    Patch(Vec<u8>, Option<Instant>),
 }
 
 /// Send pictures and audio until capture stops (the slot closes and the
@@ -948,27 +955,64 @@ async fn write_out(lane: &mut LaneSend, out: VideoOut) -> Result<(), String> {
             Ok(())
         }
         VideoOut::Config(_) => Ok(()),
-        VideoOut::Data(bytes) if lane.v2 && lane.seam.id() >= etherquic::carrier::UDP_RTP => {
+        VideoOut::Data(bytes, captured) if lane.v2 && lane.seam.id() >= etherquic::carrier::UDP_RTP => {
+            send_clock(lane, VIDEO2_MAGIC, CLOCK_VIDEO, etherquic::carrier::Lane::Picture, captured).await?;
             send_seam(lane, RECORD_DATA, &bytes)
         }
-        VideoOut::Data(bytes) if lane.v2 && lane.datagrams => {
+        VideoOut::Data(bytes, captured) if lane.v2 && lane.datagrams => {
+            send_clock(lane, VIDEO2_MAGIC, CLOCK_VIDEO, etherquic::carrier::Lane::Picture, captured).await?;
             send_datagram_record(lane, RECORD_DATA, &bytes).await
         }
-        VideoOut::Data(bytes) if lane.v2 => {
+        VideoOut::Data(bytes, captured) if lane.v2 => {
+            send_clock(lane, VIDEO2_MAGIC, CLOCK_VIDEO, etherquic::carrier::Lane::Picture, captured).await?;
             wire::write_typed(&mut lane.send, VIDEO2_MAGIC, RECORD_DATA, &bytes).await
         }
-        VideoOut::Data(bytes) => wire::write_record(&mut lane.send, LEGACY_VIDEO_MAGIC, &bytes).await,
-        VideoOut::Patch(bytes) if lane.v2 && lane.seam.id() >= etherquic::carrier::UDP_RTP => {
+        VideoOut::Data(bytes, _) => wire::write_record(&mut lane.send, LEGACY_VIDEO_MAGIC, &bytes).await,
+        VideoOut::Patch(bytes, captured) if lane.v2 && lane.seam.id() >= etherquic::carrier::UDP_RTP => {
+            send_clock(lane, VIDEO2_MAGIC, CLOCK_VIDEO, etherquic::carrier::Lane::Picture, captured).await?;
             send_seam(lane, RECORD_PATCH, &bytes)
         }
-        VideoOut::Patch(bytes) if lane.v2 && lane.datagrams => {
+        VideoOut::Patch(bytes, captured) if lane.v2 && lane.datagrams => {
+            send_clock(lane, VIDEO2_MAGIC, CLOCK_VIDEO, etherquic::carrier::Lane::Picture, captured).await?;
             send_datagram_record(lane, RECORD_PATCH, &bytes).await
         }
-        VideoOut::Patch(bytes) if lane.v2 => {
+        VideoOut::Patch(bytes, captured) if lane.v2 => {
+            send_clock(lane, VIDEO2_MAGIC, CLOCK_VIDEO, etherquic::carrier::Lane::Picture, captured).await?;
             wire::write_typed(&mut lane.send, VIDEO2_MAGIC, RECORD_PATCH, &bytes).await
         }
-        VideoOut::Patch(_) => Ok(()),
+        VideoOut::Patch(_, _) => Ok(()),
     }
+}
+
+/// A clock record on the same path as the media that follows it.
+/// `None` means this chunk is a continuation and already had a clock.
+async fn send_clock(
+    lane: &mut LaneSend,
+    magic: &[u8; 4],
+    stream: u8,
+    which: etherquic::carrier::Lane,
+    captured: Option<Instant>,
+) -> Result<(), String> {
+    let Some(captured) = captured else {
+        return Ok(());
+    };
+    if !lane.v2 {
+        return Ok(());
+    }
+    let payload = etherquic::negotiate::clock_payload(stream, captured.elapsed());
+    if lane.seam.id() >= etherquic::carrier::UDP_RTP {
+        let mut body = Vec::with_capacity(1 + payload.len());
+        body.push(RECORD_CLOCK);
+        body.extend_from_slice(&payload);
+        let capture = capture_at(lane);
+        let _ = lane.seam.send(which, &body, None, capture);
+        flush_tap(lane);
+        return Ok(());
+    }
+    if lane.datagrams {
+        return send_datagram_record(lane, RECORD_CLOCK, &payload).await;
+    }
+    wire::write_typed(&mut lane.send, magic, RECORD_CLOCK, &payload).await
 }
 
 fn send_seam(lane: &mut LaneSend, kind: u8, payload: &[u8]) -> Result<(), String> {
@@ -1102,13 +1146,14 @@ fn send_patches(
     rects: &[dirty::Rect],
     out: &FanOut,
     sent: &AtomicU64,
+    captured: Instant,
 ) -> Result<bool, String> {
     for rect in rects {
         let (rect, tile) = dirty::crop(frame, *rect)?;
         let coded = current.encoder.encode_intra(&tile)?;
         let payload = dirty::encode_payload(rect, &coded);
         sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
-        if !out.send(VideoOut::Patch(payload)) {
+        if !out.send(VideoOut::Patch(payload, Some(captured))) {
             return Ok(false);
         }
     }
@@ -1153,6 +1198,11 @@ fn video_pump(
     let mut keyframe_seen = 0u64;
     let mut keyframe_wait: Option<Instant> = None;
     let mut fresh_encoder = false;
+    // The encode sink runs on this thread for intra codecs and on ffmpeg's
+    // reader thread for the rest. The flag sends one clock for the first
+    // chunk of the frame that was just pushed.
+    let capture_stamp = Arc::new(Mutex::new(Instant::now()));
+    let clock_arm = Arc::new(AtomicBool::new(false));
     loop {
         if offer_rx.has_changed().unwrap_or(false) {
             let next = offer_rx.borrow_and_update().clone();
@@ -1199,7 +1249,7 @@ fn video_pump(
             }
         }
         let frame = match frames.wait(seen, Duration::from_millis(250)) {
-            Wait::Frame(seq, frame) => {
+            Wait::Frame(seq, frame, captured) => {
                 seen = seq;
                 if out.is_closed() {
                     return;
@@ -1207,6 +1257,9 @@ fn video_pump(
                 // Start the period here. Stamping after push returns adds a
                 // full period on top of a codec that already finished.
                 last_encode = Some(Instant::now());
+                if let Ok(mut slot) = capture_stamp.lock() {
+                    *slot = captured;
+                }
                 frame
             }
             Wait::Timeout if out.is_closed() => return,
@@ -1281,9 +1334,16 @@ fn video_pump(
                 };
                 let sink_out = out.clone();
                 let sink_sent = sent.clone();
+                let sink_stamp = Arc::clone(&capture_stamp);
+                let sink_arm = Arc::clone(&clock_arm);
                 let sink: crate::Sink<Vec<u8>> = Arc::new(move |bytes: Vec<u8>| {
                     sink_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    sink_out.send(VideoOut::Data(bytes))
+                    let captured = sink_stamp
+                        .lock()
+                        .map(|slot| *slot)
+                        .unwrap_or_else(|poison| *poison.into_inner());
+                    let clock = sink_arm.swap(false, Ordering::Relaxed).then_some(captured);
+                    sink_out.send(VideoOut::Data(bytes, clock))
                 });
                 match VideoEncoder::open(&setup, sink) {
                     Ok((encoder, opened_kbps)) => {
@@ -1410,7 +1470,11 @@ fn video_pump(
                 continue;
             }
             dirty::Action::Patches(rects) => {
-                match send_patches(current, &frame, &rects, &out, &sent) {
+                let captured = capture_stamp
+                    .lock()
+                    .map(|slot| *slot)
+                    .unwrap_or_else(|poison| *poison.into_inner());
+                match send_patches(current, &frame, &rects, &out, &sent, captured) {
                     Ok(true) => {
                         current.encode_fails = 0;
                         frames_in += 1;
@@ -1423,6 +1487,7 @@ fn video_pump(
             }
             dirty::Action::Full => {}
         }
+        clock_arm.store(true, Ordering::Relaxed);
         match current.encoder.push(&frame) {
             Ok(true) => {
                 current.encode_fails = 0;
@@ -1518,6 +1583,7 @@ async fn audio_loop(
     let mut excluded: Vec<Audio> = Vec::new();
     let mut encoder: Option<(AudioEncoder, Audio)> = None;
     while let Some(pcm) = audio.recv().await {
+        let captured = Instant::now();
         if !lane.v2 {
             wire::write_record(&mut lane.send, LEGACY_AUDIO_MAGIC, &pcm.encode()).await?;
             continue;
@@ -1622,7 +1688,19 @@ async fn audio_loop(
         };
         match enc.push(&pcm) {
             Ok(packets) => {
+                let mut stamped = false;
                 for packet in packets {
+                    if !stamped {
+                        send_clock(
+                            &mut lane,
+                            AUDIO2_MAGIC,
+                            CLOCK_AUDIO,
+                            etherquic::carrier::Lane::Audio,
+                            Some(captured),
+                        )
+                        .await?;
+                        stamped = true;
+                    }
                     if lane.seam.id() >= etherquic::carrier::UDP_RTP {
                         let mut body = Vec::with_capacity(1 + packet.len());
                         body.push(RECORD_DATA);

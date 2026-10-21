@@ -37,6 +37,14 @@ pub fn apply_line(view: &LiveView, tune: &LiveTune, line: &str) -> Control {
         crate::debug_log::set_enabled(parse_yes(value));
         return Control::Applied;
     }
+    if key == "latency-graph" {
+        crate::latency::set_graph(parse_yes(value));
+        return Control::Applied;
+    }
+    if key == "latency-log" {
+        crate::latency::set_log(parse_yes(value));
+        return Control::Applied;
+    }
     if apply_tune(tune, key, value) || apply_view(view, key, value) {
         Control::Applied
     } else {
@@ -240,6 +248,17 @@ mod tests {
         let tune_now = crate::snapshot_tune(&tune);
         assert_eq!(tune_now.audio, Some(Audio::Opus));
         assert_eq!(tune_now.fps, Some(FpsWish::Fixed(30)));
+        assert!(matches!(
+            apply_line(&view, &tune, "set latency-graph=yes"),
+            Control::Applied
+        ));
+        assert!(crate::latency::graph_enabled());
+        assert!(matches!(
+            apply_line(&view, &tune, "set latency-log=no"),
+            Control::Applied
+        ));
+        assert!(!crate::latency::log_enabled());
+        crate::latency::set_graph(false);
         assert_eq!(snapshot(&other).scale, ScaleMode::Fit);
         assert_eq!(crate::snapshot_tune(&other_tune).video, None);
         assert_eq!(crate::snapshot_tune(&other_tune).audio, None);

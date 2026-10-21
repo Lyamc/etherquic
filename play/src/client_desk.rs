@@ -201,6 +201,7 @@ fn run_view(event_loop: &mut EventLoop<()>, request: ViewRequest) {
             fruc_due: None,
             fruc_shown: false,
             fruc_last: Instant::now(),
+            fresh_picture: false,
             debug_prev: None,
             debug_tiles: Vec::new(),
             debug_on: false,
@@ -325,6 +326,7 @@ pub fn connect_view(
             "On macOS the picture window has to run on the main thread, which this window already uses. Use etherquic-play connect from a terminal for now.",
         ));
     }
+    crate::latency::begin_session();
     install_pure_crypto();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -659,16 +661,28 @@ async fn connect_player(
     status(&format!(
         "Viewing {peer_text}. Focus the picture window to use the keyboard and the mouse. A gamepad sends while it is open.{tracing}"
     ));
+    let stats_stop = Arc::clone(&stop);
+    let stats_conn = conn.clone();
+    tokio::spawn(async move {
+        let mut previous = 0u64;
+        let mut last = Instant::now();
+        while !stats_stop.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let stats = stats_conn.stats();
+            crate::latency::set_rtt(stats.path.rtt);
+            let total = stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes);
+            crate::latency::note_throughput(total, previous, last.elapsed());
+            previous = total;
+            last = Instant::now();
+        }
+    });
     let (audio_tx, mut audio_rx) = mpsc::channel(8);
     let (ack_tx, mut ack_rx) = mpsc::channel::<crate::ack::InputAck>(32);
-    let acks = if connect.trace_input {
-        Some(ack_tx)
-    } else {
-        None
-    };
+    let acks = Some(ack_tx);
     let report_status = Arc::clone(&status);
     let report_stamps = Arc::clone(&stamps);
     let report_title = Arc::clone(&title);
+    let report_trace = connect.trace_input;
     tokio::spawn(async move {
         let mut last_pointer = Instant::now() - Duration::from_secs(1);
         while let Some(ack) = ack_rx.recv().await {
@@ -677,9 +691,13 @@ async fn connect_player(
                 .ok()
                 .and_then(|mut sent| sent.remove(&ack.time_us))
                 .map(|sent| sent.elapsed());
+            if let Some(elapsed) = elapsed {
+                crate::latency::note_input(elapsed.as_secs_f32() * 1000.0);
+            }
             let line = ack.summary(elapsed);
-            let show = ack.kind == crate::ack::ACK_KEY
-                || last_pointer.elapsed() >= Duration::from_millis(500);
+            let show = report_trace
+                && (ack.kind == crate::ack::ACK_KEY
+                    || last_pointer.elapsed() >= Duration::from_millis(500));
             if show {
                 if ack.kind != crate::ack::ACK_KEY {
                     last_pointer = Instant::now();
@@ -779,6 +797,9 @@ async fn connect_player(
     }
     let shown = frames.clone();
     let sink: etherquic_media::Sink<etherquic_media::Frame> = Arc::new(move |frame| {
+        if let Some(stamp) = etherquic_media::timing::take_video() {
+            crate::latency::arm_picture(stamp.host, stamp.recv);
+        }
         if let Ok(mut slot) = shown.lock() {
             *slot = Some(Picture {
                 width: frame.width,
@@ -977,6 +998,12 @@ fn play_audio(chunks: std::sync::mpsc::Receiver<AudioChunk>, output: Option<Stri
             Ok(queued) => queued,
             Err(poison) => poison.into_inner(),
         };
+        if rate > 0 && channels > 0 {
+            let ahead = queued.len() as f32
+                / f32::from(channels.max(1))
+                / (rate.max(1) as f32);
+            crate::latency::hear_audio(Duration::from_secs_f32(ahead));
+        }
         queued.extend(samples);
         let cap = usize::from(channels.max(1)) * usize::try_from(rate).unwrap_or(48_000);
         while queued.len() > cap {
@@ -1059,6 +1086,8 @@ struct App {
     fruc_due: Option<Instant>,
     fruc_shown: bool,
     fruc_last: Instant,
+    /// A decoded picture is waiting for its first present.
+    fresh_picture: bool,
     /// Previous picture RGB, for the dirty-tile overlay.
     debug_prev: Option<(u32, u32, Vec<u8>)>,
     debug_tiles: Vec<etherquic_media::dirty::Rect>,
@@ -1373,6 +1402,7 @@ impl App {
             fruc_due: None,
             fruc_shown: false,
             fruc_last: Instant::now(),
+            fresh_picture: false,
             debug_prev: None,
             debug_tiles: Vec::new(),
             debug_on: false,
@@ -1718,7 +1748,15 @@ impl App {
                 }
             }
         }
+        if crate::latency::graph_enabled() {
+            crate::latency::paint(&mut buffer, size.width, size.height);
+        }
+        let fresh = self.fresh_picture;
         let _ = buffer.present();
+        if fresh {
+            self.fresh_picture = false;
+            crate::latency::presented_picture();
+        }
     }
 
     /// Native and Copy keep the local cursor and change its shape from the
@@ -1897,6 +1935,7 @@ impl App {
                 self.fruc_due = None;
             }
             self.picture = Some(picture);
+            self.fresh_picture = true;
             if let Some(window) = &self.window {
                 if options.size_match == crate::SizeMatch::WindowToHost
                     && !options.upscale.enabled()
@@ -2071,7 +2110,8 @@ impl App {
     fn emit(&mut self, mut events: Vec<Event>) {
         let now = self.opened.elapsed();
         for event in &mut events {
-            if self.trace && self.clock.stamp(now, event) && event.time_us != 0 {
+            let stamp = self.trace || crate::latency::wants_stamps();
+            if stamp && self.clock.stamp(now, event) && event.time_us != 0 {
                 if let Ok(mut sent) = self.stamps.lock() {
                     sent.insert(event.time_us, Instant::now());
                     if sent.len() > 256 {
@@ -2079,7 +2119,7 @@ impl App {
                         sent.insert(event.time_us, Instant::now());
                     }
                 }
-            } else if !self.trace {
+            } else if !stamp {
                 event.time_us = 0;
             }
             self.input.push(event.clone());

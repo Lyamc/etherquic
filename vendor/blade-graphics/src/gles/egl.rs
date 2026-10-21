@@ -123,6 +123,7 @@ unsafe impl Sync for Swapchain {}
 pub struct PlatformFrame {
     swapchain: Swapchain,
     framebuf: glow::Framebuffer,
+    renderbuf: glow::Renderbuffer,
 }
 
 pub struct PlatformSurface {
@@ -514,6 +515,16 @@ impl PlatformContext {
             .unwrap();
 
         unsafe {
+            // Draws landed on a temporary framebuffer. Attach the same
+            // renderbuffer here so the blit cannot sample a stale cache.
+            let gl = &inner.glow;
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(frame.framebuf));
+            gl.framebuffer_renderbuffer(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::RENDERBUFFER,
+                Some(frame.renderbuf),
+            );
             super::present_blit(&inner.glow, frame.framebuf, sc.extent);
         }
 
@@ -541,6 +552,7 @@ impl super::Surface {
             platform: PlatformFrame {
                 swapchain: sc.clone(),
                 framebuf: self.framebuf,
+                renderbuf: self.renderbuf,
             },
             texture: super::Texture {
                 inner: super::TextureInner::Renderbuffer {

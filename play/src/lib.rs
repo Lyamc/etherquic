@@ -21,6 +21,7 @@ mod desk_io;
 pub mod hostinfo;
 mod join;
 mod keystrokes;
+mod latency;
 pub mod negotiated;
 mod outbox;
 mod pad;
@@ -65,6 +66,7 @@ pub use picture::{
     Picture, PictureCodec,
 };
 pub use debug_log::{enabled as debug_trace, lines as debug_lines, push as push_debug, set_enabled as set_debug_trace};
+pub use latency::{graph_enabled, log_enabled, set_graph, set_log};
 pub use picture_hub::{
     close_picture, hold_picture, open_picture, request_raise, shown_picture, switch_picture,
     take_raise, PictureSeat,

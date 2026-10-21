@@ -72,9 +72,13 @@ let
     ++ cfg.extraArgs
   );
 
+  # nixpkgs ffmpeg has no libsvtjpegxs, so a JPEG XS offer falls through to
+  # MJPEG. The release wrapper also puts that ffmpeg first on PATH. The app
+  # reads ETHERQUIC_FFMPEG before PATH.
+  ffmpeg = import ./ffmpeg-jpegxs.nix { inherit pkgs; };
   mediaPath = lib.makeBinPath (
     [
-      pkgs.ffmpeg
+      ffmpeg
       pkgs.gst_all_1.gstreamer
       pkgs.libjxl
     ]
@@ -96,6 +100,7 @@ let
       export XAUTHORITY="$auth"
     fi
     export PATH=${mediaPath}:''${PATH}
+    export ETHERQUIC_FFMPEG=${ffmpeg}/bin/ffmpeg
     export LD_LIBRARY_PATH=${libraryPath}
     export GST_PLUGIN_SYSTEM_PATH_1_0=${gstPath}
     export ETHERQUIC_CERTS=${cfg.package}/share/etherquic/certs
@@ -173,7 +178,8 @@ in
         SupplementaryGroups = "input audio video";
         ExecStartPre = "${pkgs.bash}/bin/bash -c 'runtime=/run/user/$(id -u); for i in $(seq 1 90); do test -S \"$runtime/wayland-0\" && exit 0; sleep 1; done; echo etherquic: no Wayland socket at \"$runtime/wayland-0\"; exit 1'";
         ExecStart = start;
-        Restart = "on-failure";
+        # A closed window exits 0. on-failure leaves the machine undiscoverable.
+        Restart = "always";
         RestartSec = 5;
         AmbientCapabilities = "CAP_NET_RAW CAP_NET_ADMIN";
         CapabilityBoundingSet = "CAP_NET_RAW CAP_NET_ADMIN";

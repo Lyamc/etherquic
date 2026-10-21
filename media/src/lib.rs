@@ -23,6 +23,7 @@ pub mod player;
 pub mod pyrowave;
 #[cfg(windows)]
 pub mod pyrowave_d3d11;
+pub mod timing;
 pub mod video;
 pub mod wire;
 pub mod yuv;

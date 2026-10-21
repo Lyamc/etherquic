@@ -12,8 +12,9 @@ use crate::audio::AudioDecoder;
 use crate::caps;
 use crate::dirty;
 use crate::negotiate::{
-    build_offer, Audio, Limit, Offer, OfferInput, StreamConfig, Video, VideoCodec, OFFER_MAGIC,
-    RECORD_CONFIG, RECORD_CURSOR, RECORD_DATA, RECORD_PATCH,
+    build_offer, decode_clock, Audio, Limit, Offer, OfferInput, StreamConfig, Video, VideoCodec,
+    CLOCK_AUDIO, CLOCK_VIDEO, OFFER_MAGIC, RECORD_CLOCK, RECORD_CONFIG, RECORD_CURSOR, RECORD_DATA,
+    RECORD_PATCH,
 };
 use crate::video::VideoDecoder;
 use crate::{jpeg, jpeg2000, wire, Frame, Pcm, Sink};
@@ -427,6 +428,14 @@ pub async fn read_video(
                     }
                     continue;
                 }
+                Some(&RECORD_CLOCK) => {
+                    if let Some((stream, delay)) = decode_clock(&record) {
+                        if stream == CLOCK_VIDEO {
+                            crate::timing::push_video(delay);
+                        }
+                    }
+                    continue;
+                }
                 _ => continue,
             }
         };
@@ -605,6 +614,14 @@ pub async fn read_audio(
                     continue;
                 }
                 Some(&RECORD_DATA) => record[1..].to_vec(),
+                Some(&RECORD_CLOCK) => {
+                    if let Some((stream, delay)) = decode_clock(&record) {
+                        if stream == CLOCK_AUDIO {
+                            crate::timing::push_audio(delay);
+                        }
+                    }
+                    continue;
+                }
                 _ => continue,
             }
         };

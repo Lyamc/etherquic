@@ -35,6 +35,8 @@ pub struct ChildConnect {
     pub local_mac: [u8; 6],
     pub service_id: u16,
     pub trace_input: bool,
+    pub latency_graph: bool,
+    pub latency_log: bool,
     pub view: ViewOptions,
     /// Codec order and pins, so the child offers what the Settings say.
     pub codecs: etherquic_play::CodecChoice,
@@ -56,6 +58,12 @@ pub fn connect_args(c: &ChildConnect) -> Vec<String> {
     args.extend(["--local-mac".into(), crate::format_mac(c.local_mac)]);
     if c.trace_input {
         args.push("--trace-input".into());
+    }
+    if c.latency_graph {
+        args.push("--latency-graph".into());
+    }
+    if c.latency_log {
+        args.push("--latency-log".into());
     }
     let v = &c.view;
     args.extend(["--scale".into(), v.scale.token().into()]);
@@ -309,6 +317,8 @@ mod tests {
             local_mac: [2, 0, 0, 0, 0, 2],
             service_id: 4433,
             trace_input: false,
+            latency_graph: false,
+            latency_log: false,
             view: ViewOptions::default(),
             codecs: etherquic_play::CodecChoice::default(),
         }

@@ -49,6 +49,8 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             let view = etherquic_play::live(connect.view);
             let tune = etherquic_play::live_tune(etherquic_play::SessionTune::default());
+            etherquic_play::set_graph(connect.latency_graph);
+            etherquic_play::set_log(connect.latency_log);
             if connect.parent_pipe {
                 etherquic_play::parent_ctl::watch_stdin(Arc::clone(&stop), view.clone(), tune.clone());
             }

@@ -10,6 +10,8 @@
 
 let
   pyrowave = pkgs.callPackage ./pyrowave.nix { };
+  # Same ffmpeg the host service uses, so a dev window can encode JPEG XS.
+  ffmpeg = import ./ffmpeg-jpegxs.nix { inherit pkgs; };
   libs = with pkgs; [
     libpcap
     alsa-lib
@@ -37,7 +39,7 @@ pkgs.mkShell {
   nativeBuildInputs = [
     pkgs.pkg-config
     pkgs.rustPlatform.bindgenHook
-    pkgs.ffmpeg
+    ffmpeg
     pkgs.gst_all_1.gstreamer
     # cjxl encodes the discovery thumbnail a host sends.
     pkgs.libjxl
@@ -59,7 +61,8 @@ pkgs.mkShell {
     if [ -z "''${VK_DRIVER_FILES:-}" ] && [ -f /run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json ]; then
       export VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json
     fi
-    echo "etherquic nix-shell (libpcap ${pkgs.libpcap.version}, ffmpeg ${pkgs.ffmpeg.version}, gstreamer ${pkgs.gst_all_1.gstreamer.version}, libopus ${pkgs.libopus.version}, pyrowave ${pyrowave.version})"
+    export ETHERQUIC_FFMPEG=${ffmpeg}/bin/ffmpeg
+    echo "etherquic nix-shell (libpcap ${pkgs.libpcap.version}, ffmpeg ${ffmpeg.version} with libsvtjpegxs, gstreamer ${pkgs.gst_all_1.gstreamer.version}, libopus ${pkgs.libopus.version}, pyrowave ${pyrowave.version})"
     echo "  cargo test"
     echo "  cargo build --release --bins"
     echo "  cargo run --manifest-path video/Cargo.toml --bin etherquic-video-recv -- --help"

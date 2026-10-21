@@ -64,6 +64,7 @@ pub use prefs::{
     backend_label, backend_line, capture_rate, chosen_audio, chosen_video, codec_choice_for,
     default_audio, default_video, fps_headline, listed_top, load_connections, load_preferences,
     local_codec_rows, local_video_line, mac_key, move_to_front, negotiated_from_status,
+    audio_override_reason, remote_audio, video_override_reason, OverrideFacts,
     predicted_pair, codec_table_text, CodecSupportRow,
     remote_backend_line, remote_hardware_line, resolve_fps, scale_audio_kbps, store_connections,
     store_preferences,
