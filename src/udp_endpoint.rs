@@ -96,8 +96,16 @@ fn std_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
         socket.set_only_v6(true)?;
     }
     socket.bind(&addr.into())?;
+    // Windows gives a UDP socket 64 KB. A PyroWave picture on QUIC datagrams
+    // is a few hundred KB inside one congestion window, so the tail of every
+    // burst was dropped by the kernel and no picture ever reassembled.
+    let _ = socket.set_recv_buffer_size(QUIC_UDP_BUFFER);
+    let _ = socket.set_send_buffer_size(QUIC_UDP_BUFFER);
     Ok(socket.into())
 }
+
+/// Kernel buffer for a QUIC UDP socket. Matches the RTP media sockets.
+const QUIC_UDP_BUFFER: usize = 4 * 1024 * 1024;
 
 /// The sockets for one port: IPv4 must bind, IPv6 is kept when it binds.
 /// `Err` only when IPv4 is taken, so the caller moves to the next port.
@@ -244,7 +252,14 @@ pub fn udp_client_endpoint_on(addr: SocketAddr) -> Result<Endpoint, EndpointErro
     client_config.transport_config(Arc::new(transport));
 
     crate::note_quic_bind();
-    let endpoint = Endpoint::client(addr)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| EndpointError::Other("no async runtime".into()))?;
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        std_socket(addr)?,
+        runtime,
+    )?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }

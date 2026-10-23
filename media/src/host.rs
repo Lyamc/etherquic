@@ -1128,8 +1128,12 @@ async fn send_datagram_record(lane: &mut LaneSend, kind: u8, payload: &[u8]) -> 
         let mut packet = Vec::with_capacity(1 + slice.bytes.len() + 6);
         packet.push(lane.lane);
         packet.extend(slice.encode());
+        // `send_datagram` drops the oldest queued datagram when the buffer
+        // is full, which punches a hole in the picture still being sent.
+        // Wait for room instead; the player's deadline still drops a late one.
         lane.conn
-            .send_datagram(packet.into())
+            .send_datagram_wait(packet.into())
+            .await
             .map_err(|e| e.to_string())?;
     }
     sample_loss(lane);
