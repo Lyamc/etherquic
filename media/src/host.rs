@@ -1704,7 +1704,11 @@ async fn audio_loop(
                         ));
                         let encoded = config.encode();
                         wire::write_record(&mut lane.send, AUDIO2_MAGIC, &encoded).await?;
-                        if lane.seam.id() >= etherquic::carrier::UDP_RTP {
+                        // ST 2110-30 carries samples only. The config already
+                        // went on the stream above.
+                        if lane.seam.id() >= etherquic::carrier::UDP_RTP
+                            && lane.seam.id() != etherquic::carrier::ST2110
+                        {
                             let capture = capture_at(&mut lane);
                             let _ = lane.seam.send(
                                 etherquic::carrier::Lane::Audio,

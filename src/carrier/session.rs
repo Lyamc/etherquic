@@ -419,6 +419,19 @@ pub fn spawn_player_avb(
     });
 }
 
+const ST_AUDIO_RATE: u32 = 48_000;
+const ST_AUDIO_FRAMES_PER_MS: usize = 48;
+
+/// RTP header check and optional `gcm` open. Returns the marker and payload.
+fn st_open(gcm: &mut Option<rtp::GcmSession>, packet: &[u8]) -> Option<(bool, Vec<u8>)> {
+    let (header, sealed) = RtpHeader::decode(packet)?;
+    let payload = match gcm.as_mut() {
+        Some(session) => session.open(header.ssrc, 0, header.sequence, sealed).ok()?,
+        None => sealed.to_vec(),
+    };
+    Some((header.marker, payload))
+}
+
 /// Player ST 2110 sockets. Picture and audio stay on their own ports.
 pub fn spawn_player_st2110(
     host_input: std::net::SocketAddr,
@@ -448,63 +461,84 @@ pub fn spawn_player_st2110(
         let gcm_on = super::gates().st_gcm;
         hello.push(if gcm_on { b'G' } else { b'P' });
         let _ = picture_sock.send_to(&hello, host_input);
-        let mut gcm = gcm_on.then(|| {
-            let key = rtp::hub_exchanged_key().unwrap_or_else(rtp::session_key);
-            rtp::GcmSession::new(key)
-        });
-        let mut asm = super::XsAssembler::new();
-        let mut pcm = Vec::new();
-        let mut frame = 1u32;
-        let mut open = false;
-        let mut buf = [0u8; 2048];
-        while !picture.is_closed() && !audio.is_closed() {
-            let got = picture_sock
-                .recv_from(&mut buf)
-                .or_else(|_| audio_sock.recv_from(&mut buf));
-            let Ok((n, _)) = got else {
-                continue;
-            };
-            let Some((header, sealed)) = RtpHeader::decode(&buf[..n]) else {
-                continue;
-            };
-            let opened = if let Some(session) = gcm.as_mut() {
-                match session.open(header.ssrc, 0, header.sequence, sealed) {
-                    Ok(bytes) => bytes,
-                    Err(_) => continue,
-                }
-            } else {
-                sealed.to_vec()
-            };
-            let payload = opened.as_slice();
-            if header.payload_type == rtp::PT_AUDIO {
-                for chunk in payload.chunks_exact(2) {
-                    let sample = i16::from_be_bytes([chunk[0], chunk[1]]);
-                    pcm.extend(sample.to_le_bytes());
-                }
-                if header.marker {
-                    let record = std::mem::take(&mut pcm);
-                    if audio.blocking_send(record).is_err() {
-                        return;
+        let key = gcm_on.then(|| rtp::hub_exchanged_key().unwrap_or_else(rtp::session_key));
+        // Audio has its own thread. One loop that only read the audio socket
+        // after a 50 ms picture timeout never read it while pictures flowed.
+        if let Ok(audio_sock) = audio_sock.try_clone() {
+            let picture_alive = picture.clone();
+            std::thread::spawn(move || {
+                let mut gcm = key.map(rtp::GcmSession::new);
+                let mut pcm = Vec::new();
+                let mut channels = 0u16;
+                let mut buf = [0u8; 2048];
+                while !audio.is_closed() && !picture_alive.is_closed() {
+                    let Ok((n, _)) = audio_sock.recv_from(&mut buf) else {
+                        continue;
+                    };
+                    let Some(payload) = st_open(&mut gcm, &buf[..n]) else {
+                        continue;
+                    };
+                    let (marker, payload) = payload;
+                    // Level A is 48 kHz in 1 ms packets, so the first packet of
+                    // a record holds 48 frames and names the channel count.
+                    if pcm.is_empty() {
+                        channels = u16::try_from(payload.len() / 2 / ST_AUDIO_FRAMES_PER_MS)
+                            .unwrap_or(2)
+                            .max(1);
+                    }
+                    for chunk in payload.chunks_exact(2) {
+                        let sample = i16::from_be_bytes([chunk[0], chunk[1]]);
+                        pcm.extend(sample.to_le_bytes());
+                    }
+                    if marker {
+                        // The decoder takes the `D` record the QUIC reader hands it.
+                        let mut record = Vec::with_capacity(7 + pcm.len());
+                        record.push(crate::negotiate::RECORD_DATA);
+                        record.extend(ST_AUDIO_RATE.to_le_bytes());
+                        record.extend(channels.to_le_bytes());
+                        record.append(&mut pcm);
+                        if audio.blocking_send(record).is_err() {
+                            return;
+                        }
                     }
                 }
+            });
+        }
+        let mut gcm = key.map(rtp::GcmSession::new);
+        // Frames follow the ST 2110-22 header: packet index, and K on the last
+        // packet. A missing index drops that frame only. Before, a lost packet
+        // glued the next frame onto the broken one and the decoder got neither.
+        let mut parts = Vec::new();
+        let mut next_index: Option<u16> = None;
+        let mut buf = [0u8; 2048];
+        while !picture.is_closed() {
+            let Ok((n, _)) = picture_sock.recv_from(&mut buf) else {
                 continue;
-            }
+            };
+            let Some((last, payload)) = st_open(&mut gcm, &buf[..n]) else {
+                continue;
+            };
             if payload.len() < 4 {
                 continue;
             }
-            let first = !open;
-            open = true;
-            if let Some(record) = asm.push(frame, first, header.marker, &payload[4..]) {
-                let tx = if header.payload_type == rtp::PT_AUDIO {
-                    &audio
-                } else {
-                    &picture
-                };
-                if tx.blocking_send(record).is_err() {
+            let index = u16::from_be_bytes([payload[1], payload[2]]);
+            let k = payload[0] & 0x40 != 0;
+            if index == 0 {
+                parts.clear();
+                next_index = Some(0);
+            }
+            if next_index != Some(index) {
+                next_index = None;
+                parts.clear();
+                continue;
+            }
+            parts.extend_from_slice(&payload[4..]);
+            next_index = Some(index.wrapping_add(1));
+            if k || last {
+                next_index = None;
+                if picture.blocking_send(std::mem::take(&mut parts)).is_err() {
                     return;
                 }
-                frame = frame.wrapping_add(1);
-                open = false;
             }
         }
     });

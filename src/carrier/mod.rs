@@ -1143,8 +1143,15 @@ impl Seam {
         if body.is_empty() {
             return None;
         }
-        let samples = pcm_samples(body);
-        let packets = ::st2110::packetize_pcm(&samples, 1, 48_000);
+        // A live audio body is a `D` record: kind, rate u32le, channels u16le,
+        // then i16le samples. ST 2110-30 carries only the samples, at the
+        // record's channel count. Sending the header as samples and calling
+        // it mono left the player with records it could not decode.
+        let (samples, channels, rate) = match pcm_record(body) {
+            Some(parts) => parts,
+            None => (pcm_samples(body), 1, 48_000),
+        };
+        let packets = ::st2110::packetize_pcm(&samples, channels, rate);
         if packets.is_empty() {
             return None;
         }
@@ -1165,6 +1172,23 @@ const ST_FRAME_TICKS: u32 = 1_500;
 
 fn st_frame() -> Duration {
     Duration::from_nanos(u64::from(ST_FRAME_TICKS) * 1_000_000_000 / 90_000)
+}
+
+/// Samples, channels, and rate of a `D` PCM record, or `None` for other bodies.
+fn pcm_record(body: &[u8]) -> Option<(Vec<i16>, u16, u32)> {
+    if body.len() < 7 || body[0] != crate::negotiate::RECORD_DATA || (body.len() - 7) % 2 != 0 {
+        return None;
+    }
+    let rate = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+    let channels = u16::from_le_bytes([body[5], body[6]]);
+    if rate == 0 || channels == 0 {
+        return None;
+    }
+    let samples = body[7..]
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    Some((samples, channels, rate))
 }
 
 fn pcm_samples(body: &[u8]) -> Vec<i16> {
