@@ -1,6 +1,6 @@
 //! UDP/RTP carrier. No Quinn connection. Input is a sibling datagram.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -669,7 +669,7 @@ fn accept_rtp(
     let plain = if clear {
         payload.to_vec()
     } else {
-        match gcm.open(header.ssrc, 0, header.sequence, payload) {
+        match gcm.open_next(header.ssrc, header.sequence, payload) {
             Ok(plain) => plain,
             Err(_) => return true,
         }
@@ -765,7 +765,12 @@ pub fn srtp_nonce(ssrc: u32, roc: u32, seq: u16) -> [u8; 12] {
 #[derive(Debug)]
 pub struct GcmSession {
     key: [u8; 16],
-    seen: HashSet<(u32, u32, u16)>,
+    /// Per SSRC: highest packet index (roc << 16 | seq) and a replay bitmap
+    /// of the 128 indices below it. A set of every nonce grew without bound.
+    seen: HashMap<u32, (u64, u128)>,
+    /// Per SSRC: roll-over counter and last sequence, for `seal_next` and
+    /// `open_next`.
+    roc: HashMap<u32, (u32, u16)>,
     closed: bool,
 }
 
@@ -773,7 +778,8 @@ impl GcmSession {
     pub fn new(key: [u8; 16]) -> Self {
         Self {
             key,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
+            roc: HashMap::new(),
             closed: false,
         }
     }
@@ -798,14 +804,67 @@ impl GcmSession {
         cipher.decrypt(&nonce, payload).map_err(|e| e.to_string())
     }
 
+    /// Seal with the roll-over counter this session keeps for `ssrc`. The
+    /// counter advances when the sequence wraps. With a fixed counter of 0
+    /// the 65,537th packet repeated a nonce and closed the session, about
+    /// ten seconds into a PyroWave stream.
+    pub fn seal_next(&mut self, ssrc: u32, seq: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let roc = match self.roc.get(&ssrc).copied() {
+            Some((roc, last)) if seq < last => roc.wrapping_add(1),
+            Some((roc, _)) => roc,
+            None => 0,
+        };
+        self.roc.insert(ssrc, (roc, seq));
+        self.seal(ssrc, roc, seq, payload)
+    }
+
+    /// Open with the RFC 3711 roll-over estimate for `ssrc`.
+    pub fn open_next(&mut self, ssrc: u32, seq: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let (roc, last) = self.roc.get(&ssrc).copied().unwrap_or((0, seq));
+        let guess = if last < 0x8000 {
+            if seq > last && seq - last > 0x8000 {
+                roc.wrapping_sub(1)
+            } else {
+                roc
+            }
+        } else if last - 0x8000 > seq {
+            roc.wrapping_add(1)
+        } else {
+            roc
+        };
+        let opened = self.open(ssrc, guess, seq, payload)?;
+        let newer = (u64::from(guess) << 16 | u64::from(seq)) > (u64::from(roc) << 16 | u64::from(last));
+        if newer || !self.roc.contains_key(&ssrc) {
+            self.roc.insert(ssrc, (guess, seq));
+        }
+        Ok(opened)
+    }
+
     fn guard(&mut self, ssrc: u32, roc: u32, seq: u16) -> Result<(), String> {
         if self.closed {
             return Err("session closed".into());
         }
-        if !self.seen.insert((ssrc, roc, seq)) {
+        let index = u64::from(roc) << 16 | u64::from(seq);
+        let Some((top, bits)) = self.seen.get(&ssrc).copied() else {
+            self.seen.insert(ssrc, (index, 0));
+            return Ok(());
+        };
+        if index > top {
+            let shift = index - top;
+            let bits = if shift >= 128 { 0 } else { (bits << shift) | (1u128 << (shift - 1)) };
+            self.seen.insert(ssrc, (index, bits));
+            return Ok(());
+        }
+        let back = top - index;
+        if back == 0 || (back <= 128 && bits & (1u128 << (back - 1)) != 0) {
             self.closed = true;
             return Err("repeated nonce".into());
         }
+        if back > 128 {
+            // Too old to tell. Drop the packet, keep the session.
+            return Err("packet older than the replay window".into());
+        }
+        self.seen.insert(ssrc, (top, bits | (1u128 << (back - 1))));
         Ok(())
     }
 }
@@ -1097,7 +1156,7 @@ impl RtpSession {
             let payload = if self.plain {
                 plain
             } else {
-                match self.gcm.seal(ssrc, 0, seq, &plain) {
+                match self.gcm.seal_next(ssrc, seq, &plain) {
                     Ok(sealed) => {
                         SEALED.fetch_add(1, Ordering::Relaxed);
                         sealed
@@ -1149,6 +1208,26 @@ impl RtpSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gcm_survives_a_sequence_wrap() {
+        let _globals = crate::carrier::test_globals();
+        let mut host = GcmSession::new([5u8; 16]);
+        let mut player = GcmSession::new([5u8; 16]);
+        let mut seq = 65_000u16;
+        for i in 0..2_000u32 {
+            let body = i.to_le_bytes();
+            let sealed = host.seal_next(9, seq, &body).unwrap();
+            if i % 7 == 3 {
+                // A lost packet does not change the roll-over estimate.
+                seq = seq.wrapping_add(1);
+                continue;
+            }
+            assert_eq!(player.open_next(9, seq, &sealed).unwrap(), body);
+            seq = seq.wrapping_add(1);
+        }
+        assert!(!player.closed());
+    }
 
     #[test]
     fn gcm_round_trips_and_a_repeated_nonce_closes() {
