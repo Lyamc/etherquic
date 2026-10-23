@@ -47,19 +47,20 @@ pub fn player_share() -> KeyShare {
 }
 
 fn fresh_seed() -> [u8; 32] {
+    // The OS RNG on every platform. Windows has no /dev/urandom, and the old
+    // clock fallback copied 18 bytes into a 16-byte slot and panicked.
     let mut seed = [0u8; 32];
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        if file.read_exact(&mut seed).is_ok() {
-            return seed;
-        }
+    if getrandom::fill(&mut seed).is_ok() {
+        return seed;
     }
     let tick = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(1);
-    seed[..16].copy_from_slice(&tick.to_le_bytes());
-    seed[16..].copy_from_slice(b"player-ephemeral!!");
+    let mut seed = [0u8; 32];
+    let hk = Hkdf::<Sha256>::new(Some(&tick.to_le_bytes()), b"player-ephemeral");
+    hk.expand(b"etherquic-player-fallback", &mut seed)
+        .expect("hkdf expand");
     seed
 }
 
@@ -1151,6 +1152,7 @@ mod tests {
 
     #[test]
     fn gcm_round_trips_and_a_repeated_nonce_closes() {
+        let _globals = crate::carrier::test_globals();
         let host = KeyShare::from_seed([3u8; 32]);
         let player = KeyShare::from_seed([9u8; 32]);
         let shared = host.shared(&player.public);
@@ -1166,6 +1168,7 @@ mod tests {
 
     #[test]
     fn a_key_is_resent_until_eaku_and_a_pointer_goes_once() {
+        let _globals = crate::carrier::test_globals();
         let mut pump = KeyPump::new(4, b"k".to_vec());
         let start = Instant::now();
         let deadline = start + Duration::from_millis(20);
@@ -1224,6 +1227,7 @@ mod tests {
 
     #[test]
     fn a_dropped_slice_does_not_block_the_next_record() {
+        let _globals = crate::carrier::test_globals();
         let mut rtp = RtpSession::new(5000);
         assert!(RtpSession::ports_free(|_| false, 5000));
         assert!(!RtpSession::ports_free(|p| p == 5001, 5000));
@@ -1250,6 +1254,7 @@ mod tests {
 
     #[test]
     fn capture_time_is_the_rtp_timestamp() {
+        let _globals = crate::carrier::test_globals();
         let mut rtp = RtpSession::new(0);
         rtp.set_plain(true);
         assert!(rtp
@@ -1294,6 +1299,7 @@ mod tests {
 
     #[test]
     fn a_picture_socket_holds_a_full_frame() {
+        let _globals = crate::carrier::test_globals();
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind");
         widen_udp(&sock);
         let got = socket2::SockRef::from(&sock)
@@ -1307,6 +1313,7 @@ mod tests {
 
     #[test]
     fn emit_reaches_a_non_loopback_peer() {
+        let _globals = crate::carrier::test_globals();
         let ip = lan_v4();
         release_rtp();
         let port = free_rtp_port();
@@ -1351,6 +1358,7 @@ mod tests {
 
     #[test]
     fn a_later_offer_replaces_the_rtp_peer() {
+        let _globals = crate::carrier::test_globals();
         let ip = lan_v4();
         let was_plain = super::super::udp_plain();
         super::super::choose_udp_plain(true);
@@ -1423,6 +1431,7 @@ mod tests {
 
     #[test]
     fn a_large_picture_reaches_the_player_off_loopback() {
+        let _globals = crate::carrier::test_globals();
         let ip = lan_v4();
         let was_plain = super::super::udp_plain();
         super::super::choose_udp_plain(true);
@@ -1477,6 +1486,7 @@ mod tests {
 
     #[test]
     fn a_slow_picture_still_reassembles_inside_the_player_wait() {
+        let _globals = crate::carrier::test_globals();
         let mut rtp = RtpSession::new(0);
         rtp.set_plain(true);
         let picture = vec![0x3Cu8; 80_000];

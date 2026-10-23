@@ -712,6 +712,7 @@ mod tests {
 
     #[test]
     fn carriers_3_4_and_5_finish_on_udp_without_quic() {
+        let _globals = crate::carrier::test_globals();
         let picture = b"picture-bytes-for-the-session".to_vec();
         let audio = b"audio-pcm".to_vec();
         for id in [UDP_RTP, AVB, ST2110] {

@@ -72,6 +72,14 @@ struct Gates {
 /// another test observing the intermediate set.
 static ANNOUNCE: Mutex<()> = Mutex::new(());
 
+/// Carrier tests share process globals (profile, ports, gates, the RTP peer).
+/// `cargo test` runs them on parallel threads, so each takes this lock.
+#[cfg(test)]
+pub(crate) fn test_globals() -> std::sync::MutexGuard<'static, ()> {
+    static GLOBALS: Mutex<()> = Mutex::new(());
+    GLOBALS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// RTP input port this process published (`base + 2`). Zero means it did not.
 static PUBLISHED: AtomicU16 = AtomicU16::new(0);
 
@@ -1296,6 +1304,7 @@ mod tests {
 
     #[test]
     fn missing_tlv_is_carrier_1_and_unknown_bytes_still_parse() {
+        let _globals = crate::carrier::test_globals();
         assert_eq!(effective_carriers(&[]), vec![QUIC_STREAMS]);
         let value = encode_carrier_tlv(&[1, 2, 9]);
         assert_eq!(parse_carrier_tlv(&value).unwrap(), vec![1, 2, 9]);
@@ -1304,6 +1313,7 @@ mod tests {
 
     #[test]
     fn announce_omits_what_this_machine_cannot_open() {
+        let _globals = crate::carrier::test_globals();
         let mut input = Announce {
             android: true,
             has_l2: false,
@@ -1344,6 +1354,7 @@ mod tests {
 
     #[test]
     fn alpn_v1_is_carrier_1_and_a_mismatch_closes() {
+        let _globals = crate::carrier::test_globals();
         assert_eq!(agree(false, Some(2), &[1, 2]).unwrap(), 1);
         assert_eq!(agree(true, None, &[]).unwrap(), 1);
         assert_eq!(agree(true, Some(2), &[1, 2]).unwrap(), 2);
@@ -1355,6 +1366,7 @@ mod tests {
 
     #[test]
     fn one_loss_sample_does_not_cut_the_cap() {
+        let _globals = crate::carrier::test_globals();
         let mut cap = RateCap::new(100_000_000);
         cap.observe(Duration::from_millis(1), 1.0);
         assert_eq!(cap.cap, 100_000_000);
@@ -1366,6 +1378,7 @@ mod tests {
 
     #[test]
     fn offer_and_config_echo_the_carrier_line() {
+        let _globals = crate::carrier::test_globals();
         use crate::negotiate::{build_offer, Offer, OfferInput, StreamConfig, Video};
         let mut offer = build_offer(&OfferInput {
             want_dirty_rects: true,
@@ -1387,6 +1400,7 @@ mod tests {
 
     #[test]
     fn this_machine_leaves_out_a_carrier_it_cannot_open() {
+        let _globals = crate::carrier::test_globals();
         let _announce = ANNOUNCE.lock().unwrap_or_else(|poison| poison.into_inner());
         let _restore = GateReset;
         set_l3_port(0);
@@ -1437,6 +1451,7 @@ mod tests {
 
     #[test]
     fn the_session_packetizes_rfc4175_and_jpeg_xs() {
+        let _globals = crate::carrier::test_globals();
         let mut seam = Seam::open(ST2110);
         let samples = vec![1u8; (RFC4175_WIDTH * RFC4175_HEIGHT * 3) as usize];
         let packets = seam.send_raster(&samples, RFC4175_WIDTH, RFC4175_HEIGHT);
@@ -1497,6 +1512,7 @@ mod tests {
 
     #[test]
     fn a_failed_reservation_does_not_send_and_a_large_picture_is_paced() {
+        let _globals = crate::carrier::test_globals();
         ::avb::note_listener(false);
         note_reservation(false);
         let mut blocked = Seam::open(AVB);
@@ -1526,6 +1542,7 @@ mod tests {
 
     #[test]
     fn the_operator_can_choose_udp_plain_and_st2110_gcm() {
+        let _globals = crate::carrier::test_globals();
         choose_profile(true, false);
         let mut rtp = Seam::open(UDP_RTP);
         let body = b"clear-rtp-body-0123456789abcd";
@@ -1561,6 +1578,7 @@ mod tests {
 
     #[test]
     fn carrier_3_default_profile_seals_the_rtp_payload() {
+        let _globals = crate::carrier::test_globals();
         let before = rtp_sealed();
         let mut seam = Seam::open(UDP_RTP);
         let body = b"jpeg-picture-body-0123456789";
@@ -1590,6 +1608,7 @@ mod tests {
 
     #[test]
     fn an_rtcp_report_cuts_the_cap_and_a_second_report_inside_one_second_is_ignored() {
+        let _globals = crate::carrier::test_globals();
         let mut seam = Seam::open(UDP_RTP);
         let packet = rtp::rtcp_receiver_report(9, 11, 100, 10, 50);
         let loss = seam.ingest_rtcp(&packet).expect("receiver report");
@@ -1602,6 +1621,7 @@ mod tests {
 
     #[test]
     fn connect_row_names_the_profile_and_an_untagged_frame() {
+        let _globals = crate::carrier::test_globals();
         let _announce = ANNOUNCE.lock().unwrap_or_else(|poison| poison.into_inner());
         assert!(connect_row(AVB, false, false, false, true).contains("not a priority class"));
         assert!(connect_row(AVB, true, false, false, true).contains("shaped"));
@@ -1627,6 +1647,7 @@ mod tests {
 
     #[test]
     fn each_carrier_loopback_delivers_or_drops_without_blocking() {
+        let _globals = crate::carrier::test_globals();
         let picture = vec![7u8; 200];
         let audio = b"pcm-fixed-record".to_vec();
         for id in 1..=5 {
@@ -1672,6 +1693,7 @@ mod tests {
 
     #[test]
     fn an_l2_offer_uses_the_scanned_rtp_port() {
+        let _globals = crate::carrier::test_globals();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
         let rtp = SocketAddr::new(ip, 21_002);
         assert_eq!(rtp_socket(Some(ip), 21_002, 4433), Some(rtp));
@@ -1715,6 +1737,7 @@ mod tests {
 
     #[test]
     fn pacing_does_not_block_the_quic_runtime() {
+        let _globals = crate::carrier::test_globals();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

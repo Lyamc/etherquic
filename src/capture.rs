@@ -656,12 +656,14 @@ mod tests {
 
     #[test]
     fn unix_epoch_and_a_known_day() {
+        let _globals = crate::carrier::test_globals();
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_675), (2023, 11, 14));
     }
 
     #[test]
     fn pcap_round_trip_keeps_the_ether_frame_and_the_app_record() {
+        let _globals = crate::carrier::test_globals();
         let _hold = gate().lock().unwrap_or_else(|poison| poison.into_inner());
         if capture_active() {
             let _ = capture_stop();
@@ -723,6 +725,7 @@ mod tests {
 
     #[test]
     fn rtp_and_avtp_open_only_for_the_active_carrier() {
+        let _globals = crate::carrier::test_globals();
         let _hold = gate().lock().unwrap_or_else(|poison| poison.into_inner());
         if capture_active() {
             let _ = capture_stop();
@@ -784,6 +787,7 @@ mod tests {
 
     #[test]
     fn the_seam_writes_rtp_or_avtp_only_for_its_carrier() {
+        let _globals = crate::carrier::test_globals();
         let _hold = gate().lock().unwrap_or_else(|poison| poison.into_inner());
         if capture_active() {
             let _ = capture_stop();
