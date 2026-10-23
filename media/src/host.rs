@@ -738,6 +738,20 @@ enum VideoOut {
     Patch(Vec<u8>, Option<Instant>),
 }
 
+/// Aborts session tasks if this future is dropped.
+///
+/// `serve_shared` stops waiting when the QUIC connection closes. A dropped
+/// `JoinHandle` would leave the UDP, AVB, and ST 2110 sends running.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// Send pictures and audio until capture stops (the slot closes and the
 /// audio sender drops) or the player goes away.
 pub async fn run(
@@ -893,6 +907,11 @@ pub async fn run_shared(
         loop {
             tokio::select! {
                 biased;
+                // UDP, AVB, and ST 2110 do not write the picture on this QUIC
+                // stream, so a player that left never errors `recv` below.
+                // Prefer the closed connection over a queued frame or the
+                // send keeps going after "player disconnected".
+                _ = video_lane.conn.closed() => return Ok(()),
                 // An encoded picture goes out before a cursor sample. The watch
                 // keeps only the latest cursor, so the pointer still follows
                 // this frame instead of sitting in front of it.
@@ -922,6 +941,18 @@ pub async fn run_shared(
         audio_offer,
         options.clone(),
     ));
+
+    // `serve_shared` drops this future when the connection closes. Dropping a
+    // JoinHandle detaches the task, so abort here or a carrier send outlives
+    // the player and the next handshake times out behind the leftover picture.
+    let mut abort = Vec::new();
+    if let Some(task) = &offer_task {
+        abort.push(task.abort_handle());
+    }
+    abort.push(forward.abort_handle());
+    abort.push(video_task.abort_handle());
+    abort.push(audio_task.abort_handle());
+    let _abort = AbortOnDrop(abort);
 
     let (video_join, audio_join) = tokio::join!(video_task, audio_task);
     forward.abort();
@@ -1386,7 +1417,7 @@ fn video_pump(
                             first_config = false;
                         }
                         log(&format!(
-                            "video {} ({}) {}x{} {} fps{}{}",
+                            "video {} ({}) {}x{} {} fps{}{}{}",
                             video.name(),
                             encoder_name,
                             frame.width,
@@ -1402,6 +1433,10 @@ fn video_pump(
                             } else {
                                 format!(", because {}", config.reason)
                             },
+                            config
+                                .carrier
+                                .map(|id| format!(" carrier {id}"))
+                                .unwrap_or_default()
                         ));
                         if v2 && !out.send(VideoOut::Config(config.encode())) {
                             return;
@@ -1582,7 +1617,15 @@ async fn audio_loop(
     let mut offer = offer_rx.borrow_and_update().clone();
     let mut excluded: Vec<Audio> = Vec::new();
     let mut encoder: Option<(AudioEncoder, Audio)> = None;
-    while let Some(pcm) = audio.recv().await {
+    loop {
+        let pcm = tokio::select! {
+            biased;
+            _ = lane.conn.closed() => return Ok(()),
+            pcm = audio.recv() => pcm,
+        };
+        let Some(pcm) = pcm else {
+            break;
+        };
         let captured = Instant::now();
         if !lane.v2 {
             wire::write_record(&mut lane.send, LEGACY_AUDIO_MAGIC, &pcm.encode()).await?;

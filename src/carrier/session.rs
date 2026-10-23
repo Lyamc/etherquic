@@ -378,6 +378,7 @@ pub fn spawn_player_avb(
         let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
             return;
         };
+        rtp::widen_udp(&sock);
         let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
         let Ok(addr) = sock.local_addr() else {
             return;
@@ -387,9 +388,8 @@ pub fn spawn_player_avb(
         let _ = sock.send_to(&hello, host_input);
         let mut pictures = Assembler::new();
         let mut audios = Assembler::new();
-        let end = Instant::now() + Duration::from_secs(30);
         let mut buf = [0u8; 2048];
-        while Instant::now() < end {
+        while !picture.is_closed() && !audio.is_closed() {
             let Ok((n, _)) = sock.recv_from(&mut buf) else {
                 continue;
             };
@@ -432,6 +432,8 @@ pub fn spawn_player_st2110(
         let Ok(audio_sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
             return;
         };
+        rtp::widen_udp(&picture_sock);
+        rtp::widen_udp(&audio_sock);
         let _ = picture_sock.set_read_timeout(Some(Duration::from_millis(50)));
         let _ = audio_sock.set_read_timeout(Some(Duration::from_millis(50)));
         let Ok(picture_addr) = picture_sock.local_addr() else {
@@ -452,11 +454,10 @@ pub fn spawn_player_st2110(
         });
         let mut asm = super::XsAssembler::new();
         let mut pcm = Vec::new();
-        let end = Instant::now() + Duration::from_secs(30);
         let mut frame = 1u32;
         let mut open = false;
         let mut buf = [0u8; 2048];
-        while Instant::now() < end {
+        while !picture.is_closed() && !audio.is_closed() {
             let got = picture_sock
                 .recv_from(&mut buf)
                 .or_else(|_| audio_sock.recv_from(&mut buf));

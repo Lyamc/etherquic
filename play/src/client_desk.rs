@@ -568,37 +568,8 @@ async fn connect_player(
         .carrier
         .unwrap_or(etherquic::carrier::QUIC_STREAMS);
     etherquic::set_capture_carrier(carrier);
-    if carrier >= etherquic::carrier::UDP_RTP {
-        if carrier == etherquic::carrier::AVB {
-            etherquic::carrier::note_reservation(false);
-            etherquic::carrier::note_avb_listener(false);
-        }
-        let udp = connect.udp;
-        let l2_offer = connect.l2_offer;
-        let rtp = connect.rtp;
-        let before = etherquic::quic_binds();
-        let (picture, audio) = tokio::task::spawn_blocking(move || {
-            etherquic::carrier::open_carrier_player(carrier, udp, l2_offer, rtp)
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-        if picture.is_empty() || audio.is_empty() || etherquic::quic_binds() != before {
-            end_view(
-                &stop,
-                &status,
-                "The carrier session did not deliver picture and audio.",
-            );
-            return Ok(());
-        }
-        deliver_carrier(&frames, &speaker, &picture, &audio);
-        let line = etherquic::carrier::connect_row_now(carrier);
-        end_view(
-            &stop,
-            &status,
-            &format!("{line}. This session does not open a QUIC socket."),
-        );
-        return Ok(());
-    }
+    // UDP/RTP, AVB, and ST 2110 still open this QUIC session. The offer names
+    // the carrier, and the picture and audio bytes move on that carrier.
     let (cmd_tx, pipes, outbound, inbound) = desk_io::open_notes(desk_io::desk_roster());
     desk_io::attach_player(picture_id, cmd_tx);
     let _detach = DetachPlayer(picture_id);
@@ -897,44 +868,6 @@ async fn connect_player(
     drop(watch);
     shutdown_endpoint(endpoint).await;
     Ok(())
-}
-
-/// One picture row and one PCM chunk from the bytes the carrier socket returned.
-fn deliver_carrier(
-    frames: &Arc<Mutex<Option<Picture>>>,
-    speaker: &std::sync::mpsc::Sender<AudioChunk>,
-    picture: &[u8],
-    audio: &[u8],
-) {
-    let mut rgb = picture.to_vec();
-    let extra = rgb.len() % 3;
-    if extra != 0 {
-        rgb.resize(rgb.len() + (3 - extra), 0);
-    }
-    if rgb.is_empty() {
-        rgb.extend_from_slice(&[0, 0, 0]);
-    }
-    let width = (rgb.len() / 3) as u32;
-    if let Ok(mut slot) = frames.lock() {
-        *slot = Some(Picture {
-            width,
-            height: 1,
-            rgb,
-        });
-    }
-    let mut bytes = audio.to_vec();
-    if bytes.len() % 2 == 1 {
-        bytes.push(0);
-    }
-    let pcm = bytes
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
-    let _ = speaker.send(AudioChunk {
-        sample_rate: 48_000,
-        channels: 1,
-        pcm,
-    });
 }
 
 /// Tell the window to close, unless the user already pressed Stop.
@@ -2306,8 +2239,100 @@ fn named_keysym(key: NamedKey) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{keysym, named_keysym, physical_nav_keysym, CloseAction, Phase};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use super::{
+        connect_player, keysym, named_keysym, physical_nav_keysym, CloseAction, ConnectSession,
+        Phase,
+    };
     use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+
+    /// UDP/RTP, AVB, and ST 2110 used to paint one blob and close the view
+    /// without dialing. Carriers 2–5 now start the same QUIC session as streams.
+    #[tokio::test]
+    async fn desktop_connect_for_carriers_2_through_5_dials_quic() {
+        for id in [
+            etherquic::carrier::QUIC_DATAGRAMS,
+            etherquic::carrier::UDP_RTP,
+            etherquic::carrier::AVB,
+            etherquic::carrier::ST2110,
+        ] {
+            let status_text = Arc::new(Mutex::new(String::new()));
+            let slot = Arc::clone(&status_text);
+            let status: crate::Status = Arc::new(move |text: &str| {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = text.to_string();
+                }
+            });
+            let stop = Arc::new(AtomicBool::new(false));
+            let dial_stop = Arc::clone(&stop);
+            let codecs = crate::CodecChoice {
+                carrier: Some(id),
+                ..crate::CodecChoice::default()
+            };
+            let connect = ConnectSession {
+                local_mac: [0x02, 0, 0, 0, 0, 2],
+                peer_mac: [0x02, 0, 0, 0, 0, 1],
+                service_id: 4434,
+                trace_input: false,
+                udp: Some("127.0.0.1:9".parse().unwrap()),
+                l2_offer: false,
+                rtp: None,
+                view: Arc::new(Mutex::new(crate::view_options::ViewOptions::default())),
+                tune: crate::live_tune(crate::SessionTune::default()),
+                codecs,
+                picture: Arc::new(AtomicU64::new(0)),
+            };
+            let frames = Arc::new(Mutex::new(None));
+            let (speaker, _speaker_rx) = std::sync::mpsc::channel();
+            let (_input_tx, input_rx) = mpsc::channel(4);
+            let player = tokio::spawn(connect_player(
+                None,
+                connect,
+                frames,
+                speaker,
+                input_rx,
+                dial_stop,
+                status,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(String::new())),
+                0,
+                etherquic::cursor::share(),
+            ));
+            let start = std::time::Instant::now();
+            let mut saw_quic = false;
+            while start.elapsed() < Duration::from_secs(2) {
+                let line = status_text.lock().map(|g| g.clone()).unwrap_or_default();
+                assert!(
+                    !line.contains("does not open a QUIC socket"),
+                    "carrier {id} closed the view: {line}"
+                );
+                assert!(
+                    !line.contains("did not deliver picture and audio"),
+                    "carrier {id} ended on the one-shot: {line}"
+                );
+                if line.contains("Dialing") || line.contains("Connect failed") {
+                    saw_quic = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            stop.store(true, Ordering::SeqCst);
+            let joined = tokio::time::timeout(Duration::from_secs(3), player).await;
+            assert!(joined.is_ok(), "carrier {id} did not leave the connect");
+            assert!(saw_quic, "carrier {id} never started a QUIC dial");
+            let line = status_text.lock().map(|g| g.clone()).unwrap_or_default();
+            assert!(
+                !line.contains("does not open a QUIC socket"),
+                "carrier {id} finished on the one-shot: {line}"
+            );
+        }
+    }
 
     #[test]
     fn close_keeps_pumping_until_the_window_is_destroyed() {

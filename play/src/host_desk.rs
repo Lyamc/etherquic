@@ -248,7 +248,11 @@ async fn listen(
         let incoming = match wake {
             HostWake::Stop => break,
             HostWake::Tick => {
-                offer_carrier_frame(&frames, &mut carrier_audio, &mut carrier_served);
+                // A QUIC session already carries this carrier. The one-frame
+                // hello path is only for a player that never opens QUIC.
+                if sessions.is_empty() {
+                    offer_carrier_frame(&frames, &mut carrier_audio, &mut carrier_served);
+                }
                 continue;
             }
             HostWake::Conn(incoming) => incoming,
@@ -262,11 +266,16 @@ async fn listen(
             status("Exclusive session; a later join was refused.");
             continue;
         }
+        // Hold the one-frame path while this handshake is in flight.
+        carrier_served = true;
         let conn = tokio::select! {
             result = incoming => match result {
                 Ok(conn) => conn,
                 Err(error) => {
                     eprintln!("etherquic-play: handshake failed: {error}");
+                    if sessions.is_empty() {
+                        carrier_served = false;
+                    }
                     continue;
                 }
             },

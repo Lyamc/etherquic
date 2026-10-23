@@ -266,7 +266,7 @@ impl SessionLine {
     pub fn log_line(&self, event: &PlayerEvent) -> Option<String> {
         match event {
             PlayerEvent::Video(config) => Some(format!(
-                "session video {} encoder {} {}x{} {} fps {} kbit/s{}",
+                "session video {} encoder {} {}x{} {} fps {} kbit/s{}{}",
                 config.video.map(Video::token).unwrap_or("?"),
                 config.encoder,
                 config.width,
@@ -277,7 +277,11 @@ impl SessionLine {
                     String::new()
                 } else {
                     format!(" ({})", config.reason)
-                }
+                },
+                config
+                    .carrier
+                    .map(|id| format!(" carrier {id}"))
+                    .unwrap_or_default()
             )),
             PlayerEvent::Audio(config) => Some(format!(
                 "session audio {} encoder {} {} Hz {} ch",
@@ -338,6 +342,17 @@ mod tests {
         let text = line.text();
         assert!(!text.contains("patches"), "{text}");
         assert!(!text.contains("pskip"), "{text}");
+    }
+
+    #[test]
+    fn session_video_log_names_the_carrier() {
+        let line = SessionLine::new("peer".into(), true);
+        let mut config = StreamConfig::video(Video::Mjpeg, "jpeg", 64, 48, 30);
+        config.carrier = Some(etherquic::carrier::ST2110);
+        let text = line
+            .log_line(&PlayerEvent::Video(config))
+            .expect("session video line");
+        assert!(text.contains("carrier 5"), "{text}");
     }
 
     #[test]

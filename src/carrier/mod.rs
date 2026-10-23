@@ -1023,7 +1023,7 @@ impl Seam {
         let dst = [2, 0, 0, 0, 0, 4];
         let src = [2, 0, 0, 0, 0, 1];
         let id = self.bump(lane);
-        let slices = split_record(id, body, 48);
+        let slices = split_record(id, body, 1000);
         let mut asm = Assembler::new();
         let now = std::time::Instant::now();
         let mut got = None;
@@ -1191,11 +1191,19 @@ fn seal_st(rtp: &[u8]) -> Vec<u8> {
 
 fn pace_until(origin: std::time::Instant, send_at: Duration) {
     let target = origin.checked_add(send_at).unwrap_or(origin);
-    if let Some(wait) = target.checked_duration_since(std::time::Instant::now()) {
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
-        }
+    let Some(wait) = target.checked_duration_since(std::time::Instant::now()) else {
+        return;
+    };
+    if wait.is_zero() {
+        return;
     }
+    // Picture and audio sends run on the host's current-thread QUIC runtime.
+    // Sleeping there freezes accept and the idle timer: the next player times
+    // out, and a player that already left never shows as disconnected.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return;
+    }
+    std::thread::sleep(wait);
 }
 
 fn seam_loop(id: u8, picture: &[u8], audio: &[u8], drop_slice: bool) -> LoopReport {
@@ -1703,5 +1711,22 @@ mod tests {
         });
         assert!(opened);
         assert_eq!(net.unwrap(), Some("nic"));
+    }
+
+    #[test]
+    fn pacing_does_not_block_the_quic_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let origin = std::time::Instant::now();
+            let started = std::time::Instant::now();
+            pace_until(origin, Duration::from_millis(400));
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "pace slept on the runtime"
+            );
+        });
     }
 }

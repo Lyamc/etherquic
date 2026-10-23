@@ -10,7 +10,7 @@
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -343,6 +343,13 @@ async fn accept_loop(
         "Confirmation required. Run etherquic-host --approve."
     };
     let udp = udp_listeners(cfg.service, &cert, &key);
+    if let Ok(text) = fs::read_to_string(config::HostPaths::from_env().config) {
+        if config::st2110_speed_override(&text) {
+            // The speed check is the only gate this flag lifts. Picture kind
+            // still has to be JPEG XS, and Opus-only audio still suppresses it.
+            etherquic::carrier::set_st2110_enabled(true, false, 1_000, true);
+        }
+    }
     etherquic::carrier::enable_on_host(udp.port);
     log.line(&format!(
         "listening. This PC is {} on service {}, UDP port {}. {} {access}",
@@ -362,6 +369,7 @@ async fn accept_loop(
     let mut udp_v6 = udp.v6;
     let mut closed_by_endpoint = false;
     let mut carrier_served = false;
+    let quic_live = Arc::new(AtomicUsize::new(0));
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -380,7 +388,9 @@ async fn accept_loop(
                         break;
                     }
                 }
-                push_carrier_frame(&mut carrier_served);
+                if quic_live.load(Ordering::SeqCst) == 0 {
+                    push_carrier_frame(&mut carrier_served);
+                }
                 continue;
             }
             Arrival::L2(None) => {
@@ -441,12 +451,16 @@ async fn accept_loop(
                             let guests = Arc::clone(&guests);
                             let presence = presence.clone();
                             let remote = remote.clone();
+                            let live = Arc::clone(&quic_live);
+                            live.fetch_add(1, Ordering::SeqCst);
+                            carrier_served = true;
                             tokio::spawn(async move {
                                 if let Err(err) = desk.serve_player(conn).await {
                                     log.line(&format!("play session: {err}"));
                                 }
                                 log.line("player disconnected");
                                 remember_guest(&guests, &presence, &remote, false);
+                                live.fetch_sub(1, Ordering::SeqCst);
                             });
                         }
                         #[cfg(not(windows))]

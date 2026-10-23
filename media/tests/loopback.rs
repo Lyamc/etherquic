@@ -351,6 +351,126 @@ async fn carrier_3_pictures_leave_as_rtp_not_on_the_uni_stream() {
     }
 }
 
+/// The desktop host drops `run` when the QUIC connection closes. Carrier
+/// picture must stop with it, while capture is still producing frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_session_stops_the_udp_picture() {
+    use std::sync::atomic::AtomicBool;
+    etherquic::carrier::set_l3_port(0);
+    etherquic::carrier::set_avb_enabled(false);
+    let mut port = 0u16;
+    for candidate in 21_200..21_400 {
+        if std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, candidate)).is_ok()
+            && std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, candidate + 1)).is_ok()
+            && std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, candidate + 2)).is_ok()
+        {
+            port = candidate;
+            break;
+        }
+    }
+    assert_ne!(port, 0, "no free rtp ports");
+    etherquic::carrier::set_l3_port(port);
+    let _reset = PortReset;
+    let offer = etherquic_media::negotiate::build_offer(&etherquic_media::negotiate::OfferInput {
+        video_order: &[Video::Mjpeg],
+        audio_order: &[Audio::Pcm],
+        decodes: &[VideoCodec::Mjpeg],
+        carrier: Some(etherquic::carrier::UDP_RTP),
+        ..Default::default()
+    });
+    etherquic::install_pure_crypto();
+    let (cert, key) = certs();
+    let listeners = etherquic::udp_listeners(free_port(), &cert, &key);
+    let server = listeners.v4.clone().expect("listener");
+    let listen = listeners.port;
+    let slot = FrameSlot::new();
+    let feeder_slot = slot.clone();
+    let stop_feed = Arc::new(AtomicBool::new(false));
+    let stop = stop_feed.clone();
+    let feeder = std::thread::spawn(move || {
+        let mut i = 0u32;
+        while !stop.load(Ordering::SeqCst) {
+            feeder_slot.put(frame(i));
+            i = i.wrapping_add(1);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+    let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let (negotiated, _) = host::accept_offer(&conn).await.unwrap();
+        let streams = host::open_streams(&conn, negotiated.is_v2()).await.unwrap();
+        let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            loop {
+                if pcm_tx
+                    .send(Pcm {
+                        sample_rate: 48_000,
+                        channels: 2,
+                        samples: vec![1i16; 960 * 2],
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let options = HostOptions {
+            fps: etherquic::negotiate::FpsWish::Fixed(30),
+            display_hz: None,
+            caps: HostCaps::baseline(),
+            log: Arc::new(|line: &str| eprintln!("host: {line}")),
+            cap_kbps: Arc::new(AtomicU64::new(0)),
+            carrier_tap: Some(tap_tx),
+        };
+        let (_cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
+        let run = host::run(streams, negotiated, slot, pcm_rx, options, cursor_rx);
+        tokio::pin!(run);
+        let closed = conn.closed();
+        tokio::select! {
+            result = &mut run => result,
+            _ = closed => Ok(()),
+        }
+    });
+    let endpoint = etherquic::udp_client_endpoint_on("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listen));
+    let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let _offer_send = player::send_offer(&conn, &offer).await.unwrap();
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut recv = tokio::time::timeout(Duration::from_secs(8), conn.accept_uni())
+            .await
+            .expect("uni stream")
+            .unwrap();
+        let _ = wire::read_magic(&mut recv).await;
+        held.push(recv);
+    }
+    let started = tokio::time::timeout(Duration::from_secs(8), tap_rx.recv())
+        .await
+        .expect("carrier tap timed out")
+        .expect("carrier tap closed before a picture");
+    assert!(!started.is_empty(), "carrier tap packet was empty");
+    conn.close(0u32.into(), b"done");
+    tokio::time::timeout(Duration::from_secs(3), host_task)
+        .await
+        .expect("session did not return when the player closed")
+        .unwrap()
+        .unwrap();
+    // One frame may already be inside send when the connection closes.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while tap_rx.try_recv().is_ok() {}
+    let quiet = tokio::time::timeout(Duration::from_millis(400), tap_rx.recv()).await;
+    assert!(
+        !matches!(quiet, Ok(Some(_))),
+        "udp picture kept sending after the player closed"
+    );
+    stop_feed.store(true, Ordering::SeqCst);
+    let _ = feeder.join();
+    drop(held);
+}
+
 struct PortReset;
 
 impl Drop for PortReset {

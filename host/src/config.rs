@@ -243,6 +243,25 @@ fn parse_partial(text: &str) -> Result<Partial, String> {
     Ok(partial)
 }
 
+/// `st2110-override=yes` in `host.conf` lets this host announce ST 2110 when
+/// the NIC is slower than 10 Gbit/s. Any other value, or a missing key, leaves
+/// the speed check on.
+pub fn st2110_speed_override(text: &str) -> bool {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("st2110-override") {
+            return parse_yes_no(value.trim()) == Some(true);
+        }
+    }
+    false
+}
+
 fn parse_yes_no(value: &str) -> Option<bool> {
     match value.to_ascii_lowercase().as_str() {
         "yes" | "true" | "1" | "on" => Some(true),
@@ -272,6 +291,16 @@ mod tests {
 
     const MACHINE: &str = "00112233-4455-6677-8899-aabbccddeeff";
     const GENERATED: &str = "be:4e:c5:33:fb:a0";
+
+    #[test]
+    fn st2110_override_is_opt_in() {
+        assert!(!st2110_speed_override(
+            "mac=02:11:22:33:44:55\nnic=\nservice=4434\n"
+        ));
+        assert!(st2110_speed_override("st2110-override=yes\n"));
+        assert!(!st2110_speed_override("st2110-override=no\n"));
+        assert!(!st2110_speed_override("# st2110-override=yes\n"));
+    }
 
     #[test]
     fn mac_matches_the_installer_vector() {

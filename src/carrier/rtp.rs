@@ -87,6 +87,33 @@ pub fn picture_deadline(frame: Duration) -> Duration {
     if frame < min { min } else { frame }
 }
 
+/// How long the player waits for the rest of one picture.
+///
+/// A PyroWave frame is hundreds of kilobytes. One display interval expires
+/// while those packets are still arriving, and the assembler then drops the
+/// record. The next record id still replaces a picture that never finishes.
+pub fn player_picture_wait() -> Duration {
+    Duration::from_secs(1)
+}
+
+/// Record bytes in one RTP packet. Room for the RTP header, the slice header,
+/// and the GCM tag under a 1500-byte Ethernet payload, and under the player's
+/// 2048-byte receive buffer.
+const RTP_SLICE_BUDGET: usize = 1200;
+
+/// Kernel buffer for one picture or audio socket.
+///
+/// A PyroWave frame is a few hundred kilobytes and leaves in one burst. The
+/// default UDP buffer is about 200 KB, so the tail of that burst is dropped
+/// before the player reads it.
+const MEDIA_UDP_BUFFER: usize = 4 * 1024 * 1024;
+
+pub(super) fn widen_udp(sock: &UdpSocket) {
+    let borrowed = socket2::SockRef::from(sock);
+    let _ = borrowed.set_recv_buffer_size(MEDIA_UDP_BUFFER);
+    let _ = borrowed.set_send_buffer_size(MEDIA_UDP_BUFFER);
+}
+
 pub fn audio_deadline() -> Duration {
     Duration::from_millis(20)
 }
@@ -160,6 +187,9 @@ struct RtpHub {
     audio: UdpSocket,
     peer_picture: Mutex<Option<SocketAddr>>,
     peer_audio: Mutex<Option<SocketAddr>>,
+    /// Socket the current offer came from. A repeat from that socket is the
+    /// player's retry. A different socket is a new player.
+    offer_from: Mutex<Option<SocketAddr>>,
     exchanged: Mutex<Option<[u8; 16]>>,
     config_sent: AtomicBool,
     key_seen: AtomicU32,
@@ -239,6 +269,9 @@ pub(super) fn listen_once(port: u16) {
     let Ok(input) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port.saturating_add(2))) else {
         return;
     };
+    widen_udp(&picture);
+    widen_udp(&audio);
+    widen_udp(&input);
     let _ = input.set_read_timeout(Some(Duration::from_millis(200)));
     let _ = picture.set_nonblocking(true);
     let hub = Arc::new(RtpHub {
@@ -247,6 +280,7 @@ pub(super) fn listen_once(port: u16) {
         audio,
         peer_picture: Mutex::new(None),
         peer_audio: Mutex::new(None),
+        offer_from: Mutex::new(None),
         exchanged: Mutex::new(None),
         config_sent: AtomicBool::new(false),
         key_seen: AtomicU32::new(0),
@@ -260,7 +294,7 @@ pub(super) fn listen_once(port: u16) {
                 poll_rtcp(&thread_hub);
                 continue;
             };
-            if n >= 41 && &buf[..5] == b"OFFER" && !thread_hub.config_sent.load(Ordering::Relaxed) {
+            if n >= 41 && &buf[..5] == b"OFFER" {
                 note_offered(super::UDP_RTP);
                 if n >= 42 {
                     match buf[41] {
@@ -273,32 +307,44 @@ pub(super) fn listen_once(port: u16) {
                 player_public.copy_from_slice(&buf[5..37]);
                 let picture_port = u16::from_le_bytes([buf[37], buf[38]]);
                 let audio_port = u16::from_le_bytes([buf[39], buf[40]]);
-                *thread_hub
-                    .peer_picture
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) =
-                    Some(SocketAddr::new(src.ip(), picture_port));
-                *thread_hub
-                    .peer_audio
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) =
-                    Some(SocketAddr::new(src.ip(), audio_port));
-                let host = host_share();
-                let key = derive_aes128(&host.shared(&player_public));
-                *thread_hub.exchanged.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
-                let mut payload = b"CFG".to_vec();
-                payload.extend_from_slice(&host.public);
-                let packet = RtpHeader {
-                    marker: true,
-                    payload_type: PT_PICTURE,
-                    sequence: 0,
-                    timestamp: 0,
-                    ssrc: 1,
-                }
-                .encode(&payload);
-                let peer = SocketAddr::new(src.ip(), picture_port);
-                if thread_hub.picture.send_to(&packet, peer).is_ok() {
-                    thread_hub.config_sent.store(true, Ordering::Relaxed);
+                let picture_peer = SocketAddr::new(src.ip(), picture_port);
+                let audio_peer = SocketAddr::new(src.ip(), audio_port);
+                let repeat = {
+                    let from = thread_hub
+                        .offer_from
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    *from == Some(src) && thread_hub.config_sent.load(Ordering::Relaxed)
+                };
+                if !repeat {
+                    *thread_hub
+                        .peer_picture
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(picture_peer);
+                    *thread_hub
+                        .peer_audio
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(audio_peer);
+                    *thread_hub
+                        .offer_from
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(src);
+                    let host = host_share();
+                    let key = derive_aes128(&host.shared(&player_public));
+                    *thread_hub.exchanged.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
+                    let mut payload = b"CFG".to_vec();
+                    payload.extend_from_slice(&host.public);
+                    let packet = RtpHeader {
+                        marker: true,
+                        payload_type: PT_PICTURE,
+                        sequence: 0,
+                        timestamp: 0,
+                        ssrc: 1,
+                    }
+                    .encode(&payload);
+                    if thread_hub.picture.send_to(&packet, picture_peer).is_ok() {
+                        thread_hub.config_sent.store(true, Ordering::Relaxed);
+                    }
                 }
             } else if n >= 9 && &buf[..5] == b"RPORT" {
                 let picture_port = u16::from_le_bytes([buf[5], buf[6]]);
@@ -391,6 +437,14 @@ fn send_udp(picture: bool, packet: &[u8]) {
     let _ = sock.send_to(packet, peer);
 }
 
+pub(super) fn hub_config_sent() -> bool {
+    let guard = RTP_HUB.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(hub) = guard.as_ref() else {
+        return false;
+    };
+    hub.config_sent.load(Ordering::Relaxed)
+}
+
 pub(super) fn hub_has_peer() -> bool {
     let guard = RTP_HUB.lock().unwrap_or_else(|p| p.into_inner());
     let Some(hub) = guard.as_ref() else {
@@ -411,35 +465,10 @@ pub(super) fn hub_exchanged_key() -> Option<[u8; 16]> {
     key
 }
 
-fn emit_socket() -> &'static UdpSocket {
-    static SOCK: std::sync::OnceLock<UdpSocket> = std::sync::OnceLock::new();
-    SOCK.get_or_init(|| {
-        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("carrier emit socket");
-        let _ = sock.set_nonblocking(true);
-        sock
-    })
-}
-
-/// AVB and ST 2110 leave on a UDP socket. RTP stays on [`send_udp`].
+/// AVB and ST 2110 leave on the same sockets as RTP. Those sockets are bound
+/// to 0.0.0.0. A socket bound to 127.0.0.1 cannot send to a player on the LAN.
 pub(super) fn emit_packet(picture: bool, packet: &[u8]) {
-    let sock = emit_socket();
-    let guard = RTP_HUB.lock().unwrap_or_else(|p| p.into_inner());
-    let peer = guard.as_ref().and_then(|hub| {
-        let slot = if picture {
-            &hub.peer_picture
-        } else {
-            &hub.peer_audio
-        };
-        *slot.lock().unwrap_or_else(|p| p.into_inner())
-    });
-    drop(guard);
-    if let Some(peer) = peer {
-        let _ = sock.send_to(packet, peer);
-        return;
-    }
-    if let Ok(addr) = sock.local_addr() {
-        let _ = sock.send_to(packet, addr);
-    }
+    send_udp(picture, packet);
 }
 
 /// Player side of the live UDP socket. The offer repeats every 20 ms on the
@@ -461,6 +490,9 @@ pub fn spawn_player_rtp(
         let Ok(input_sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
             return;
         };
+        widen_udp(&picture_sock);
+        widen_udp(&audio_sock);
+        widen_udp(&input_sock);
         let _ = picture_sock.set_nonblocking(true);
         let _ = audio_sock.set_nonblocking(true);
         let _ = input_sock.set_nonblocking(true);
@@ -518,7 +550,7 @@ pub fn spawn_player_rtp(
         let mut gcm = gcm.unwrap_or_else(|| GcmSession::new(session_key()));
         let mut pictures = Assembler::new();
         let mut audios = Assembler::new();
-        let picture_deadline = picture_deadline(Duration::from_millis(16));
+        let picture_deadline = player_picture_wait();
         let batch = Instant::now();
         let mut picture_open = true;
         let mut audio_open = true;
@@ -554,11 +586,13 @@ pub fn spawn_player_rtp(
                 break;
             }
         }
-        let media_end = Instant::now() + Duration::from_secs(30);
         let key_end = Instant::now() + Duration::from_millis(200);
         let mut eaku = false;
         let mut pointed = false;
-        while Instant::now() < media_end && (picture_open || audio_open) {
+        while picture_open || audio_open {
+            if picture.is_closed() && audio.is_closed() {
+                break;
+            }
             if !eaku && Instant::now() < key_end {
                 let _ = input_sock.send_to(b"KEY\x04", host_input);
             }
@@ -1039,7 +1073,7 @@ impl RtpSession {
             ensure_rtp_listener(self.bound);
         }
         self.ensure_key();
-        let slices = split_record(record_id, bytes, 32);
+        let slices = split_record(record_id, bytes, RTP_SLICE_BUDGET);
         let pt = if picture { PT_PICTURE } else { PT_AUDIO };
         let ssrc = if picture { 11 } else { 22 };
         let now = Instant::now();
@@ -1225,5 +1259,245 @@ mod tests {
         let (header, _) = RtpHeader::decode(packet).unwrap();
         assert_eq!(header.timestamp, 90_000);
         assert_ne!(session_key(), derive_aes128(&[0x71; 32]));
+    }
+
+    fn lan_v4() -> Ipv4Addr {
+        let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("probe");
+        probe
+            .connect("192.168.0.58:4434")
+            .expect("route to the host");
+        match probe.local_addr().expect("local") {
+            SocketAddr::V4(addr) => {
+                assert!(!addr.ip().is_loopback(), "route to the host stayed on loopback");
+                *addr.ip()
+            }
+            other => panic!("expected ipv4, got {other}"),
+        }
+    }
+
+    fn free_rtp_port() -> u16 {
+        for base in 23_000..23_200u16 {
+            let Ok(picture) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, base)) else {
+                continue;
+            };
+            let Ok(audio) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, base + 1)) else {
+                continue;
+            };
+            let Ok(input) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, base + 2)) else {
+                continue;
+            };
+            drop((picture, audio, input));
+            return base;
+        }
+        panic!("no free rtp ports");
+    }
+
+    #[test]
+    fn a_picture_socket_holds_a_full_frame() {
+        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind");
+        widen_udp(&sock);
+        let got = socket2::SockRef::from(&sock)
+            .recv_buffer_size()
+            .expect("recv buffer");
+        assert!(
+            got >= 1024 * 1024,
+            "picture socket buffer is {got}, too small for one frame"
+        );
+    }
+
+    #[test]
+    fn emit_reaches_a_non_loopback_peer() {
+        let ip = lan_v4();
+        release_rtp();
+        let port = free_rtp_port();
+        listen_once(port);
+        let recv = UdpSocket::bind((ip, 0)).expect("player socket");
+        recv.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let recv_port = recv.local_addr().expect("player").port();
+        let hello = UdpSocket::bind((ip, 0)).expect("hello socket");
+        let mut body = b"AVB".to_vec();
+        body.extend(recv_port.to_le_bytes());
+        body.extend(recv_port.to_le_bytes());
+        hello
+            .send_to(&body, SocketAddr::new(std::net::IpAddr::V4(ip), port + 2))
+            .expect("hello");
+        let start = Instant::now();
+        while !hub_has_peer() && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hub_has_peer(), "AVB hello did not register a peer");
+        let marker = b"lan-picture-marker";
+        emit_packet(true, marker);
+        let mut buf = [0u8; 64];
+        let (n, src) = recv.recv_from(&mut buf).expect("peer received nothing");
+        assert_eq!(&buf[..n], marker);
+        let std::net::IpAddr::V4(from) = src.ip() else {
+            panic!("expected ipv4 source");
+        };
+        assert!(!from.is_loopback(), "packet came from {from}");
+        release_rtp();
+    }
+
+    fn rtp_offer(picture_port: u16, audio_port: u16, seed: u8) -> Vec<u8> {
+        let player = KeyShare::from_seed([seed; 32]);
+        let mut body = b"OFFER".to_vec();
+        body.extend_from_slice(&player.public);
+        body.extend(picture_port.to_le_bytes());
+        body.extend(audio_port.to_le_bytes());
+        body.push(b'P');
+        body
+    }
+
+    #[test]
+    fn a_later_offer_replaces_the_rtp_peer() {
+        let ip = lan_v4();
+        let was_plain = super::super::udp_plain();
+        super::super::choose_udp_plain(true);
+        release_rtp();
+        let port = free_rtp_port();
+        listen_once(port);
+        let first = UdpSocket::bind((ip, 0)).expect("first player");
+        let second = UdpSocket::bind((ip, 0)).expect("second player");
+        first
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        second
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let first_port = first.local_addr().expect("first").port();
+        let second_port = second.local_addr().expect("second").port();
+        let input = SocketAddr::new(std::net::IpAddr::V4(ip), port + 2);
+        let hello_first = UdpSocket::bind((ip, 0)).expect("first hello");
+        let hello_second = UdpSocket::bind((ip, 0)).expect("second hello");
+        hello_first
+            .send_to(&rtp_offer(first_port, first_port, 3), input)
+            .expect("first offer");
+        let start = Instant::now();
+        while !hub_config_sent() && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hub_config_sent(), "first offer was not answered");
+        hello_second
+            .send_to(&rtp_offer(second_port, second_port, 9), input)
+            .expect("second offer");
+        let mut buf = [0u8; 128];
+        let mut configured = false;
+        let wait = Instant::now();
+        while wait.elapsed() < Duration::from_secs(1) {
+            match second.recv_from(&mut buf) {
+                Ok((n, _)) if buf[..n].windows(3).any(|window| window == b"CFG") => {
+                    configured = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(configured, "second player was not configured");
+        let marker = b"second-player";
+        emit_packet(true, marker);
+        let mut saw = false;
+        let wait = Instant::now();
+        while wait.elapsed() < Duration::from_secs(1) {
+            match second.recv_from(&mut buf) {
+                Ok((n, _)) if &buf[..n] == marker => {
+                    saw = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw, "picture stayed on the first player");
+        let mut leaked = false;
+        while let Ok((n, _)) = first.recv_from(&mut buf) {
+            if &buf[..n] == marker {
+                leaked = true;
+            }
+        }
+        assert!(!leaked, "first player still received the picture");
+        super::super::choose_udp_plain(was_plain);
+        release_rtp();
+    }
+
+    #[test]
+    fn a_large_picture_reaches_the_player_off_loopback() {
+        let ip = lan_v4();
+        let was_plain = super::super::udp_plain();
+        super::super::choose_udp_plain(true);
+        release_rtp();
+        let port = free_rtp_port();
+        let mut host = RtpSession::new(port);
+        host.set_plain(true);
+        host.listen(port);
+        assert!(rtp_owns(port), "host rtp sockets did not bind");
+        let (picture_tx, mut picture_rx) = tokio::sync::mpsc::channel(2);
+        let (audio_tx, _audio_rx) = tokio::sync::mpsc::channel(1);
+        spawn_player_rtp(
+            SocketAddr::new(std::net::IpAddr::V4(ip), port + 2),
+            picture_tx,
+            audio_tx,
+        );
+        let start = Instant::now();
+        while !hub_has_peer() && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hub_has_peer(), "player offer did not reach the host");
+        let cfg = Instant::now();
+        while !hub_config_sent() && cfg.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hub_config_sent(), "host did not deliver the RTP config");
+        // The offer loop reads one datagram per millisecond. Wait until it has
+        // the config and is draining the picture socket, then send.
+        std::thread::sleep(Duration::from_millis(200));
+        let picture = vec![0xA5u8; 400_000];
+        let assembled = host.send_record(true, 3, &picture, None, Duration::from_millis(4));
+        assert_eq!(assembled.as_deref(), Some(picture.as_slice()));
+        let packets = host.drain();
+        assert!(
+            packets.len() < 400,
+            "picture used {} packets",
+            packets.len()
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Some(bytes) = picture_rx.blocking_recv() {
+                let _ = done_tx.send(bytes);
+            }
+        });
+        let got = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("player did not reassemble the picture");
+        assert_eq!(got, picture);
+        super::super::choose_udp_plain(was_plain);
+        release_rtp();
+    }
+
+    #[test]
+    fn a_slow_picture_still_reassembles_inside_the_player_wait() {
+        let mut rtp = RtpSession::new(0);
+        rtp.set_plain(true);
+        let picture = vec![0x3Cu8; 80_000];
+        assert!(rtp
+            .send_record(true, 9, &picture, None, Duration::from_millis(8))
+            .is_some());
+        let packets = rtp.drain();
+        assert!(packets.len() > 4, "picture was one packet");
+        let mut asm = Assembler::new();
+        let mut now = Instant::now();
+        let mut got = None;
+        for (index, packet) in packets.iter().enumerate() {
+            if index == packets.len() / 2 {
+                now += Duration::from_millis(50);
+            }
+            let (_, payload) = RtpHeader::decode(packet).expect("rtp");
+            let slice = Slice::decode(payload).expect("slice");
+            if let Some(record) = asm.push(slice, now, now + player_picture_wait()) {
+                got = Some(record);
+            }
+        }
+        assert_eq!(got.as_deref(), Some(picture.as_slice()));
     }
 }
