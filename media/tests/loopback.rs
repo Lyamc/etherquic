@@ -215,8 +215,17 @@ async fn session(caps: HostCaps, offer: Offer, legacy: bool, fail_first: bool) -
     out
 }
 
+
+/// Carrier tests set process-wide ports and gates (`set_l3_port`,
+/// `set_avb_enabled`). Run them one at a time under parallel `cargo test`.
+fn carrier_globals() -> std::sync::MutexGuard<'static, ()> {
+    static GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GLOBALS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn carrier_3_pictures_leave_as_rtp_not_on_the_uni_stream() {
+    let _globals = carrier_globals();
     use std::sync::atomic::AtomicU64;
     etherquic::carrier::set_l3_port(0);
     etherquic::carrier::set_avb_enabled(false);
@@ -355,6 +364,7 @@ async fn carrier_3_pictures_leave_as_rtp_not_on_the_uni_stream() {
 /// picture must stop with it, while capture is still producing frames.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_the_session_stops_the_udp_picture() {
+    let _globals = carrier_globals();
     use std::sync::atomic::AtomicBool;
     etherquic::carrier::set_l3_port(0);
     etherquic::carrier::set_avb_enabled(false);
