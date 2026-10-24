@@ -1,25 +1,87 @@
-//! A consumer that is not the `avb` or `st2110` unit tests.
+//! A consumer that is not the `avtp`, `avb`, or `st2110` unit tests.
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 fn main() {
-    let frame = avb::picture_frame(
-        [0x02, 0, 0, 0, 0, 2],
-        [0x02, 0, 0, 0, 0, 1],
-        1,
-        1,
-        1_500,
-        b"cvf-sample",
-        None,
-        true,
-    )
-    .expect("cvf frame");
-    let ethertype = avb::ethertype_of(&frame.ethernet).expect("ethertype");
-    let subtype = frame.ethernet.get(14).copied().expect("subtype");
-    assert_eq!(ethertype, 0x22F0, "EtherType");
-    assert!(
-        subtype == avb::SUBTYPE_CVF || subtype == 0x07,
-        "subtype {subtype:#x} is not CVF or RVF"
-    );
-    assert_ne!(subtype, 0x7F, "experimental subtype");
+    let cases: [(&str, &[u8], &[u8]); 2] = [
+        ("media", &[0xFF, 0xD8, 0xFF, 0xD9], &[0x03, 0xE8, 0xFC, 0x18]),
+        ("record", b"picture-bytes", b"audio-record"),
+    ];
+    for (run, (kind, picture, audio)) in cases.into_iter().enumerate() {
+        let run = run + 1;
+        let pic = avb::picture_frame(
+            [0x02, 0, 0, 0, 0, 2],
+            [0x02, 0, 0, 0, 0, 1],
+            1,
+            run as u8,
+            1_500,
+            picture,
+            None,
+            run == 2,
+        )
+        .expect("picture frame");
+        let aud = if kind == "media" {
+            let samples = [1000i16, -1000];
+            avb::pcm_frame(
+                [0x02, 0, 0, 0, 0, 2],
+                [0x02, 0, 0, 0, 0, 1],
+                2,
+                run as u8,
+                48_000,
+                2,
+                &samples,
+                None,
+            )
+            .expect("pcm frame")
+        } else {
+            avb::audio_frame(
+                [0x02, 0, 0, 0, 0, 2],
+                [0x02, 0, 0, 0, 0, 1],
+                2,
+                run as u8,
+                48_000,
+                audio,
+                None,
+            )
+            .expect("audio frame")
+        };
+        let pic_back = avb::decode_pdu(avb::payload_of(&pic.ethernet).expect("picture pdu"))
+            .expect("picture decode");
+        let aud_back = avb::decode_pdu(avb::payload_of(&aud.ethernet).expect("audio pdu"))
+            .expect("audio decode");
+        let audio_in = if kind == "media" {
+            aud.payload.clone()
+        } else {
+            audio.to_vec()
+        };
+        assert_eq!(pic_back.payload, picture);
+        assert_eq!(aud_back.payload, audio_in);
+        assert_eq!(avb::ethertype_of(&pic.ethernet), Some(0x22F0));
+        assert_eq!(avb::ethertype_of(&aud.ethernet), Some(0x22F0));
+        if kind == "media" {
+            assert_eq!(pic.subtype, avb::SUBTYPE_CVF);
+            assert_eq!(avb::cvf_codec(&pic.payload), Some(avb::CvfCodec::Mjpeg));
+            assert_eq!(aud.subtype, avb::SUBTYPE_AAF);
+        } else {
+            assert_eq!(pic.subtype, avb::SUBTYPE_EXPERIMENTAL);
+            assert_eq!(aud.subtype, avb::SUBTYPE_EXPERIMENTAL);
+            assert!(avb::cvf_codec(picture).is_none());
+        }
+        println!(
+            "run {run} kind={kind} ethertype={:#06x} picture_subtype={:#x} audio_subtype={:#x} picture_identical={} audio_identical={} picture_in={} picture_out={} audio_in={} audio_out={}",
+            avb::ethertype_of(&pic.ethernet).unwrap(),
+            pic.subtype,
+            aud.subtype,
+            pic_back.payload == picture,
+            aud_back.payload == audio_in,
+            hex(picture),
+            hex(&pic_back.payload),
+            hex(&audio_in),
+            hex(&aud_back.payload)
+        );
+    }
 
     let mut samples = vec![0u8; 64 * 64 * 3];
     for (i, byte) in samples.iter_mut().enumerate() {
@@ -45,7 +107,7 @@ fn main() {
         "send times are not distinct"
     );
     println!(
-        "ok ethertype={ethertype:#06x} subtype={subtype:#x} rows={} first={:?} last={:?}",
+        "st2110 rows={} first={:?} last={:?}",
         packets.len(),
         times.first(),
         times.last()

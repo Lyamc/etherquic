@@ -1,21 +1,19 @@
-//! IEEE 1722 talker frames through `open1722`, plus the in-process pieces of
-//! 802.1BA this process can run without a switch: a credit-style software
-//! pacer, an 802.1AS follower, and an 802.1Qat advertise that fails closed.
+//! IEEE 1722 talker frames, plus the in-process pieces of 802.1BA this process
+//! can run without a switch: a credit-style software pacer, an 802.1AS
+//! follower, and an 802.1Qat advertise that fails closed.
 //!
-//! Picture frames are CVF (subtype 3). PCM frames are AAF (subtype 2).
-//! The experimental subtype `0x7F` is not used.
+//! The AVTPDU bytes come from the `avtp` crate. A CVF or AAF label is used
+//! only when the payload is that media. Anything else is an experimental
+//! stream, not a false codec.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use open1722::aaf::{Format, Pcm, SampleRate, HEADER_LEN as AAF_HEADER};
-use open1722::cvf::{Codec, Cvf, HEADER_LEN as CVF_HEADER};
+pub use avtp::{
+    cvf_codec, ethertype_of, payload_of, CvfCodec, ETHERTYPE_AVTP, SUBTYPE_AAF, SUBTYPE_CVF,
+    SUBTYPE_EXPERIMENTAL,
+};
 
-pub const ETHERTYPE_AVTP: u16 = 0x22F0;
-/// CVF, IEEE 1722-2016 compressed video. Not the experimental subtype.
-pub const SUBTYPE_CVF: u8 = 3;
-/// AAF, IEEE 1722-2016 PCM.
-pub const SUBTYPE_AAF: u8 = 2;
 pub const RATE_PICTURE: u64 = 200_000_000;
 pub const RATE_AUDIO: u64 = 2_000_000;
 pub const RATE_INPUT: u64 = 1_000_000;
@@ -39,7 +37,10 @@ pub struct Frame {
     pub ethernet: Vec<u8>,
 }
 
-/// One CVF picture PDU inside an Ethernet frame of EtherType `0x22F0`.
+/// One picture PDU inside an Ethernet frame of EtherType `0x22F0`.
+///
+/// JPEG, H.264, and JPEG 2000 are CVF. Any other payload is an experimental
+/// stream so the subtype still names the bytes.
 pub fn picture_frame(
     dst: [u8; 6],
     src: [u8; 6],
@@ -51,11 +52,35 @@ pub fn picture_frame(
     marker: bool,
 ) -> Result<Frame, String> {
     let stream_id = stream_id_bytes(src, lane);
-    let pdu = cvf_pdu(stream_id, sequence, timestamp, payload, marker)?;
-    finish(dst, src, lane, sequence, stream_id, timestamp, payload, vlan, pdu, SUBTYPE_CVF)
+    let pdu = if let Some(codec) = cvf_codec(payload) {
+        avtp::encode_cvf(stream_id, sequence, timestamp, codec, marker, payload)
+    } else {
+        avtp::encode_experimental(stream_id, sequence, timestamp, payload)
+    }
+    .map_err(|err| err.to_string())?;
+    finish(dst, src, lane, sequence, stream_id, timestamp, payload, vlan, pdu)
 }
 
-/// One AAF PCM PDU inside an Ethernet frame of EtherType `0x22F0`.
+/// One carrier record. The subtype is experimental even when the bytes
+/// happen to start like a video or audio elementary stream.
+pub fn record_frame(
+    dst: [u8; 6],
+    src: [u8; 6],
+    lane: u8,
+    sequence: u8,
+    timestamp: u32,
+    payload: &[u8],
+    vlan: Option<u16>,
+) -> Result<Frame, String> {
+    let stream_id = stream_id_bytes(src, lane);
+    let pdu = avtp::encode_experimental(stream_id, sequence, timestamp, payload)
+        .map_err(|err| err.to_string())?;
+    finish(dst, src, lane, sequence, stream_id, timestamp, payload, vlan, pdu)
+}
+
+/// One audio PDU. Opaque records are an experimental stream.
+///
+/// Interleaved 16-bit PCM uses [`pcm_frame`], which is AAF.
 pub fn audio_frame(
     dst: [u8; 6],
     src: [u8; 6],
@@ -66,8 +91,44 @@ pub fn audio_frame(
     vlan: Option<u16>,
 ) -> Result<Frame, String> {
     let stream_id = stream_id_bytes(src, lane);
-    let pdu = aaf_pdu(stream_id, sequence, timestamp, payload)?;
-    finish(dst, src, lane, sequence, stream_id, timestamp, payload, vlan, pdu, SUBTYPE_AAF)
+    let pdu = avtp::encode_experimental(stream_id, sequence, timestamp, payload)
+        .map_err(|err| err.to_string())?;
+    finish(dst, src, lane, sequence, stream_id, timestamp, payload, vlan, pdu)
+}
+
+/// AAF 16-bit interleaved PCM at 48 kHz.
+pub fn pcm_frame(
+    dst: [u8; 6],
+    src: [u8; 6],
+    lane: u8,
+    sequence: u8,
+    timestamp: u32,
+    channels: u16,
+    samples: &[i16],
+    vlan: Option<u16>,
+) -> Result<Frame, String> {
+    let stream_id = stream_id_bytes(src, lane);
+    let pdu = avtp::encode_aaf_i16(
+        stream_id,
+        sequence,
+        timestamp,
+        channels,
+        avtp::SampleRate::Hz48000,
+        samples,
+    )
+    .map_err(|err| err.to_string())?;
+    let payload = avtp::decode(&pdu).map_err(|err| err.to_string())?;
+    finish(
+        dst,
+        src,
+        lane,
+        sequence,
+        stream_id,
+        timestamp,
+        payload.payload(),
+        vlan,
+        pdu,
+    )
 }
 
 fn finish(
@@ -80,14 +141,8 @@ fn finish(
     payload: &[u8],
     vlan: Option<u16>,
     pdu: Vec<u8>,
-    subtype: u8,
 ) -> Result<Frame, String> {
-    if pdu.first().copied() != Some(subtype) {
-        return Err("open1722 wrote an unexpected subtype".into());
-    }
-    if subtype == 0x7F {
-        return Err("experimental subtype is not an AVB frame".into());
-    }
+    let subtype = *pdu.first().ok_or("empty AVTP PDU")?;
     let pcp = pcp_for(lane, vlan);
     let ethernet = ethernet_frame(dst, src, vlan, pcp, &pdu);
     Ok(Frame {
@@ -101,98 +156,16 @@ fn finish(
     })
 }
 
-fn cvf_pdu(
-    stream_id: [u8; 8],
-    sequence: u8,
-    timestamp: u32,
-    payload: &[u8],
-    marker: bool,
-) -> Result<Vec<u8>, String> {
-    let mut buf = vec![0u8; CVF_HEADER + payload.len()];
-    {
-        let mut pdu = Cvf::initialized(&mut buf).map_err(|err| err.to_string())?;
-        pdu.set_sequence_num(sequence);
-        pdu.set_stream_id(u64::from_be_bytes(stream_id));
-        pdu.set_avtp_timestamp(timestamp);
-        pdu.set_stream_data_length(payload.len() as u16);
-        pdu.set_codec(Codec::Mjpeg);
-        pdu.set_stream_id_valid(true);
-        pdu.set_timestamp_valid(true);
-        pdu.set_presentation_timestamp_valid(true);
-        pdu.set_marker(marker);
-        if pdu.subtype() != SUBTYPE_CVF {
-            return Err(format!("CVF subtype {:#x}", pdu.subtype()));
-        }
-    }
-    buf[CVF_HEADER..].copy_from_slice(payload);
-    Ok(buf)
-}
-
-fn aaf_pdu(
-    stream_id: [u8; 8],
-    sequence: u8,
-    timestamp: u32,
-    payload: &[u8],
-) -> Result<Vec<u8>, String> {
-    let mut buf = vec![0u8; AAF_HEADER + payload.len()];
-    {
-        let mut pdu = Pcm::initialized(&mut buf).map_err(|err| err.to_string())?;
-        pdu.set_sequence_num(sequence);
-        pdu.set_stream_id(u64::from_be_bytes(stream_id));
-        pdu.set_avtp_timestamp(timestamp);
-        pdu.set_format(Format::Int16);
-        pdu.set_sample_rate(SampleRate::Hz48000);
-        pdu.set_channels_per_frame(2);
-        pdu.set_bit_depth(16);
-        pdu.set_stream_data_length(payload.len() as u16);
-        pdu.set_stream_id_valid(true);
-        pdu.set_timestamp_valid(true);
-        if pdu.subtype() != SUBTYPE_AAF {
-            return Err(format!("AAF subtype {:#x}", pdu.subtype()));
-        }
-    }
-    buf[AAF_HEADER..].copy_from_slice(payload);
-    Ok(buf)
-}
-
-/// Parse a CVF or AAF PDU. The experimental subtype is rejected.
+/// Parse an AAF, CVF, or experimental PDU.
 pub fn decode_pdu(bytes: &[u8]) -> Option<Frame> {
-    let subtype = *bytes.first()?;
-    let (header, payload_len, sequence, stream_id, timestamp) = if subtype == SUBTYPE_CVF {
-        let pdu = Cvf::new(bytes).ok()?;
-        if !pdu.is_valid() && pdu.stream_data_length() as usize + CVF_HEADER > bytes.len() {
-            return None;
-        }
-        (
-            CVF_HEADER,
-            pdu.stream_data_length() as usize,
-            pdu.sequence_num(),
-            pdu.stream_id().to_be_bytes(),
-            pdu.avtp_timestamp(),
-        )
-    } else if subtype == SUBTYPE_AAF {
-        let pdu = Pcm::new(bytes).ok()?;
-        (
-            AAF_HEADER,
-            pdu.stream_data_length() as usize,
-            pdu.sequence_num(),
-            pdu.stream_id().to_be_bytes(),
-            pdu.avtp_timestamp(),
-        )
-    } else {
-        return None;
-    };
-    let end = header.checked_add(payload_len)?;
-    if end > bytes.len() {
-        return None;
-    }
+    let pdu = avtp::decode(bytes).ok()?;
     Some(Frame {
         ethertype: ETHERTYPE_AVTP,
-        subtype,
-        sequence,
-        stream_id,
-        timestamp,
-        payload: bytes[header..end].to_vec(),
+        subtype: pdu.subtype(),
+        sequence: pdu.sequence(),
+        stream_id: pdu.stream_id(),
+        timestamp: pdu.timestamp(),
+        payload: pdu.payload().to_vec(),
         ethernet: Vec::new(),
     })
 }
@@ -221,38 +194,7 @@ pub fn ethernet_frame(
     pcp: Option<u8>,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(18 + payload.len());
-    out.extend_from_slice(&dst);
-    out.extend_from_slice(&src);
-    if let Some(vid) = vlan {
-        let pcp = pcp.unwrap_or(0) & 0x7;
-        let tci = (u16::from(pcp) << 13) | (vid & 0x0fff);
-        out.extend_from_slice(&0x8100u16.to_be_bytes());
-        out.extend_from_slice(&tci.to_be_bytes());
-    }
-    out.extend_from_slice(&ETHERTYPE_AVTP.to_be_bytes());
-    out.extend_from_slice(payload);
-    out
-}
-
-pub fn ethertype_of(frame: &[u8]) -> Option<u16> {
-    if frame.len() >= 16 && u16::from_be_bytes([frame[12], frame[13]]) == 0x8100 {
-        return Some(u16::from_be_bytes([frame[16], frame[17]]));
-    }
-    if frame.len() >= 14 {
-        return Some(u16::from_be_bytes([frame[12], frame[13]]));
-    }
-    None
-}
-
-pub fn payload_of(frame: &[u8]) -> Option<&[u8]> {
-    if frame.len() >= 18 && u16::from_be_bytes([frame[12], frame[13]]) == 0x8100 {
-        return Some(&frame[18..]);
-    }
-    if frame.len() >= 14 {
-        return Some(&frame[14..]);
-    }
-    None
+    avtp::ethernet_frame(dst, src, vlan, pcp, payload)
 }
 
 /// Software pacer. `now` is time since the reservation started.
@@ -401,8 +343,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn picture_is_cvf_on_22f0_and_audio_is_aaf() {
+    fn picture_matches_the_payload_and_audio_pcm_is_aaf() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
         let picture = picture_frame(
+            [2, 0, 0, 0, 0, 4],
+            [2, 0, 0, 0, 0, 1],
+            1,
+            1,
+            90_000,
+            &jpeg,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(picture.ethertype, 0x22F0);
+        assert_eq!(picture.subtype, SUBTYPE_CVF);
+        assert_eq!(ethertype_of(&picture.ethernet), Some(0x22F0));
+        assert_eq!(picture.ethernet[12], 0x22);
+        let pdu = payload_of(&picture.ethernet).unwrap();
+        assert_eq!(pdu[0], SUBTYPE_CVF);
+        assert_eq!(decode_pdu(pdu).unwrap().payload, jpeg);
+
+        let opaque = picture_frame(
             [2, 0, 0, 0, 0, 4],
             [2, 0, 0, 0, 0, 1],
             1,
@@ -413,22 +375,18 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(picture.ethertype, 0x22F0);
-        assert_eq!(picture.subtype, SUBTYPE_CVF);
-        assert_ne!(picture.subtype, 0x7F);
-        assert_eq!(ethertype_of(&picture.ethernet), Some(0x22F0));
-        assert_eq!(picture.ethernet[12], 0x22);
-        let pdu = payload_of(&picture.ethernet).unwrap();
-        assert_eq!(pdu[0], SUBTYPE_CVF);
-        assert_eq!(decode_pdu(pdu).unwrap().payload, b"slice");
+        assert_eq!(opaque.subtype, SUBTYPE_EXPERIMENTAL);
+        assert_ne!(opaque.subtype, SUBTYPE_CVF);
 
-        let audio = audio_frame(
+        let samples = [1000i16, -1000];
+        let audio = pcm_frame(
             [2, 0, 0, 0, 0, 4],
             [2, 0, 0, 0, 0, 1],
             2,
             1,
             48_000,
-            b"pcm",
+            2,
+            &samples,
             Some(2),
         )
         .unwrap();
@@ -437,6 +395,22 @@ mod tests {
         assert_eq!(ethertype_of(&audio.ethernet), Some(0x22F0));
         let tci = u16::from_be_bytes([audio.ethernet[14], audio.ethernet[15]]);
         assert_eq!(tci >> 13, u16::from(PCP_AUDIO));
+        let decoded = decode_pdu(payload_of(&audio.ethernet).unwrap()).unwrap();
+        assert_eq!(decoded.payload.len(), samples.len() * 2);
+
+        let record = audio_frame(
+            [2, 0, 0, 0, 0, 4],
+            [2, 0, 0, 0, 0, 1],
+            2,
+            1,
+            48_000,
+            b"pcm",
+            None,
+        )
+        .unwrap();
+        assert_eq!(record.subtype, SUBTYPE_EXPERIMENTAL);
+        assert_eq!(decode_pdu(payload_of(&record.ethernet).unwrap()).unwrap().payload, b"pcm");
+
         assert!(pacer_stays_inside(RATE_PICTURE, Duration::from_millis(100), 1500));
         assert!(reservation_fails_closed(Reservation::Failed("no listener")).is_err());
         note_listener(false);

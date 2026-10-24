@@ -41,7 +41,7 @@ pub use rtp::{
 };
 pub use session::{
     complete_session, host_push, open_carrier_player, play_on_carrier, prepare_host,
-    spawn_player_avb, spawn_player_st2110, SessionReport,
+    spawn_player_avb, spawn_player_st2110, SessionReport, StAudio,
 };
 pub use st2110::{
     packetize_jpeg_xs, packetize_rfc4175, XsAssembler, XsPacket, RFC4175_HEIGHT, RFC4175_WIDTH,
@@ -1147,10 +1147,17 @@ impl Seam {
         // then i16le samples. ST 2110-30 carries only the samples, at the
         // record's channel count. Sending the header as samples and calling
         // it mono left the player with records it could not decode.
-        let (samples, channels, rate) = match pcm_record(body) {
+        let (mut samples, channels, mut rate) = match pcm_record(body) {
             Some(parts) => parts,
             None => (pcm_samples(body), 1, 48_000),
         };
+        // Level A is 48 kHz. The player counts channels as samples per 1 ms
+        // packet divided by 48, so any other rate shifts that count and the
+        // interleaved samples play as noise.
+        if rate != 48_000 {
+            samples = resample_pcm(&samples, channels, rate, 48_000);
+            rate = 48_000;
+        }
         let packets = ::st2110::packetize_pcm(&samples, channels, rate);
         if packets.is_empty() {
             return None;
@@ -1189,6 +1196,26 @@ fn pcm_record(body: &[u8]) -> Option<(Vec<i16>, u16, u32)> {
         .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     Some((samples, channels, rate))
+}
+
+fn resample_pcm(samples: &[i16], channels: u16, from: u32, to: u32) -> Vec<i16> {
+    let ch = usize::from(channels.max(1));
+    let frames = samples.len() / ch;
+    if frames == 0 || from == 0 || to == 0 || from == to {
+        return samples.to_vec();
+    }
+    let out_frames = ((u64::from(to) * frames as u64) / u64::from(from)).max(1) as usize;
+    let mut out = Vec::with_capacity(out_frames * ch);
+    for i in 0..out_frames {
+        let src = if out_frames == 1 {
+            0
+        } else {
+            (i as u64 * (frames as u64 - 1) / (out_frames as u64 - 1)) as usize
+        };
+        let src = src.min(frames - 1) * ch;
+        out.extend_from_slice(&samples[src..src + ch]);
+    }
+    out
 }
 
 fn pcm_samples(body: &[u8]) -> Vec<i16> {
@@ -1502,9 +1529,11 @@ mod tests {
             waited < Duration::from_millis(80),
             "one frame is not a one-second sleep, waited {waited:?}"
         );
-        let (header, _) = RtpHeader::decode(packets.last().unwrap()).unwrap();
-        assert!(header.timestamp < ST_FRAME_TICKS);
-        assert!(header.timestamp > 1_000);
+        let stamps: Vec<u32> = packets
+            .iter()
+            .map(|packet| RtpHeader::decode(packet).unwrap().0.timestamp)
+            .collect();
+        assert!(stamps.iter().all(|stamp| *stamp == stamps[0]));
         let xs = seam.packets();
         let xs = &xs[packets.len()..];
         assert!(xs.len() > 1);
@@ -1522,12 +1551,15 @@ mod tests {
             seam.send(Lane::Picture, b"next-xs", None, Duration::from_millis(1)).as_deref(),
             Some(b"next-xs".as_slice())
         );
-        let audio = b"pcm-level-a-16b";
+        let audio: Vec<u8> = (0..48i16).flat_map(|sample| sample.to_le_bytes()).collect();
         assert_eq!(
-            seam.send(Lane::Audio, audio, None, Duration::from_millis(1)).as_deref(),
+            seam.send(Lane::Audio, &audio, None, Duration::from_millis(1)).as_deref(),
             Some(audio.as_slice())
         );
-        assert!(seam.packets().iter().any(|packet| packet.len() > 12 && packet[1] & 0x7f == 97));
+        assert!(seam.send(Lane::Audio, b"pcm-level-a-16b", None, Duration::from_millis(1)).is_none());
+        assert!(seam.packets().iter().any(|packet| {
+            packet.len() > 12 && packet[1] & 0x7f == 97 && packet[1] & 0x80 == 0
+        }));
         assert!(
             seam.send(Lane::Picture, b"behind", None, Duration::from_millis(80)).is_none(),
             "a send more than one frame behind drops the frame in hand"
@@ -1595,7 +1627,7 @@ mod tests {
             Some(coded.as_slice())
         );
         let (_, payload) = RtpHeader::decode(st.packets().last().unwrap()).unwrap();
-        assert_ne!(&payload[..4], ::st2110::xs_header(true, 0).as_slice());
+        assert_ne!(&payload[..4], ::st2110::xs_header(true, 0, 0).as_slice());
         assert!(connect_row_now(ST2110).contains("gcm"));
         choose_profile(false, false);
     }
@@ -1674,19 +1706,25 @@ mod tests {
         let _globals = crate::carrier::test_globals();
         let picture = vec![7u8; 200];
         let audio = b"pcm-fixed-record".to_vec();
+        // ST 2110-30 Level A needs 1 ms of 48 kHz PCM. Opaque bytes that are
+        // shorter than that never leave send_pcm.
+        let st_audio: Vec<u8> = (0..48i16)
+            .flat_map(|sample| (1000 - sample).to_le_bytes())
+            .collect();
         for id in 1..=5 {
-            let clean = run_loopback(id, &picture, &audio, false);
+            let audio_in = if id == ST2110 { &st_audio } else { &audio };
+            let clean = run_loopback(id, &picture, audio_in, false);
             assert_eq!(clean.picture.as_deref(), Some(picture.as_slice()), "id {id}");
-            assert_eq!(clean.audio.as_deref(), Some(audio.as_slice()), "id {id}");
+            assert_eq!(clean.audio.as_deref(), Some(audio_in.as_slice()), "id {id}");
             assert_eq!(clean.next_picture.as_deref(), Some(b"next-picture".as_slice()));
             if id == 1 {
                 assert_eq!(clean.ethertype, crate::ETHERTYPE_QUIC);
                 assert_eq!(clean.datagrams, 0);
-                let dropped = run_loopback(id, &picture, &audio, true);
+                let dropped = run_loopback(id, &picture, audio_in, true);
                 assert_eq!(dropped.picture.as_deref(), Some(picture.as_slice()));
                 assert!(dropped.retried);
             } else {
-                let dropped = run_loopback(id, &picture, &audio, true);
+                let dropped = run_loopback(id, &picture, audio_in, true);
                 assert!(dropped.picture.is_none(), "partial id {id}");
                 assert_eq!(dropped.next_picture.as_deref(), Some(b"next-picture".as_slice()));
             }

@@ -19,8 +19,8 @@ pub struct Rfc4175Packet {
 }
 
 /// `samples` is packed RGB, `width * height * 3` bytes. Packets are RFC 4175
-/// from the `st2110` crate: one row each, timestamps span the frame, and the
-/// send times are not one burst.
+/// from the `st2110` crate: one row each, one timestamp for the frame, and
+/// send times that are not one burst.
 pub fn packetize_rfc4175(samples: &[u8], width: u32, height: u32, frame_ticks: u32) -> Vec<Rfc4175Packet> {
     st2110::packetize_rfc4175(samples, width, height, frame_ticks)
         .into_iter()
@@ -132,10 +132,10 @@ mod tests {
         assert_eq!(back, samples);
         let first = packets.first().unwrap().timestamp;
         let last = packets.last().unwrap().timestamp;
-        assert!(last > first);
+        assert_eq!(last, first);
         assert_ne!(packets[0].send_at, packets[63].send_at);
         let ticks: Vec<u32> = packets.iter().map(|packet| packet.timestamp).collect();
-        assert!(ticks.windows(2).any(|pair| pair[1] != pair[0]));
+        assert!(ticks.windows(2).all(|pair| pair[1] == pair[0]));
     }
 
     #[test]

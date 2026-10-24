@@ -829,8 +829,14 @@ async fn connect_player(
         let mut logged = false;
         while let Some(chunk) = audio_rx.recv().await {
             if !logged && chunk.sample_rate > 0 && chunk.channels > 0 && !chunk.pcm.is_empty() {
+                let peak = chunk
+                    .pcm
+                    .iter()
+                    .map(|sample| sample.unsigned_abs())
+                    .max()
+                    .unwrap_or(0);
                 eprintln!(
-                    "etherquic-play: audio {} Hz {} ch pcm {} samples",
+                    "etherquic-play: audio {} Hz {} ch pcm {} samples peak {peak}",
                     chunk.sample_rate,
                     chunk.channels,
                     chunk.pcm.len()

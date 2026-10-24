@@ -479,6 +479,16 @@ fn apply_patch(
     Ok(Some(picture.clone()))
 }
 
+/// ST 2110-30 is L16. The negotiated row can still say Opus; decoding those
+/// sample bytes as an Opus packet is the noise.
+pub fn audio_decoder_row(audio: Audio, carrier: Option<u8>) -> Audio {
+    if carrier == Some(etherquic::carrier::ST2110) {
+        Audio::Pcm
+    } else {
+        audio
+    }
+}
+
 /// Read audio from `EAU2` (or the legacy `EAUD` PCM stream).
 pub async fn read_audio(
     mut recv: RecvStream,
@@ -578,6 +588,7 @@ pub async fn read_audio(
                             let _ = events.send(PlayerEvent::Audio(config.clone()));
                             decoder = None;
                             if let Some(audio) = config.audio {
+                                let audio = audio_decoder_row(audio, config.carrier);
                                 match AudioDecoder::open(audio, config.channels.max(1)) {
                                     Ok(dec) => {
                                         decoder = Some((dec, audio));

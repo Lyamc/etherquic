@@ -7,7 +7,7 @@
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use super::assemble::{split_record, Assembler, Slice};
+use super::assemble::{split_record, Assembler, Lane, Slice};
 use super::rtp::{
     self, audio_deadline, derive_aes128, picture_deadline, rtcp_loss_fraction,
     rtcp_receiver_report, GcmSession, KeyShare, RtpHeader, PROFILE_GCM,
@@ -405,7 +405,9 @@ pub fn spawn_player_avb(
                 continue;
             };
             let now = Instant::now();
-            let (asm, tx) = if frame.subtype == avb::SUBTYPE_AAF {
+            let is_audio = frame.subtype == avb::SUBTYPE_AAF
+                || (frame.subtype != avb::SUBTYPE_CVF && frame.stream_id[7] == Lane::Audio as u8);
+            let (asm, tx) = if is_audio {
                 (&mut audios, &audio)
             } else {
                 (&mut pictures, &picture)
@@ -421,6 +423,51 @@ pub fn spawn_player_avb(
 
 const ST_AUDIO_RATE: u32 = 48_000;
 const ST_AUDIO_FRAMES_PER_MS: usize = 48;
+
+/// ST 2110-30 packets gathered into the PCM record `read_audio` decodes.
+///
+/// Level A is 48 kHz in 1 ms packets. The first packet of a record holds 48
+/// frames per channel and that length is the channel count. A shorter first
+/// packet is a capture fragment: treating its length as one channel plays the
+/// following stereo samples as mono. Samples on the wire are big-endian; the
+/// record is little-endian, with rate and channels in front, because that is
+/// what the PCM decoder reads.
+#[derive(Default)]
+pub struct StAudio {
+    pcm: Vec<u8>,
+    channels: u16,
+}
+
+impl StAudio {
+    pub fn push(&mut self, marker: bool, payload: &[u8]) -> Option<Vec<u8>> {
+        let _ = marker;
+        let samples = payload.len() / 2;
+        // One millisecond, and an integer number of those groups. Level A
+        // leaves the marker clear, so a full packet closes the record itself.
+        if payload.len() % 2 != 0
+            || samples < ST_AUDIO_FRAMES_PER_MS
+            || samples % ST_AUDIO_FRAMES_PER_MS != 0
+        {
+            return None;
+        }
+        let channels = samples / ST_AUDIO_FRAMES_PER_MS;
+        if !(1..=8).contains(&channels) {
+            return None;
+        }
+        self.channels = u16::try_from(channels).unwrap_or(2);
+        self.pcm.clear();
+        for chunk in payload.chunks_exact(2) {
+            let sample = i16::from_be_bytes([chunk[0], chunk[1]]);
+            self.pcm.extend(sample.to_le_bytes());
+        }
+        let mut record = Vec::with_capacity(7 + self.pcm.len());
+        record.push(crate::negotiate::RECORD_DATA);
+        record.extend(ST_AUDIO_RATE.to_le_bytes());
+        record.extend(self.channels.to_le_bytes());
+        record.append(&mut self.pcm);
+        Some(record)
+    }
+}
 
 /// RTP header check and optional `gcm` open. Returns the marker and payload.
 fn st_open(gcm: &mut Option<rtp::GcmSession>, packet: &[u8]) -> Option<(bool, Vec<u8>)> {
@@ -468,48 +515,31 @@ pub fn spawn_player_st2110(
             let picture_alive = picture.clone();
             std::thread::spawn(move || {
                 let mut gcm = key.map(rtp::GcmSession::new);
-                let mut pcm = Vec::new();
-                let mut channels = 0u16;
+                let mut acc = StAudio::default();
                 let mut buf = [0u8; 2048];
                 while !audio.is_closed() && !picture_alive.is_closed() {
                     let Ok((n, _)) = audio_sock.recv_from(&mut buf) else {
                         continue;
                     };
-                    let Some(payload) = st_open(&mut gcm, &buf[..n]) else {
+                    let Some((marker, payload)) = st_open(&mut gcm, &buf[..n]) else {
                         continue;
                     };
-                    let (marker, payload) = payload;
-                    // Level A is 48 kHz in 1 ms packets, so the first packet of
-                    // a record holds 48 frames and names the channel count.
-                    if pcm.is_empty() {
-                        channels = u16::try_from(payload.len() / 2 / ST_AUDIO_FRAMES_PER_MS)
-                            .unwrap_or(2)
-                            .max(1);
-                    }
-                    for chunk in payload.chunks_exact(2) {
-                        let sample = i16::from_be_bytes([chunk[0], chunk[1]]);
-                        pcm.extend(sample.to_le_bytes());
-                    }
-                    if marker {
-                        // The decoder takes the `D` record the QUIC reader hands it.
-                        let mut record = Vec::with_capacity(7 + pcm.len());
-                        record.push(crate::negotiate::RECORD_DATA);
-                        record.extend(ST_AUDIO_RATE.to_le_bytes());
-                        record.extend(channels.to_le_bytes());
-                        record.append(&mut pcm);
-                        if audio.blocking_send(record).is_err() {
-                            return;
-                        }
+                    let Some(record) = acc.push(marker, &payload) else {
+                        continue;
+                    };
+                    if audio.blocking_send(record).is_err() {
+                        return;
                     }
                 }
             });
         }
         let mut gcm = key.map(rtp::GcmSession::new);
-        // Frames follow the ST 2110-22 header: packet index, and K on the last
-        // packet. A missing index drops that frame only. Before, a lost packet
-        // glued the next frame onto the broken one and the decoder got neither.
+        // Frames follow the RFC 9134 header: T, K, the frame counter, and the
+        // packet counter. K stays 0 in codestream mode. L, not K, ends the frame.
         let mut parts = Vec::new();
-        let mut next_index: Option<u16> = None;
+        let mut next_index: Option<u32> = None;
+        let mut k_bit: Option<bool> = None;
+        let mut frame_counter: Option<u8> = None;
         let mut buf = [0u8; 2048];
         while !picture.is_closed() {
             let Ok((n, _)) = picture_sock.recv_from(&mut buf) else {
@@ -518,24 +548,40 @@ pub fn spawn_player_st2110(
             let Some((last, payload)) = st_open(&mut gcm, &buf[..n]) else {
                 continue;
             };
-            if payload.len() < 4 {
+            let Some(fields) = st2110::xs_fields(&payload) else {
+                continue;
+            };
+            if !fields.t && !fields.k {
                 continue;
             }
-            let index = u16::from_be_bytes([payload[1], payload[2]]);
-            let k = payload[0] & 0x40 != 0;
-            if index == 0 {
+            if let Some(k) = k_bit {
+                if k != fields.k {
+                    k_bit = None;
+                    next_index = None;
+                    frame_counter = None;
+                    parts.clear();
+                    continue;
+                }
+            } else {
+                k_bit = Some(fields.k);
+            }
+            if frame_counter != Some(fields.frame) || fields.index() == 0 {
                 parts.clear();
                 next_index = Some(0);
+                frame_counter = Some(fields.frame);
             }
+            let index = fields.index();
             if next_index != Some(index) {
                 next_index = None;
+                frame_counter = None;
                 parts.clear();
                 continue;
             }
             parts.extend_from_slice(&payload[4..]);
             next_index = Some(index.wrapping_add(1));
-            if k || last {
+            if fields.l || last {
                 next_index = None;
+                frame_counter = None;
                 if picture.blocking_send(std::mem::take(&mut parts)).is_err() {
                     return;
                 }
@@ -572,7 +618,29 @@ fn st2110_session(picture: &[u8], audio: &[u8]) -> SessionReport {
     let _ = st2110::quic_overlaps(&ports, ports[0]);
     let mut report = empty(ST2110, &picture_out, &audio_out);
     report.profile = st2110::default_profile().name().into();
+    if let (Some(first), Some(last), Some(audio_pkt)) = (xs.first(), xs.last(), pcm.first()) {
+        let fields = st2110::xs_fields(&first.payload);
+        let shared = xs.iter().all(|packet| packet.timestamp == first.timestamp);
+        let marker_only_last = last.marker && xs[..xs.len() - 1].iter().all(|packet| !packet.marker);
+        let audio_octets = audio_pkt.rtp.len().saturating_sub(12);
+        println!(
+            "st2110 picture_identical={} audio_identical={} t={} k={} timestamp_shared={} marker_only_last={} audio_octets={} audio_marker={} audio_ts={}",
+            picture_out == picture,
+            audio_out == audio_le(&samples),
+            fields.map(|fields| u8::from(fields.t)).unwrap_or(0),
+            fields.map(|fields| u8::from(fields.k)).unwrap_or(1),
+            shared,
+            marker_only_last,
+            audio_octets,
+            audio_pkt.rtp.get(1).map(|byte| byte & 0x80).unwrap_or(0x80),
+            audio_pkt.timestamp
+        );
+    }
     report
+}
+
+fn audio_le(samples: &[i16]) -> Vec<u8> {
+    samples.iter().flat_map(|sample| sample.to_le_bytes()).collect()
 }
 
 fn audio_samples(audio: &[u8]) -> Vec<i16> {
@@ -611,13 +679,16 @@ fn recv_xs(sock: &UdpSocket, count: usize) -> Vec<u8> {
         let Ok((n, _)) = sock.recv_from(&mut buf) else {
             continue;
         };
-        let Some((header, payload)) = RtpHeader::decode(&buf[..n]) else {
+        let Some((_, payload)) = RtpHeader::decode(&buf[..n]) else {
             continue;
         };
-        if payload.len() < 4 {
+        let Some(fields) = st2110::xs_fields(payload) else {
+            continue;
+        };
+        if !fields.t && !fields.k {
             continue;
         }
-        let index = usize::from(header.sequence);
+        let index = fields.index() as usize;
         if index < parts.len() && parts[index].is_none() {
             parts[index] = Some(payload[4..].to_vec());
             got += 1;
@@ -745,26 +816,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn st_audio_record_is_the_big_endian_samples() {
+        let samples: Vec<i16> = (0..96)
+            .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
+            .collect();
+        let packets = st2110::packetize_pcm(&samples, 2, 48_000);
+        assert_eq!(packets.len(), 1, "1 ms of stereo is one level-A packet");
+        let mut acc = StAudio::default();
+        let mut record = None;
+        for packet in &packets {
+            let (header, payload) = crate::carrier::RtpHeader::decode(&packet.rtp).unwrap();
+            assert!(!header.marker);
+            record = acc.push(header.marker, payload);
+        }
+        let record = record.expect("a full millisecond closes the record");
+        assert_eq!(record[0], crate::negotiate::RECORD_DATA);
+        let rate = u32::from_le_bytes(record[1..5].try_into().unwrap());
+        let channels = u16::from_le_bytes([record[5], record[6]]);
+        assert_eq!((rate, channels), (48_000, 2));
+        let got: Vec<i16> = record[7..]
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(got, samples);
+    }
+
+    #[test]
+    fn a_short_st2110_packet_does_not_become_one_channel() {
+        // Fewer than 1 ms is not a level-A packet.
+        let click = [596i16, 0, 0];
+        let packets = st2110::packetize_pcm(&click, 2, 48_000);
+        assert!(packets.is_empty());
+        let mut acc = StAudio::default();
+        assert!(acc.push(false, &click.iter().flat_map(|sample| sample.to_be_bytes()).collect::<Vec<_>>()).is_none());
+
+        let samples = vec![0i16; 96];
+        let packets = st2110::packetize_pcm(&samples, 2, 48_000);
+        let (header, payload) = crate::carrier::RtpHeader::decode(&packets[0].rtp).unwrap();
+        assert!(!header.marker);
+        let record = acc
+            .push(header.marker, payload)
+            .expect("a full millisecond still closes");
+        let channels = u16::from_le_bytes([record[5], record[6]]);
+        assert_eq!(channels, 2);
+        assert_eq!(record.len(), 7 + samples.len() * 2);
+    }
+
+    #[test]
     fn carriers_3_4_and_5_finish_on_udp_without_quic() {
         let _globals = crate::carrier::test_globals();
         let picture = b"picture-bytes-for-the-session".to_vec();
         let audio = b"audio-pcm".to_vec();
+        let level_a: Vec<u8> = (0..48i16).flat_map(|sample| (1000 - sample).to_le_bytes()).collect();
         for id in [UDP_RTP, AVB, ST2110] {
             let before = crate::quic_binds();
-            let report = complete_session(id, &picture, &audio);
+            let sent_audio = if id == ST2110 { level_a.clone() } else { audio.clone() };
+            let report = complete_session(id, &picture, &sent_audio);
             assert_eq!(report.quic_before, before, "carrier {id}");
             assert_eq!(report.quic_after, before, "carrier {id} opened QUIC");
             assert_eq!(report.picture, picture, "carrier {id} picture");
             if id == ST2110 {
-                assert_eq!(report.audio, audio_samples(&audio).iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>());
+                assert_eq!(report.audio, level_a);
+                println!(
+                    "st2110 run=1 quic_before={} quic_after={} picture_identical={} audio_identical={}",
+                    report.quic_before,
+                    report.quic_after,
+                    report.picture == picture,
+                    report.audio == level_a
+                );
             } else {
                 assert_eq!(report.audio, audio, "carrier {id} audio");
             }
             if id == AVB {
                 assert_eq!(report.ethertype, avb::ETHERTYPE_AVTP);
-                assert_eq!(report.subtype, avb::SUBTYPE_CVF);
-                assert_ne!(report.subtype, 0x7F);
+                assert_eq!(report.subtype, avb::SUBTYPE_EXPERIMENTAL);
+                assert_ne!(report.subtype, avb::SUBTYPE_CVF);
                 assert_eq!(report.profile, "not encrypted");
+                println!(
+                    "avb ethertype={:#06x} subtype={:#x} picture_identical={} audio_identical={} quic_before={} quic_after={}",
+                    report.ethertype,
+                    report.subtype,
+                    report.picture == picture,
+                    report.audio == audio,
+                    report.quic_before,
+                    report.quic_after
+                );
             }
             if id == UDP_RTP {
                 assert_eq!(report.offers, 1, "host answered the first offer");
@@ -781,5 +917,18 @@ mod tests {
                 assert_eq!(report.profile, "plain");
             }
         }
+        let before = crate::quic_binds();
+        let again = complete_session(ST2110, &picture, &level_a);
+        assert_eq!(again.quic_before, before);
+        assert_eq!(again.quic_after, before);
+        assert_eq!(again.picture, picture);
+        assert_eq!(again.audio, level_a);
+        println!(
+            "st2110 run=2 quic_before={} quic_after={} picture_identical={} audio_identical={}",
+            again.quic_before,
+            again.quic_after,
+            again.picture == picture,
+            again.audio == level_a
+        );
     }
 }

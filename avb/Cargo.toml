@@ -8,4 +8,4 @@ publish = false
 description = "IEEE 1722 AVTP frames, software pacing, and in-process gPTP and MSRP"
 
 [dependencies]
-open1722 = "0.9.6"
+avtp = { git = "https://github.com/Lyamc/avtp", rev = "7e4015ffda7bb399ff7e3cc2de1ebffa0f50d057" }

@@ -19,9 +19,9 @@ use tokio::sync::{mpsc, watch};
 use crate::audio::AudioEncoder;
 use crate::dirty;
 use crate::negotiate::{
-    choose_audio, choose_video, session_fps_wish, Audio, FpsWish, HostCaps, Offer, StreamConfig,
-    Video, AUDIO2_MAGIC, CLOCK_AUDIO, CLOCK_VIDEO, OFFER_MAGIC, RECORD_CLOCK, RECORD_CURSOR,
-    RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
+    choose_audio, choose_video, session_fps_wish, Audio, Choice, FpsWish, HostCaps, Offer,
+    StreamConfig, Video, AUDIO2_MAGIC, CLOCK_AUDIO, CLOCK_VIDEO, OFFER_MAGIC, RECORD_CLOCK,
+    RECORD_CURSOR, RECORD_DATA, RECORD_PATCH, VIDEO2_MAGIC,
 };
 use crate::video::{EncodeSetup, VideoEncoder};
 use crate::{wire, yuv, Frame, Log, Pcm};
@@ -1611,6 +1611,16 @@ fn encode_period(wish: FpsWish, hardware: bool, display_hz: Option<u32>) -> Opti
     }
 }
 
+/// ST 2110-30 carries L16 samples. Opus on that carrier is decoded as if it
+/// were those samples, which is full-scale noise on a silent desktop.
+fn audio_choice_for_carrier(carrier: Option<u8>, mut pick: Choice<Audio>) -> Choice<Audio> {
+    if carrier == Some(etherquic::carrier::ST2110) && pick.row != Audio::Pcm {
+        pick.row = Audio::Pcm;
+        pick.encoder = "pcm".into();
+    }
+    pick
+}
+
 async fn audio_loop(
     mut lane: LaneSend,
     mut audio: mpsc::Receiver<Pcm>,
@@ -1651,6 +1661,7 @@ async fn audio_loop(
                     Some(offer) => choose_audio(offer, &options.caps, &excluded),
                     None => break,
                 };
+                let pick = audio_choice_for_carrier(offer.as_ref().and_then(|row| row.carrier), pick);
                 let max_channels = offer.as_ref().map(|o| o.audio_channels).unwrap_or(0);
                 let stereo_kbps = offer.as_ref().map(|o| o.audio_bitrate_kbps).unwrap_or(0);
                 match AudioEncoder::open(
@@ -1794,6 +1805,68 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn st2110_plays_captured_pcm_when_the_offer_picked_opus() {
+        let samples: Vec<i16> = (0..96)
+            .map(|i| if i % 2 == 0 { 1000 } else { -1500 })
+            .collect();
+        let pcm = crate::Pcm {
+            sample_rate: 48_000,
+            channels: 2,
+            samples: samples.clone(),
+        };
+        let offered = crate::negotiate::Choice {
+            row: crate::negotiate::Audio::Opus,
+            encoder: "libopus".into(),
+            skipped: Vec::new(),
+            fallback: false,
+        };
+        let kept = super::audio_choice_for_carrier(Some(etherquic::carrier::UDP_RTP), offered.clone());
+        assert_eq!(kept.row, crate::negotiate::Audio::Opus);
+        let pick = super::audio_choice_for_carrier(Some(etherquic::carrier::ST2110), offered);
+        assert_eq!(pick.row, crate::negotiate::Audio::Pcm);
+        let (mut enc, rate, channels) = crate::audio::AudioEncoder::open(
+            pick.row,
+            pcm.sample_rate,
+            pcm.channels,
+            2,
+            96,
+        )
+        .expect("pcm encoder");
+        assert_eq!((rate, channels), (48_000, 2));
+        let packets = enc.push(&pcm).expect("pcm packet");
+        let mut body = vec![crate::negotiate::RECORD_DATA];
+        body.extend_from_slice(&packets[0]);
+        etherquic::carrier::note_st_gcm(false);
+        let mut seam = etherquic::carrier::Seam::open(etherquic::carrier::ST2110);
+        assert!(seam
+            .send(
+                etherquic::carrier::Lane::Audio,
+                &body,
+                None,
+                std::time::Duration::from_millis(1),
+            )
+            .is_some());
+        let mut acc = etherquic::carrier::StAudio::default();
+        let mut record = None;
+        for packet in seam.packets() {
+            let (header, payload) = etherquic::carrier::RtpHeader::decode(packet).unwrap();
+            if let Some(next) = acc.push(header.marker, payload) {
+                record = Some(next);
+            }
+        }
+        let record = record.expect("player record");
+        let row = crate::player::audio_decoder_row(
+            crate::negotiate::Audio::Opus,
+            Some(etherquic::carrier::ST2110),
+        );
+        let mut dec = crate::audio::AudioDecoder::open(row, 2).expect("pcm decoder");
+        let played = dec.decode(&record[1..]).expect("pcm record");
+        assert_eq!(played.samples, samples);
+        assert_eq!(played.sample_rate, 48_000);
+        assert_eq!(played.channels, 2);
+    }
 
     #[test]
     fn capture_fps_changes_the_period_while_the_loop_is_up() {

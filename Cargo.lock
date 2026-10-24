@@ -620,7 +620,7 @@ dependencies = [
 name = "avb"
 version = "0.1.0"
 dependencies = [
- "open1722",
+ "avtp",
 ]
 
 [[package]]
@@ -631,6 +631,11 @@ checksum = "e7178fe5f7d460b13895ebb9dcb28a3a6216d2df2574a0806cb51b555d297f38"
 dependencies = [
  "arrayvec",
 ]
+
+[[package]]
+name = "avtp"
+version = "0.1.0"
+source = "git+https://github.com/Lyamc/avtp?rev=7e4015ffda7bb399ff7e3cc2de1ebffa0f50d057#7e4015ffda7bb399ff7e3cc2de1ebffa0f50d057"
 
 [[package]]
 name = "base16ct"
@@ -701,8 +706,6 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
- "log",
- "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -5497,26 +5500,6 @@ checksum = "aa576c76302b7b808eecc68061e67336c47833ef9d22caa74dda10fa9675eebc"
 dependencies = [
  "is-wsl",
  "libc",
-]
-
-[[package]]
-name = "open1722"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef3c2b0186e5a26d4738ac16c15758a34e5f937cf13773fafa66216500fb9861"
-dependencies = [
- "open1722-sys",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "open1722-sys"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee77e24aee613f8457a3df8acad28d42155967113b3e73c5a61a57f2ab68910"
-dependencies = [
- "bindgen 0.72.1",
- "cc",
 ]
 
 [[package]]
