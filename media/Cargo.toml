@@ -11,6 +11,7 @@ publish = false
 etherquic = { path = ".." }
 jpeg-encoder = "0.6"
 libloading = "0.8"
+pyrowave-rs = { git = "https://github.com/Lyamc/pyrowave-rs.git", rev = "3fe00a7430a1b5451d2d3c4ec941755e86efb397" }
 openjpeg2-pure-rs = "0.1.1"
 quinn = { path = "../vendor/quinn/quinn", default-features = false, features = [
     "runtime-tokio",

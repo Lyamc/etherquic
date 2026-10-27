@@ -1,8 +1,10 @@
-//! PyroWave through `libpyrowave-shared`, loaded at run time.
+//! PyroWave encode through [pyrowave-rs](https://github.com/Lyamc/pyrowave-rs),
+//! and decode through `libpyrowave-shared`, loaded at run time.
 //!
-//! The CPU-buffer API is used on both ends: the host converts RGB to planar
-//! YUV (4:2:0 / 4:2:2 / 4:4:4, 8- or 10-bit) and PyroWave compresses it with
-//! Vulkan compute; the player pushes packets and reads the same layout back.
+//! The host converts RGB to planar YUV (4:2:0 / 4:2:2 / 4:4:4, 8- or 10-bit).
+//! 8-bit pictures are encoded by pyrowave-rs (hardware Vulkan, then D3D11 on
+//! Windows, then OpenGL, then a CPU or lavapipe device). 10-bit still uses
+//! the C encoder. The player pushes packets and reads the same layout back.
 //! 4:2:2 is sent as 4:4:4 after a horizontal chroma upsample. Granite (inside PyroWave) loads the Vulkan loader
 //! itself. On Windows Granite only ever does `LoadLibraryA("vulkan-1.dll")`
 //! (it ignores `GRANITE_VULKAN_LIBRARY` there), so a PC without a Vulkan
@@ -617,10 +619,20 @@ fn packed_buffer(
     }
 }
 
+enum Engine {
+    Rs(pyrowave_rs::Encoder),
+    /// 10-bit pictures. pyrowave-rs encodes 8-bit planes only.
+    C {
+        device: Device,
+        handle: Handle,
+        bitstream: Vec<u8>,
+        packets: Vec<Packet>,
+    },
+}
+
 /// One encoder for one picture size.
 pub struct Encoder {
-    device: Device,
-    handle: Handle,
+    engine: Engine,
     width: u32,
     height: u32,
     format: YuvFormat,
@@ -628,9 +640,10 @@ pub struct Encoder {
     pack_y: Vec<u8>,
     pack_u: Vec<u8>,
     pack_v: Vec<u8>,
-    bitstream: Vec<u8>,
-    packets: Vec<Packet>,
     frame_bytes: usize,
+    reported: Option<VulkanDevice>,
+    /// `vulkan`, `d3d11`, `opengl`, `cpu`, or `c`.
+    backend: &'static str,
 }
 
 unsafe impl Send for Encoder {}
@@ -648,6 +661,34 @@ impl Encoder {
                 "pyrowave needs even sides of 16 or more, got {width}x{height}"
             ));
         }
+        let frame_bytes = frame_bytes.max(16 * 1024);
+        let planes = YuvPlanes::new(width as usize, height as usize, format);
+        if format.bitstream().depth == YuvDepth::Depth10 {
+            return Self::open_c(width, height, frame_bytes, format, planes);
+        }
+        let (inner, reported, backend) = open_rs()?;
+        Ok(Encoder {
+            engine: Engine::Rs(inner),
+            width,
+            height,
+            format,
+            planes,
+            pack_y: Vec::new(),
+            pack_u: Vec::new(),
+            pack_v: Vec::new(),
+            frame_bytes,
+            reported: Some(reported),
+            backend,
+        })
+    }
+
+    fn open_c(
+        width: u32,
+        height: u32,
+        frame_bytes: usize,
+        format: YuvFormat,
+        planes: YuvPlanes,
+    ) -> Result<Encoder, String> {
         let device = Device::new()?;
         let info = EncInfo {
             device: device.handle,
@@ -660,20 +701,24 @@ impl Encoder {
             unsafe { (device.api.encoder_create)(&info, &mut handle) },
             "encoder",
         )?;
-        let frame_bytes = frame_bytes.max(16 * 1024);
+        let reported = device.vulkan_device();
         Ok(Encoder {
-            device,
-            handle,
+            engine: Engine::C {
+                device,
+                handle,
+                bitstream: vec![0; frame_bytes + 64 * 1024],
+                packets: Vec::new(),
+            },
             width,
             height,
             format,
-            planes: YuvPlanes::new(width as usize, height as usize, format),
+            planes,
             pack_y: Vec::new(),
             pack_u: Vec::new(),
             pack_v: Vec::new(),
-            bitstream: vec![0; frame_bytes + 64 * 1024],
-            packets: Vec::new(),
             frame_bytes,
+            reported,
+            backend: "c",
         })
     }
 
@@ -681,18 +726,25 @@ impl Encoder {
         (self.width, self.height)
     }
 
+    /// `vulkan`, `d3d11`, `opengl`, `cpu`, or `c` (10-bit C encoder).
+    pub fn backend(&self) -> &'static str {
+        self.backend
+    }
+
     /// Per-picture budget used on the next [`Self::encode`]. Quality preview
     /// reuses one encoder and only changes this.
     pub fn set_frame_bytes(&mut self, frame_bytes: usize) {
         self.frame_bytes = frame_bytes.max(16 * 1024);
-        if self.bitstream.len() < self.frame_bytes + 64 * 1024 {
-            self.bitstream.resize(self.frame_bytes + 64 * 1024, 0);
+        if let Engine::C { bitstream, .. } = &mut self.engine {
+            if bitstream.len() < self.frame_bytes + 64 * 1024 {
+                bitstream.resize(self.frame_bytes + 64 * 1024, 0);
+            }
         }
     }
 
-    /// The Vulkan device this encoder runs on, when the library can say.
+    /// The device this encoder runs on. CPU and lavapipe set [`VulkanDevice::cpu`].
     pub fn vulkan_device(&self) -> Option<VulkanDevice> {
-        self.device.vulkan_device()
+        self.reported.clone()
     }
 
     /// One record: u32le packet count, then u32le size and bytes per packet.
@@ -707,62 +759,246 @@ impl Encoder {
         self.pack_y = pack_plane(&work.y, work.format.depth);
         self.pack_u = pack_plane(&work.u, work.format.depth);
         self.pack_v = pack_plane(&work.v, work.format.depth);
-        let api = &self.device.api;
-        let buffer = packed_buffer(
-            &mut self.pack_y,
-            &mut self.pack_u,
-            &mut self.pack_v,
-            work.width,
-            work.height,
-            work.format,
-        );
-        let rate = RateControl {
-            maximum_bitstream_size: self.frame_bytes,
-        };
-        check(
-            unsafe { (api.encode_cpu)(self.handle, &buffer, &rate) },
-            "encode",
-        )?;
-        let mut count = 0usize;
-        check(
-            unsafe { (api.num_packets)(self.handle, PACKET_BOUNDARY, &mut count) },
-            "packet count",
-        )?;
-        self.packets.resize(count.max(1), Packet::default());
-        let mut written = 0usize;
-        check(
-            unsafe {
-                (api.packetize)(
-                    self.handle,
-                    self.packets.as_mut_ptr(),
-                    PACKET_BOUNDARY,
-                    &mut written,
-                    self.bitstream.as_mut_ptr().cast(),
-                    self.bitstream.len(),
-                )
-            },
-            "packetize",
-        )?;
-        let packets = &self.packets[..written.min(self.packets.len())];
-        let total: usize = packets.iter().map(|p| p.size + 4).sum();
-        let mut out = Vec::with_capacity(4 + total);
-        out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
-        for packet in packets {
-            let end = packet.offset + packet.size;
-            if end > self.bitstream.len() {
-                return Err("pyrowave packet outside the bitstream".into());
-            }
-            out.extend_from_slice(&(packet.size as u32).to_le_bytes());
-            out.extend_from_slice(&self.bitstream[packet.offset..end]);
+        let frame_bytes = self.frame_bytes;
+        match &mut self.engine {
+            Engine::Rs(inner) => encode_rs(
+                inner,
+                &self.pack_y,
+                &self.pack_u,
+                &self.pack_v,
+                work.width,
+                work.height,
+                work.format,
+                frame_bytes,
+            ),
+            Engine::C {
+                device,
+                handle,
+                bitstream,
+                packets,
+            } => encode_c(
+                device,
+                *handle,
+                bitstream,
+                packets,
+                &mut self.pack_y,
+                &mut self.pack_u,
+                &mut self.pack_v,
+                work.width,
+                work.height,
+                work.format,
+                frame_bytes,
+            ),
         }
-        Ok(out)
     }
 }
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        unsafe { (self.device.api.encoder_destroy)(self.handle) };
+        if let Engine::C { device, handle, .. } = &self.engine {
+            unsafe { (device.api.encoder_destroy)(*handle) };
+        }
     }
+}
+
+fn open_rs() -> Result<(pyrowave_rs::Encoder, VulkanDevice, &'static str), String> {
+    if let Some(backend) = forced_backend() {
+        let allow_software = backend == pyrowave_rs::Backend::Vulkan;
+        let inner = pyrowave_rs::Encoder::create(pyrowave_rs::CreateInfo {
+            backend,
+            allow_software,
+        })?;
+        let name = backend_name(backend);
+        let device = report(&inner, name);
+        return Ok((inner, device, name));
+    }
+    let mut errors = Vec::new();
+    let mut software = None;
+    match try_backend(pyrowave_rs::Backend::Vulkan, true) {
+        Ok(inner) => {
+            let device = report(&inner, "vulkan");
+            if !device.cpu {
+                return Ok((inner, device, "vulkan"));
+            }
+            software = Some((inner, device));
+        }
+        Err(error) => errors.push(format!("vulkan: {error}")),
+    }
+    #[cfg(windows)]
+    {
+        match try_backend(pyrowave_rs::Backend::D3d11, false) {
+            Ok(inner) => {
+                let device = report(&inner, "d3d11");
+                return Ok((inner, device, "d3d11"));
+            }
+            Err(error) => errors.push(format!("d3d11: {error}")),
+        }
+    }
+    match try_backend(pyrowave_rs::Backend::OpenGl, false) {
+        Ok(inner) => {
+            let device = report(&inner, "opengl");
+            return Ok((inner, device, "opengl"));
+        }
+        Err(error) => errors.push(format!("opengl: {error}")),
+    }
+    if let Some((inner, device)) = software {
+        return Ok((inner, device, "vulkan"));
+    }
+    match try_backend(pyrowave_rs::Backend::Cpu, false) {
+        Ok(inner) => {
+            let device = report(&inner, "cpu");
+            Ok((inner, device, "cpu"))
+        }
+        Err(error) => Err(format!(
+            "pyrowave-rs ({}; cpu: {error})",
+            errors.join("; ")
+        )),
+    }
+}
+
+fn try_backend(
+    backend: pyrowave_rs::Backend,
+    allow_software: bool,
+) -> Result<pyrowave_rs::Encoder, String> {
+    pyrowave_rs::Encoder::create(pyrowave_rs::CreateInfo {
+        backend,
+        allow_software,
+    })
+}
+
+fn forced_backend() -> Option<pyrowave_rs::Backend> {
+    match std::env::var("ETHERQUIC_PYROWAVE_BACKEND")
+        .ok()
+        .as_deref()
+    {
+        Some("cpu") => Some(pyrowave_rs::Backend::Cpu),
+        Some("vulkan") => Some(pyrowave_rs::Backend::Vulkan),
+        Some("d3d11") => Some(pyrowave_rs::Backend::D3d11),
+        Some("opengl") => Some(pyrowave_rs::Backend::OpenGl),
+        _ => None,
+    }
+}
+
+fn backend_name(backend: pyrowave_rs::Backend) -> &'static str {
+    match backend {
+        pyrowave_rs::Backend::Cpu => "cpu",
+        pyrowave_rs::Backend::D3d11 => "d3d11",
+        pyrowave_rs::Backend::OpenGl => "opengl",
+        pyrowave_rs::Backend::Vulkan => "vulkan",
+    }
+}
+
+fn report(enc: &pyrowave_rs::Encoder, backend: &str) -> VulkanDevice {
+    let name = if enc.device_name.is_empty() {
+        backend.to_string()
+    } else {
+        enc.device_name.clone()
+    };
+    let cpu = backend == "cpu" || cpu_driver_name(&name);
+    VulkanDevice { name, cpu }
+}
+
+fn encode_rs(
+    inner: &mut pyrowave_rs::Encoder,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: usize,
+    height: usize,
+    format: YuvFormat,
+    frame_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let chroma = match format.chroma {
+        YuvChroma::Yuv420 => pyrowave_rs::Chroma::Yuv420,
+        YuvChroma::Yuv422 | YuvChroma::Yuv444 => pyrowave_rs::Chroma::Yuv444,
+    };
+    let target = u32::try_from(frame_bytes).unwrap_or(u32::MAX);
+    inner.encode_target(
+        &pyrowave_rs::YuvFrame {
+            width: width as u32,
+            height: height as u32,
+            chroma,
+            y,
+            u,
+            v,
+        },
+        target,
+    )?;
+    let mut bitstream = vec![0u8; frame_bytes.saturating_add(64 * 1024)];
+    let packets = inner.packetize(PACKET_BOUNDARY, &mut bitstream)?;
+    record_from_slices(&bitstream, &packets[..])
+}
+
+fn encode_c(
+    device: &Device,
+    handle: Handle,
+    bitstream: &mut [u8],
+    packets: &mut Vec<Packet>,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    width: usize,
+    height: usize,
+    format: YuvFormat,
+    frame_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let api = &device.api;
+    let buffer = packed_buffer(y, u, v, width, height, format);
+    let rate = RateControl {
+        maximum_bitstream_size: frame_bytes,
+    };
+    check(
+        unsafe { (api.encode_cpu)(handle, &buffer, &rate) },
+        "encode",
+    )?;
+    let mut count = 0usize;
+    check(
+        unsafe { (api.num_packets)(handle, PACKET_BOUNDARY, &mut count) },
+        "packet count",
+    )?;
+    packets.resize(count.max(1), Packet::default());
+    let mut written = 0usize;
+    check(
+        unsafe {
+            (api.packetize)(
+                handle,
+                packets.as_mut_ptr(),
+                PACKET_BOUNDARY,
+                &mut written,
+                bitstream.as_mut_ptr().cast(),
+                bitstream.len(),
+            )
+        },
+        "packetize",
+    )?;
+    let packets = &packets[..written.min(packets.len())];
+    let total: usize = packets.iter().map(|p| p.size + 4).sum();
+    let mut out = Vec::with_capacity(4 + total);
+    out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+    for packet in packets {
+        let end = packet.offset + packet.size;
+        if end > bitstream.len() {
+            return Err("pyrowave packet outside the bitstream".into());
+        }
+        out.extend_from_slice(&(packet.size as u32).to_le_bytes());
+        out.extend_from_slice(&bitstream[packet.offset..end]);
+    }
+    Ok(out)
+}
+
+fn record_from_slices(bitstream: &[u8], packets: &[pyrowave_rs::Packet]) -> Result<Vec<u8>, String> {
+    let total: usize = packets.iter().map(|p| p.size + 4).sum();
+    let mut out = Vec::with_capacity(4 + total);
+    out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+    for packet in packets {
+        let end = packet.offset + packet.size;
+        if end > bitstream.len() {
+            return Err("pyrowave packet outside the bitstream".into());
+        }
+        out.extend_from_slice(&(packet.size as u32).to_le_bytes());
+        out.extend_from_slice(&bitstream[packet.offset..end]);
+    }
+    Ok(out)
 }
 
 /// One decoder for one picture size.

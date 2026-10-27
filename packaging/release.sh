@@ -104,15 +104,20 @@ if [ "$linux_only" -eq 0 ]; then
     if scp -o BatchMode=yes -o ConnectTimeout=25 -o ProxyJump="$hop" \
         "$src_tar" "$mac:/tmp/etherquic-$version-src.tar.gz"
     then
-        ssh -o BatchMode=yes -o ConnectTimeout=25 -o ServerAliveInterval=30 \
+        if ssh -o BatchMode=yes -o ConnectTimeout=25 -o ServerAliveInterval=30 \
             -J "$hop" "$mac" \
             "mkdir -p $mac_dir && tar -C $mac_dir -xzf /tmp/etherquic-$version-src.tar.gz && VERSION=$version $mac_dir/packaging/macos/make-pkg.sh"
-        scp -o BatchMode=yes -o ConnectTimeout=25 -o ProxyJump="$hop" \
-            "$mac:$mac_dir/dist/macos/etherquic-$version-macos-arm64.dmg" \
-            "$mac:$mac_dir/dist/macos/etherquic-$version-macos-arm64.pkg" \
-            "$dist/"
-        mac_dmg=$dist/etherquic-$version-macos-arm64.dmg
-        mac_pkg=$dist/etherquic-$version-macos-arm64.pkg
+        then
+            scp -o BatchMode=yes -o ConnectTimeout=25 -o ProxyJump="$hop" \
+                "$mac:$mac_dir/dist/macos/etherquic-$version-macos-arm64.dmg" \
+                "$mac:$mac_dir/dist/macos/etherquic-$version-macos-arm64.pkg" \
+                "$dist/" \
+                && mac_dmg=$dist/etherquic-$version-macos-arm64.dmg \
+                && mac_pkg=$dist/etherquic-$version-macos-arm64.pkg \
+                || echo "macOS package copy failed; continuing without it" >&2
+        else
+            echo "macOS build failed; continuing without it" >&2
+        fi
     else
         echo "macOS build skipped (host did not answer)" >&2
     fi

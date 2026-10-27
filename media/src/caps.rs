@@ -53,26 +53,29 @@ fn run_probe() -> Probe {
         pyrowave::Encoder::new(256, 144, 32 * 1024, crate::negotiate::YuvFormat::YUV420P8)
             .and_then(|mut enc| {
                 let record = enc.encode(&test_frame(256, 144))?;
-                Ok((record, enc.vulkan_device()))
+                Ok((record, enc.vulkan_device(), enc.backend()))
             });
-    // Hardware Vulkan wins. D3D11 is only for a failed encode or a CPU device.
-    // An unknown device type is counted as a GPU, same as the row above.
+    // Hardware Vulkan wins inside Encoder::new. The Direct3D 11 DLL is only
+    // for a failed encode or a CPU / lavapipe device. An unknown device type
+    // is counted as a GPU, same as the row above.
     let try_d3d11 = match &encoded {
         Err(_) => true,
-        Ok((_, device)) => device.as_ref().is_some_and(|d| d.cpu),
+        Ok((_, device, backend)) => {
+            *backend == "cpu" || device.as_ref().is_some_and(|d| d.cpu)
+        }
     };
     match encoded {
-        Ok((record, device)) => {
+        Ok((record, device, backend)) => {
             let cpu = device.as_ref().is_some_and(|d| d.cpu);
             match &device {
                 Some(d) => probe.notes.push(format!(
-                    "pyrowave vulkan: {} ({})",
+                    "pyrowave {backend}: {} ({})",
                     d.name,
                     if d.cpu { "CPU" } else { "GPU" }
                 )),
-                None => probe
-                    .notes
-                    .push("pyrowave vulkan: device type unknown, counted as GPU".into()),
+                None => probe.notes.push(format!(
+                    "pyrowave {backend}: device type unknown, counted as GPU"
+                )),
             }
             probe.caps.video.push(EncodeCap {
                 video: if cpu {

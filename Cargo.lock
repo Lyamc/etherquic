@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "etherquic"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "aes-gcm",
  "avb",
@@ -2238,6 +2238,7 @@ dependencies = [
  "jpeg-encoder",
  "libloading",
  "openjpeg2-pure-rs",
+ "pyrowave-rs",
  "quinn",
  "tokio",
  "zune-core 0.4.12",
@@ -6047,6 +6048,11 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "pyrowave-rs"
+version = "0.1.0"
+source = "git+https://github.com/Lyamc/pyrowave-rs.git?rev=3fe00a7430a1b5451d2d3c4ec941755e86efb397#3fe00a7430a1b5451d2d3c4ec941755e86efb397"
 
 [[package]]
 name = "qoi"

@@ -1,8 +1,9 @@
 //! Encoders and decoders for a negotiated etherquic session.
 //!
-//! Every codec here is real end to end: PyroWave through `libpyrowave-shared`
-//! (CPU buffers in and out, Vulkan compute inside) or, on Windows without a
-//! hardware Vulkan device, `pyrowave_d3d11.dll`, Opus through libopus,
+//! Every codec here is real end to end: PyroWave encode through `pyrowave-rs`
+//! (Vulkan, Direct3D 11, OpenGL, or CPU) and decode through `libpyrowave-shared`.
+//! On Windows, if that encode stays on a CPU device, `pyrowave_d3d11.dll` is
+//! still offered. Opus goes through libopus,
 //! H.264, H.265, AV1, OpenAPV, and JPEG XS through an `ffmpeg` child process,
 //! and MJPEG, MJ2K and PCM in Rust. [`caps`] runs a test encode or decode before a codec is offered,
 //! so nothing is advertised that cannot run on this computer.
