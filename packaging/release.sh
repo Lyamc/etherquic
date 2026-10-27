@@ -73,7 +73,8 @@ mac_dir=${MAC_DIR:-/Users/claire/Build/etherquic}
 
 echo "version $version tag $tag"
 
-"$here/linux/make-tarball.sh" "$dist"
+# pkg-config, EGL, and libpyrowave-shared come from the dev shell.
+nix-shell "$root/nix/shell.nix" --run "$here/linux/make-tarball.sh \"$dist\""
 linux=$dist/etherquic-$version-x86_64-linux.tar.gz
 
 win_msi=
