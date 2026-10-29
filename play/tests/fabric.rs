@@ -199,7 +199,7 @@ async fn spawn_desk(pipes: Option<(Pipes, Pipes)>) -> Result<Desk, Box<dyn std::
         let conn = connecting.await.map_err(|error| error.to_string())?;
         let media = player_media(offer, shown_tx);
         let result = if let Some(pipes) = player_pipes {
-            play_session(conn, media, heard_tx, player_input_rx, None, pipes).await
+            play_session(conn, media, heard_tx, player_input_rx, None, pipes, None).await
         } else {
             play(conn, media, heard_tx, player_input_rx, None).await
         };

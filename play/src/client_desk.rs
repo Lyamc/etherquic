@@ -584,7 +584,13 @@ async fn connect_player(
         let endpoint = udp_client_endpoint_on(bind)?;
         (endpoint, addr, addr.to_string())
     } else {
-        let net = net.ok_or("no adapter for the L2 dial")?;
+        let net = match net {
+            Some(net) => net,
+            None => {
+                status("no adapter for the L2 dial");
+                return Err("no adapter for the L2 dial".into());
+            }
+        };
         // One discovery burst first. The host answers from its L2 MAC, so a
         // Wi-Fi bridge that has forgotten that MAC learns it again. Without
         // this an idle bridge drops the Initial and the dial times out.
@@ -787,8 +793,10 @@ async fn connect_player(
         events: event_tx,
         live: live_rx,
     };
-    let mut session =
-        tokio::spawn(async move { play_session(conn, media, audio_tx, input, acks, pipes).await });
+    let connect_rtp = connect.rtp;
+    let mut session = tokio::spawn(async move {
+        play_session(conn, media, audio_tx, input, acks, pipes, connect_rtp).await
+    });
     let codec_status = Arc::clone(&status);
     let codec_title = Arc::clone(&title);
     let quiet_stats = connect.trace_input;

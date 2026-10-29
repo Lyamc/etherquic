@@ -414,10 +414,13 @@ pub async fn play(
     input: mpsc::Receiver<Vec<Event>>,
     acks: Option<mpsc::Sender<InputAck>>,
 ) -> Result<(), Error> {
-    play_session(conn, media, audio, input, acks, Pipes::idle()).await
+    play_session(conn, media, audio, input, acks, Pipes::idle(), None).await
 }
 
 /// [`play`] plus file, clipboard, and chat pipes.
+///
+/// `rtp` is the host IP and RTP input already taken from discovery. An L2
+/// QUIC address is not routable, so ST 2110 uses this socket for its essence.
 pub async fn play_session(
     conn: Connection,
     media: PlayerMedia,
@@ -425,6 +428,7 @@ pub async fn play_session(
     input: mpsc::Receiver<Vec<Event>>,
     acks: Option<mpsc::Sender<InputAck>>,
     pipes: Pipes,
+    rtp: Option<std::net::SocketAddr>,
 ) -> Result<(), Error> {
     use etherquic_media::negotiate::{AUDIO2_MAGIC, VIDEO2_MAGIC};
     use etherquic_media::player::{self, PlayerEvent};
@@ -455,7 +459,7 @@ pub async fn play_session(
             )
         ) {
             let remote = conn.remote_address();
-            if let Some(input) = etherquic::carrier::player_host(Some(remote)) {
+            if let Some(input) = etherquic::carrier::media_input(remote, rtp) {
                 let (picture_tx, picture_rx) = mpsc::channel(16);
                 let (audio_tx, audio_rx) = mpsc::channel(16);
                 match offer.carrier {

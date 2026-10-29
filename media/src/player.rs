@@ -318,6 +318,7 @@ pub async fn read_video(
         })
         .map_err(|e| e.to_string())?;
 
+    let mut opened: Option<(Video, u32, u32)> = None;
     let mut stats = Stats::default();
     if !v2 {
         stats.video = Some(Video::Mjpeg);
@@ -405,6 +406,16 @@ pub async fn read_video(
                         {
                             break Err(error);
                         }
+                        // The config is on the reliable stream and copied onto
+                        // RTP. Opening the decoder twice drops the first
+                        // keyframe, and H.264 then stays blank until the next
+                        // GOP. The second copy is the same picture.
+                        if opened == Some((config.video.unwrap_or(Video::Mjpeg), config.width, config.height))
+                            && config.video.is_some()
+                        {
+                            continue;
+                        }
+                        opened = config.video.map(|video| (video, config.width, config.height));
                         etherquic::carrier::pulse_on_later_config(&mut configs, reset.as_ref());
                         on_datagrams = config.carrier.is_some_and(|id| {
                             id == etherquic::carrier::QUIC_DATAGRAMS || id >= etherquic::carrier::UDP_RTP

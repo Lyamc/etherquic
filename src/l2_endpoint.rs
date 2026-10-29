@@ -37,6 +37,10 @@ pub struct L2Net {
     l2_backend: u8,
     hw_mac: Option<Mac>,
     adapter: Option<String>,
+    /// Deliver a copy into this process before the NIC. Two sockets on one
+    /// adapter then see each other when the NIC does not hairpin, and
+    /// [`deliver_raw`] drops the echo of a MAC this fabric already owns.
+    reflect_local: bool,
 }
 
 impl L2Net {
@@ -95,6 +99,7 @@ impl L2Net {
             l2_backend,
             hw_mac,
             adapter,
+            reflect_local: true,
         }))
     }
 
@@ -125,6 +130,7 @@ impl L2Net {
             l2_backend: 0,
             hw_mac: None,
             adapter: None,
+            reflect_local: false,
         })
     }
 
@@ -274,6 +280,10 @@ fn deliver_raw(fabric: &Fabric, ethertype: u16, raw: &[u8]) {
     if let Ok(frame) = Frame::decode_filtered(raw, ethertype) {
         // Announcements share this EtherType. They are not QUIC datagrams.
         if !crate::discover::is_discovery(&frame) {
+            // L2Sender already handed this transmit to a local socket.
+            if fabric.owns(frame.src) {
+                return;
+            }
             fabric.inject(frame);
         }
     }
@@ -669,6 +679,9 @@ impl L2Sender {
             src_service: self.service_id,
             payload: transmit.contents.to_vec(),
         };
+        if self.net.reflect_local {
+            self.net.fabric.inject(frame.clone());
+        }
         let bytes = frame.encode();
         self.net.enqueue(bytes)
     }

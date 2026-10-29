@@ -690,6 +690,10 @@ struct LaneSend {
     lost_base: u64,
     tap: Option<mpsc::UnboundedSender<Vec<u8>>>,
     capture_origin: Option<Instant>,
+    /// ST 2110 drops a capture that jumps more than one 60 fps slot. The
+    /// live source is often slower than that. This stamp steps one slot at
+    /// a time so each new frame is sent, instead of only the first burst.
+    st_capture: Duration,
 }
 
 fn capture_at(lane: &mut LaneSend) -> Duration {
@@ -700,6 +704,18 @@ fn capture_at(lane: &mut LaneSend) -> Duration {
             Duration::ZERO
         }
     }
+}
+
+/// Capture stamp passed into the seam. ST 2110 treats a gap past one 16 ms
+/// frame as a frame that missed its slot and then drops every later frame.
+/// Step 10 ms so a 15 fps source stays inside that window.
+fn seam_time(lane: &mut LaneSend) -> Duration {
+    if lane.seam.id() == etherquic::carrier::ST2110 {
+        let now = lane.st_capture;
+        lane.st_capture = lane.st_capture.saturating_add(Duration::from_millis(10));
+        return now;
+    }
+    capture_at(lane)
 }
 
 /// Host settings for one session.
@@ -811,6 +827,7 @@ pub async fn run_shared(
         lost_base: 0,
         tap: options.carrier_tap.clone(),
         capture_origin: None,
+        st_capture: Duration::ZERO,
     };
     let audio_lane = LaneSend {
         send: audio_send,
@@ -827,6 +844,7 @@ pub async fn run_shared(
         lost_base: 0,
         tap: options.carrier_tap.clone(),
         capture_origin: None,
+        st_capture: Duration::ZERO,
     };
     let keyframes = shared.keyframes.clone();
     let owned_hub = shared
@@ -977,7 +995,7 @@ async fn write_out(lane: &mut LaneSend, out: VideoOut) -> Result<(), String> {
             // The config record is on the reliable stream before any picture.
             wire::write_record(&mut lane.send, VIDEO2_MAGIC, &bytes).await?;
             if lane.seam.id() >= etherquic::carrier::UDP_RTP {
-                let capture = capture_at(lane);
+                let capture = seam_time(lane);
                 let _ = lane
                     .seam
                     .send(etherquic::carrier::Lane::Picture, &bytes, None, capture);
@@ -1035,7 +1053,7 @@ async fn send_clock(
         let mut body = Vec::with_capacity(1 + payload.len());
         body.push(RECORD_CLOCK);
         body.extend_from_slice(&payload);
-        let capture = capture_at(lane);
+        let capture = seam_time(lane);
         let _ = lane.seam.send(which, &body, None, capture);
         flush_tap(lane);
         return Ok(());
@@ -1050,7 +1068,7 @@ fn send_seam(lane: &mut LaneSend, kind: u8, payload: &[u8]) -> Result<(), String
     let mut body = Vec::with_capacity(1 + payload.len());
     body.push(kind);
     body.extend_from_slice(payload);
-    let capture = capture_at(lane);
+    let capture = seam_time(lane);
     let _ = lane
         .seam
         .send(etherquic::carrier::Lane::Picture, &body, None, capture);
@@ -1289,6 +1307,18 @@ fn video_pump(
                 if out.is_closed() {
                     return;
                 }
+                let carrier = offer
+                    .as_ref()
+                    .and_then(|row| row.carrier)
+                    .unwrap_or(etherquic::carrier::QUIC_STREAMS);
+                // The first encoded frame is the keyframe. Sending it before
+                // the player hello has a peer drops it, and ST 2110 then
+                // treats every later frame as late. Wait, then encode.
+                if carrier >= etherquic::carrier::UDP_RTP && !etherquic::carrier::rtp_media_ready()
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 // Start the period here. Stamping after push returns adds a
                 // full period on top of a codec that already finished.
                 last_encode = Some(Instant::now());
@@ -1403,11 +1433,7 @@ fn video_pump(
                                 etherquic::carrier::prepare_announce(picture_ok, opus && !pcm);
                             }
                             let requested = offer.as_ref().and_then(|row| row.carrier);
-                            match etherquic::carrier::agree(
-                                true,
-                                requested,
-                                &etherquic::carrier::local_carriers(0),
-                            ) {
+                            match agreed_carrier(requested) {
                                 Ok(id) => config.carrier = Some(id),
                                 Err(error) => {
                                     log(&error);
@@ -1611,6 +1637,15 @@ fn encode_period(wish: FpsWish, hardware: bool, display_hz: Option<u32>) -> Opti
     }
 }
 
+fn agreed_carrier(requested: Option<u8>) -> Result<u8, String> {
+    etherquic::carrier::honor_explicit_carrier(requested);
+    etherquic::carrier::agree(
+        true,
+        requested,
+        &etherquic::carrier::local_carriers(0),
+    )
+}
+
 /// ST 2110-30 carries L16 samples. Opus on that carrier is decoded as if it
 /// were those samples, which is full-scale noise on a silent desktop.
 fn audio_choice_for_carrier(carrier: Option<u8>, mut pick: Choice<Audio>) -> Choice<Audio> {
@@ -1689,11 +1724,7 @@ async fn audio_loop(
                             etherquic::carrier::prepare_announce(picture_ok, opus && !pcm);
                         }
                         let requested = offer.as_ref().and_then(|row| row.carrier);
-                        match etherquic::carrier::agree(
-                            true,
-                            requested,
-                            &etherquic::carrier::local_carriers(0),
-                        ) {
+                        match agreed_carrier(requested) {
                             Ok(id) => config.carrier = Some(id),
                             Err(error) => {
                                 log(&error);
@@ -1767,7 +1798,7 @@ async fn audio_loop(
                         let mut body = Vec::with_capacity(1 + packet.len());
                         body.push(RECORD_DATA);
                         body.extend_from_slice(&packet);
-                        let capture = capture_at(&mut lane);
+                        let capture = seam_time(&mut lane);
                         let _ = lane.seam.send(
                             etherquic::carrier::Lane::Audio,
                             &body,

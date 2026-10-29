@@ -374,18 +374,20 @@ pub fn spawn_player_avb(
     picture: tokio::sync::mpsc::Sender<Vec<u8>>,
     audio: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
+    // The socket is the listener. Note it before the hello so the first
+    // picture is not dropped while `try_reserve` still sees no listener.
+    ::avb::note_listener(true);
     std::thread::spawn(move || {
-        let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        let Some(sock) = rtp::bind_unspecified(host_input) else {
             return;
         };
-        rtp::widen_udp(&sock);
         let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
         let Ok(addr) = sock.local_addr() else {
             return;
         };
         let mut hello = b"AVB".to_vec();
         hello.extend(addr.port().to_le_bytes());
-        let _ = sock.send_to(&hello, host_input);
+        let _ = rtp::udp_send(&sock, &hello, host_input);
         let mut pictures = Assembler::new();
         let mut audios = Assembler::new();
         let mut buf = [0u8; 2048];
@@ -473,7 +475,7 @@ impl StAudio {
 fn st_open(gcm: &mut Option<rtp::GcmSession>, packet: &[u8]) -> Option<(bool, Vec<u8>)> {
     let (header, sealed) = RtpHeader::decode(packet)?;
     let payload = match gcm.as_mut() {
-        Some(session) => session.open(header.ssrc, 0, header.sequence, sealed).ok()?,
+        Some(session) => session.open_next(header.ssrc, header.sequence, sealed).ok()?,
         None => sealed.to_vec(),
     };
     Some((header.marker, payload))
@@ -486,14 +488,12 @@ pub fn spawn_player_st2110(
     audio: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     std::thread::spawn(move || {
-        let Ok(picture_sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        let Some(picture_sock) = rtp::bind_unspecified(host_input) else {
             return;
         };
-        let Ok(audio_sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        let Some(audio_sock) = rtp::bind_unspecified(host_input) else {
             return;
         };
-        rtp::widen_udp(&picture_sock);
-        rtp::widen_udp(&audio_sock);
         let _ = picture_sock.set_read_timeout(Some(Duration::from_millis(50)));
         let _ = audio_sock.set_read_timeout(Some(Duration::from_millis(50)));
         let Ok(picture_addr) = picture_sock.local_addr() else {
@@ -507,8 +507,11 @@ pub fn spawn_player_st2110(
         hello.extend(audio_addr.port().to_le_bytes());
         let gcm_on = super::gates().st_gcm;
         hello.push(if gcm_on { b'G' } else { b'P' });
-        let _ = picture_sock.send_to(&hello, host_input);
-        let key = gcm_on.then(|| rtp::hub_exchanged_key().unwrap_or_else(rtp::session_key));
+        let mut last_hello: Option<Instant> = None;
+        let mut heard = false;
+        // Same key `seal_st` uses. The RTP hub key is the UDP OFFER exchange
+        // and is not this carrier's key.
+        let key = gcm_on.then(rtp::session_key);
         // Audio has its own thread. One loop that only read the audio socket
         // after a 50 ms picture timeout never read it while pictures flowed.
         if let Ok(audio_sock) = audio_sock.try_clone() {
@@ -542,6 +545,17 @@ pub fn spawn_player_st2110(
         let mut frame_counter: Option<u8> = None;
         let mut buf = [0u8; 2048];
         while !picture.is_closed() {
+            // Keep saying hello until a picture arrives. One second of
+            // hellos used to end before the host had a peer, and every
+            // later packet was dropped on the floor.
+            let due = !heard
+                && last_hello
+                    .map(|sent| sent.elapsed() >= Duration::from_millis(20))
+                    .unwrap_or(true);
+            if due {
+                let _ = rtp::udp_send(&picture_sock, &hello, host_input);
+                last_hello = Some(Instant::now());
+            }
             let Ok((n, _)) = picture_sock.recv_from(&mut buf) else {
                 continue;
             };
@@ -551,6 +565,7 @@ pub fn spawn_player_st2110(
             let Some(fields) = st2110::xs_fields(&payload) else {
                 continue;
             };
+            heard = true;
             if !fields.t && !fields.k {
                 continue;
             }
@@ -582,7 +597,8 @@ pub fn spawn_player_st2110(
             if fields.l || last {
                 next_index = None;
                 frame_counter = None;
-                if picture.blocking_send(std::mem::take(&mut parts)).is_err() {
+                let record = std::mem::take(&mut parts);
+                if picture.blocking_send(record).is_err() {
                     return;
                 }
             }

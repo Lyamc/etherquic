@@ -55,9 +55,10 @@ fn run_probe() -> Probe {
                 let record = enc.encode(&test_frame(256, 144))?;
                 Ok((record, enc.vulkan_device(), enc.backend()))
             });
-    // Hardware Vulkan wins inside Encoder::new. The Direct3D 11 DLL is only
-    // for a failed encode or a CPU / lavapipe device. An unknown device type
-    // is counted as a GPU, same as the row above.
+    // Hardware Vulkan wins inside Encoder::new. On Windows the Direct3D 11
+    // DLL is the GPU row when Vulkan is a CPU device: pyrowave-rs D3D11
+    // readbacks every wavelet level and packs on the CPU. An unknown device
+    // type is counted as a GPU, same as the row above.
     let try_d3d11 = match &encoded {
         Err(_) => true,
         Ok((_, device, backend)) => {

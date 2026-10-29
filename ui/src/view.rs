@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     active_layer, apply_override, audio_for, audio_hint, audio_layout_name, audio_match_line,
+    carrier_enabled,
     backend_hint, backend_label, backend_line, capture_rate, codec_table_text, dial_target,
     format_mac, lanes, list_nics, listed_top, load_connections, load_preferences, local_codec_rows,
     mac_key, qr_grid, remote_backend_line, remote_hardware_line, scale_audio_kbps,
@@ -1370,8 +1371,14 @@ impl Desk {
             }
         };
         let (l2_offer, rtp) = self.carrier_dial(udp, device.as_ref());
-        // Carriers 1 and 2 still need the raw dial. Carriers 3–5 offer on the
-        // scanned RTP socket and do not open a QUIC or Ethernet socket.
+        if let Some(why) = self.carrier_block(layer, rtp) {
+            self.message = Some(why.into());
+            cx.notify();
+            return;
+        }
+        // Carriers 1 and 2 still need the raw dial. UDP/RTP and AVB on L2 offer
+        // on the scanned RTP socket and do not open a QUIC or Ethernet socket.
+        // ST 2110 keeps the L2 dial and sends essence to `rtp`.
         if udp.is_none() && !l2_offer {
             if let Some(why) = etherquic::l2_unavailable_reason() {
                 self.message = Some(why.into());
@@ -2348,6 +2355,38 @@ impl Desk {
         format!("{path} · {}", self.carrier_summary())
     }
 
+    /// The layer the Connect card is showing for the typed host.
+    fn connect_layer(&self) -> Layer {
+        let (v4, v6) = self
+            .peer
+            .parse()
+            .and_then(|mac| {
+                let board = self.scan.board();
+                board
+                    .devices
+                    .iter()
+                    .find(|device| device.l2_mac == mac)
+                    .map(|device| (device.ipv4.clone(), device.ipv6.clone()))
+            })
+            .unwrap_or_default();
+        active_layer(self.layer, &v4, &v6)
+    }
+
+    /// UDP/RTP on L2 is not dialed. ST 2110 on L2 still needs a discovered host IP.
+    fn carrier_block(&self, layer: Layer, rtp: Option<std::net::SocketAddr>) -> Option<&'static str> {
+        let carrier = self.selected_carrier();
+        if !carrier_enabled(layer, carrier) {
+            return Some("UDP/RTP needs an IPv4 or IPv6 layer.");
+        }
+        if matches!(layer, Layer::L2)
+            && carrier == etherquic::carrier::ST2110
+            && rtp.is_none()
+        {
+            return Some("ST 2110 needs the host IP from discovery.");
+        }
+        None
+    }
+
     fn selected_carrier(&self) -> u8 {
         self.peer
             .parse()
@@ -2377,7 +2416,11 @@ impl Desk {
     }
 
     fn carrier_summary(&self) -> String {
-        etherquic::carrier::connect_row_now(self.selected_carrier())
+        let carrier = self.selected_carrier();
+        if !carrier_enabled(self.connect_layer(), carrier) {
+            return "UDP/RTP needs an IPv4 or IPv6 layer.".into();
+        }
+        etherquic::carrier::connect_row_now(carrier)
     }
 
     fn path_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2463,6 +2506,7 @@ impl Desk {
 
     fn carrier_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected_carrier();
+        let layer = self.connect_layer();
         let choices = [
             ("carrier-quic", "QUIC streams", etherquic::carrier::QUIC_STREAMS),
             (
@@ -2482,13 +2526,20 @@ impl Desk {
             .w_full()
             .min_w_0();
         for (id, label, value) in choices {
+            let enabled = carrier_enabled(layer, value);
+            let why = (!enabled).then_some("UDP/RTP needs an IPv4 or IPv6 layer.");
             chips = chips.child(path_chip(
                 id,
                 label,
-                selected == value,
-                true,
-                None,
+                selected == value && enabled,
+                enabled,
+                why,
                 cx.listener(move |desk, _, _, cx| {
+                    if !enabled {
+                        desk.message = Some("UDP/RTP needs an IPv4 or IPv6 layer.".into());
+                        cx.notify();
+                        return;
+                    }
                     if let Some(mac) = desk.peer.parse() {
                         desk.edit_connection(mac, |over| over.carrier = Some(value));
                     } else {
@@ -2537,16 +2588,24 @@ impl Desk {
                 .gap_2()
                 .w_full()
                 .min_w_0();
-            for (id, label, on, plain) in [
-                ("profile-plain", "Plain", plain_on, true),
-                ("profile-gcm", "GCM", !plain_on, false),
+            for (id, label, on, plain, why) in [
+                ("profile-plain", "Plain", plain_on, true, None),
+                (
+                    "profile-gcm",
+                    "GCM",
+                    !plain_on,
+                    false,
+                    Some(
+                        "Galois/Counter Mode. AES-GCM authenticates and encrypts the RTP payload.",
+                    ),
+                ),
             ] {
                 profiles = profiles.child(path_chip(
                     id,
                     label,
                     on,
                     true,
-                    None,
+                    why,
                     cx.listener(move |desk, _, _, cx| {
                         if let Some(mac) = desk.peer.parse() {
                             desk.edit_connection(mac, |over| {

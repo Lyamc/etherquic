@@ -107,6 +107,13 @@ pub fn active_layer(choice: Layer, v4: &[Ipv4Addr], v6: &[Ipv6Addr]) -> Layer {
     }
 }
 
+/// UDP/RTP is an IP carrier. The L2 chip has no UDP socket to dial, so the
+/// Connect card greys it out. ST 2110 still dials: control stays on L2 and the
+/// essence uses the host IP from discovery.
+pub fn carrier_enabled(layer: Layer, carrier: u8) -> bool {
+    !(matches!(layer, Layer::L2) && carrier == etherquic::carrier::UDP_RTP)
+}
+
 /// `port` `0` uses the play service. `scope` is the IPv6 interface index.
 pub fn dial_target(layer: Layer, port: u16, scope: u32) -> DialTarget {
     let port = if port == 0 { PLAY_SERVICE_ID } else { port };
@@ -236,6 +243,14 @@ mod tests {
             dial_target(Layer::V4(v4[0]), 0, 0),
             DialTarget::Udp(SocketAddr::from((v4[0], PLAY_SERVICE_ID)))
         );
+        assert!(!carrier_enabled(Layer::L2, etherquic::carrier::UDP_RTP));
+        assert!(carrier_enabled(Layer::L2, etherquic::carrier::ST2110));
+        assert!(carrier_enabled(Layer::L2, etherquic::carrier::QUIC_STREAMS));
+        assert!(carrier_enabled(Layer::L2, etherquic::carrier::AVB));
+        assert!(carrier_enabled(
+            Layer::V4(v4[0]),
+            etherquic::carrier::UDP_RTP
+        ));
         assert_eq!(dial_target(Layer::V6(v6[0]), 4433, 0), DialTarget::NeedsNic);
         match dial_target(Layer::V6(v6[0]), 4433, 2) {
             DialTarget::Udp(SocketAddr::V6(addr)) => assert_eq!(addr.scope_id(), 2),

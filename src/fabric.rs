@@ -115,6 +115,10 @@ impl Fabric {
         inbox
     }
 
+    pub(crate) fn owns(&self, mac: Mac) -> bool {
+        self.inner.lock().expect("fabric lock").contains_key(&mac)
+    }
+
     pub(crate) fn detach(&self, mac: Mac) {
         let mut map = self.inner.lock().expect("fabric lock");
         map.remove(&mac);

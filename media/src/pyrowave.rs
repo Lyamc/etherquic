@@ -824,22 +824,37 @@ fn open_rs() -> Result<(pyrowave_rs::Encoder, VulkanDevice, &'static str), Strin
         }
         Err(error) => errors.push(format!("vulkan: {error}")),
     }
+    // pyrowave-rs runs only the wavelet on the GPU, then quant, analyze,
+    // resolve, and RDO on one CPU thread, with a readback after every level.
+    // On the HD 6670 that is about one 720p frame per second. The Direct3D 11
+    // DLL keeps those stages on the GPU, so when that DLL is installed the
+    // CPU / lavapipe row stays here and caps.rs adds the DLL as the GPU row.
     #[cfg(windows)]
-    {
-        match try_backend(pyrowave_rs::Backend::D3d11, false) {
-            Ok(inner) => {
-                let device = report(&inner, "d3d11");
-                return Ok((inner, device, "d3d11"));
+    let dll = crate::pyrowave_d3d11::library_candidates()
+        .iter()
+        .any(|path| path.is_file());
+    #[cfg(not(windows))]
+    let dll = false;
+    // Hardware Vulkan already returned above. The DLL is the GPU encoder
+    // only for a missing or CPU Vulkan device.
+    if !use_d3d11_dll(false, dll) {
+        #[cfg(windows)]
+        {
+            match try_backend(pyrowave_rs::Backend::D3d11, false) {
+                Ok(inner) => {
+                    let device = report(&inner, "d3d11");
+                    return Ok((inner, device, "d3d11"));
+                }
+                Err(error) => errors.push(format!("d3d11: {error}")),
             }
-            Err(error) => errors.push(format!("d3d11: {error}")),
         }
-    }
-    match try_backend(pyrowave_rs::Backend::OpenGl, false) {
-        Ok(inner) => {
-            let device = report(&inner, "opengl");
-            return Ok((inner, device, "opengl"));
+        match try_backend(pyrowave_rs::Backend::OpenGl, false) {
+            Ok(inner) => {
+                let device = report(&inner, "opengl");
+                return Ok((inner, device, "opengl"));
+            }
+            Err(error) => errors.push(format!("opengl: {error}")),
         }
-        Err(error) => errors.push(format!("opengl: {error}")),
     }
     if let Some((inner, device)) = software {
         return Ok((inner, device, "vulkan"));
@@ -854,6 +869,12 @@ fn open_rs() -> Result<(pyrowave_rs::Encoder, VulkanDevice, &'static str), Strin
             errors.join("; ")
         )),
     }
+}
+
+/// The installed Direct3D 11 DLL encodes when Vulkan is not a hardware GPU
+/// and that DLL is on disk. A hardware Vulkan device never takes this path.
+fn use_d3d11_dll(hardware_vulkan: bool, dll_installed: bool) -> bool {
+    !hardware_vulkan && dll_installed
 }
 
 fn try_backend(
@@ -1117,6 +1138,19 @@ fn take_u32(rest: &mut &[u8]) -> Result<u32, String> {
 /// 720p desks at quant 0 on a LAN (about 111 Mbit/s at 30 fps).
 pub fn default_frame_bytes(width: u32, height: u32) -> usize {
     (width as usize * height as usize / 2).max(32 * 1024)
+}
+
+#[cfg(test)]
+mod dll_selection_tests {
+    use super::use_d3d11_dll;
+
+    #[test]
+    fn hardware_vulkan_stays_ahead_of_the_d3d11_dll() {
+        assert!(!use_d3d11_dll(true, true));
+        assert!(!use_d3d11_dll(true, false));
+        assert!(use_d3d11_dll(false, true));
+        assert!(!use_d3d11_dll(false, false));
+    }
 }
 
 #[cfg(test)]

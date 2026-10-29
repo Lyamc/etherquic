@@ -1,7 +1,7 @@
 //! UDP/RTP carrier. No Quinn connection. Input is a sibling datagram.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -109,6 +109,50 @@ const RTP_SLICE_BUDGET: usize = 1200;
 /// before the player reads it.
 const MEDIA_UDP_BUFFER: usize = 4 * 1024 * 1024;
 
+/// Send one datagram.
+///
+/// On Windows an unconnected send to an IPv6 address assigned on a NIC is
+/// dropped, including when that address is on this machine. The socket is
+/// connected for the send and then disconnected with `AF_UNSPEC`.
+pub(super) fn udp_send(sock: &UdpSocket, packet: &[u8], peer: SocketAddr) -> std::io::Result<usize> {
+    #[cfg(windows)]
+    if peer.is_ipv6() {
+        return udp_send_ipv6(sock, packet, peer);
+    }
+    sock.send_to(packet, peer)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn udp_send_ipv6(sock: &UdpSocket, packet: &[u8], peer: SocketAddr) -> std::io::Result<usize> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SOCKADDR, SOCKADDR_IN6, connect, send};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let raw = sock.as_raw_socket() as usize;
+    let dest = socket2::SockAddr::from(peer);
+    let rc = unsafe { connect(raw, dest.as_ptr().cast(), dest.len() as i32) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let n = unsafe { send(raw, packet.as_ptr().cast(), packet.len() as i32, 0) };
+    let result = if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    };
+    let unspec = unsafe { std::mem::zeroed::<SOCKADDR_IN6>() };
+    let _ = unsafe {
+        connect(
+            raw,
+            &unspec as *const SOCKADDR_IN6 as *const SOCKADDR,
+            std::mem::size_of::<SOCKADDR_IN6>() as i32,
+        )
+    };
+    result
+}
+
 pub(super) fn widen_udp(sock: &UdpSocket) {
     let borrowed = socket2::SockRef::from(sock);
     let _ = borrowed.set_recv_buffer_size(MEDIA_UDP_BUFFER);
@@ -186,6 +230,8 @@ struct RtpHub {
     base: u16,
     picture: UdpSocket,
     audio: UdpSocket,
+    picture_v6: Option<UdpSocket>,
+    audio_v6: Option<UdpSocket>,
     peer_picture: Mutex<Option<SocketAddr>>,
     peer_audio: Mutex<Option<SocketAddr>>,
     /// Socket the current offer came from. A repeat from that socket is the
@@ -209,6 +255,10 @@ pub(super) fn rtp_owns(port: u16) -> bool {
 
 static RTP_HUB: Mutex<Option<Arc<RtpHub>>> = Mutex::new(None);
 static SEALED: AtomicU64 = AtomicU64::new(0);
+/// Bumped when the UDP sockets are released or replaced. A seam opened
+/// against the previous hub must not keep sending: its packets would land
+/// on the next player's GCM session and close it.
+static MEDIA_EPOCH: AtomicU64 = AtomicU64::new(1);
 /// Carrier id from the player hello. `0` means no hello yet.
 static OFFERED: AtomicU8 = AtomicU8::new(0);
 
@@ -240,11 +290,74 @@ fn note_offered(id: u8) {
     }
 }
 
+pub(super) fn media_epoch() -> u64 {
+    MEDIA_EPOCH.load(Ordering::Acquire)
+}
+
+/// Picture and audio SSRCs. Each seam gets its own, so a packet still in
+/// flight from the previous seam cannot move this player's replay window.
+pub(super) fn fresh_ssrc() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(0xE7C0_0001);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        1
+    } else {
+        n
+    }
+}
+
+/// Held across an epoch bump and across the check-then-send of one packet.
+/// A send that already passed `media_epoch` cannot leave after the bump.
+static EMIT_GATE: Mutex<()> = Mutex::new(());
+
+fn bump_media_epoch() {
+    let _gate = EMIT_GATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    MEDIA_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Send `packet` only while `epoch` is still the hub this seam opened on.
+pub(super) fn emit_if_current(epoch: u64, picture: bool, packet: &[u8]) -> bool {
+    let _gate = EMIT_GATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    if epoch != MEDIA_EPOCH.load(Ordering::Acquire) {
+        return false;
+    }
+    send_udp(picture, packet);
+    true
+}
+
 pub fn release_rtp() {
+    bump_media_epoch();
     OFFERED.store(0, Ordering::Relaxed);
     if let Some(hub) = RTP_HUB.lock().unwrap_or_else(|p| p.into_inner()).take() {
         hub.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// IPv6 sockets beside the IPv4 hub. `None` when this host has no IPv6 stack.
+fn bind_v6_trio(port: u16) -> Option<(UdpSocket, UdpSocket, UdpSocket)> {
+    let picture = bind_v6(port).ok()?;
+    let audio = bind_v6(port.saturating_add(1)).ok()?;
+    let input = bind_v6(port.saturating_add(2)).ok()?;
+    Some((picture, audio, input))
+}
+
+fn bind_v6(port: u16) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(true)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    Ok(socket.into())
+}
+
+/// Player socket in the same family as `host`.
+pub(super) fn bind_unspecified(host: SocketAddr) -> Option<UdpSocket> {
+    let sock = if host.is_ipv6() {
+        bind_v6(0).ok()?
+    } else {
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?
+    };
+    widen_udp(&sock);
+    Some(sock)
 }
 
 /// One bind. A taken port returns without the 50-try wait.
@@ -270,15 +383,28 @@ pub(super) fn listen_once(port: u16) {
     let Ok(input) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port.saturating_add(2))) else {
         return;
     };
+    let (picture_v6, audio_v6, input_v6) = match bind_v6_trio(port) {
+        Some((picture_v6, audio_v6, input_v6)) => {
+            widen_udp(&picture_v6);
+            widen_udp(&audio_v6);
+            widen_udp(&input_v6);
+            let _ = input_v6.set_read_timeout(Some(Duration::from_millis(20)));
+            (Some(picture_v6), Some(audio_v6), Some(input_v6))
+        }
+        None => (None, None, None),
+    };
     widen_udp(&picture);
     widen_udp(&audio);
     widen_udp(&input);
-    let _ = input.set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = input.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = picture.set_nonblocking(true);
+    bump_media_epoch();
     let hub = Arc::new(RtpHub {
         base: port,
         picture,
         audio,
+        picture_v6,
+        audio_v6,
         peer_picture: Mutex::new(None),
         peer_audio: Mutex::new(None),
         offer_from: Mutex::new(None),
@@ -291,7 +417,14 @@ pub(super) fn listen_once(port: u16) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 128];
         while !thread_hub.stop.load(Ordering::Relaxed) {
-            let Ok((n, src)) = input.recv_from(&mut buf) else {
+            let got = if let Ok(packet) = input.recv_from(&mut buf) {
+                Some(packet)
+            } else if let Some(sock) = input_v6.as_ref() {
+                sock.recv_from(&mut buf).ok()
+            } else {
+                None
+            };
+            let Some((n, src)) = got else {
                 poll_rtcp(&thread_hub);
                 continue;
             };
@@ -310,40 +443,40 @@ pub(super) fn listen_once(port: u16) {
                 let audio_port = u16::from_le_bytes([buf[39], buf[40]]);
                 let picture_peer = SocketAddr::new(src.ip(), picture_port);
                 let audio_peer = SocketAddr::new(src.ip(), audio_port);
-                let repeat = {
-                    let from = thread_hub
-                        .offer_from
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    *from == Some(src) && thread_hub.config_sent.load(Ordering::Relaxed)
+                // Every offer gets a config packet. The first send can be
+                // lost, and a later offer from the same socket is the retry.
+                *thread_hub
+                    .peer_picture
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(picture_peer);
+                *thread_hub
+                    .peer_audio
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(audio_peer);
+                *thread_hub
+                    .offer_from
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(src);
+                let host = host_share();
+                let key = derive_aes128(&host.shared(&player_public));
+                *thread_hub.exchanged.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
+                let mut payload = b"CFG".to_vec();
+                payload.extend_from_slice(&host.public);
+                let packet = RtpHeader {
+                    marker: true,
+                    payload_type: PT_PICTURE,
+                    sequence: 0,
+                    timestamp: 0,
+                    ssrc: 1,
+                }
+                .encode(&payload);
+                let cfg_sock = if picture_peer.is_ipv6() {
+                    thread_hub.picture_v6.as_ref()
+                } else {
+                    Some(&thread_hub.picture)
                 };
-                if !repeat {
-                    *thread_hub
-                        .peer_picture
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = Some(picture_peer);
-                    *thread_hub
-                        .peer_audio
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = Some(audio_peer);
-                    *thread_hub
-                        .offer_from
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = Some(src);
-                    let host = host_share();
-                    let key = derive_aes128(&host.shared(&player_public));
-                    *thread_hub.exchanged.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
-                    let mut payload = b"CFG".to_vec();
-                    payload.extend_from_slice(&host.public);
-                    let packet = RtpHeader {
-                        marker: true,
-                        payload_type: PT_PICTURE,
-                        sequence: 0,
-                        timestamp: 0,
-                        ssrc: 1,
-                    }
-                    .encode(&payload);
-                    if thread_hub.picture.send_to(&packet, picture_peer).is_ok() {
+                if let Some(sock) = cfg_sock {
+                    if udp_send(sock, &packet, picture_peer).is_ok() {
                         thread_hub.config_sent.store(true, Ordering::Relaxed);
                     }
                 }
@@ -363,7 +496,14 @@ pub(super) fn listen_once(port: u16) {
             } else if n >= 3 && &buf[..3] == b"KEY" {
                 let seen = thread_hub.key_seen.fetch_add(1, Ordering::Relaxed) + 1;
                 if seen >= 2 {
-                    let _ = input.send_to(b"EAKU", src);
+                    let reply = if src.is_ipv6() {
+                        input_v6.as_ref()
+                    } else {
+                        Some(&input)
+                    };
+                    if let Some(sock) = reply {
+                        let _ = udp_send(sock, b"EAKU", src);
+                    }
                 }
             } else if n >= 3 && (&buf[..3] == b"AVB" || &buf[..3] == b"ST2") {
                 if &buf[..3] == b"AVB" {
@@ -434,8 +574,20 @@ fn send_udp(picture: bool, packet: &[u8]) {
     let Some(peer) = peer else {
         return;
     };
-    let sock = if picture { &hub.picture } else { &hub.audio };
-    let _ = sock.send_to(packet, peer);
+    let sock = if peer.is_ipv6() {
+        if picture {
+            hub.picture_v6.as_ref()
+        } else {
+            hub.audio_v6.as_ref()
+        }
+    } else if picture {
+        Some(&hub.picture)
+    } else {
+        Some(&hub.audio)
+    };
+    if let Some(sock) = sock {
+        let _ = udp_send(sock, packet, peer);
+    }
 }
 
 pub(super) fn hub_config_sent() -> bool {
@@ -444,6 +596,24 @@ pub(super) fn hub_config_sent() -> bool {
         return false;
     };
     hub.config_sent.load(Ordering::Relaxed)
+}
+
+/// True when a UDP/AVB/ST 2110 sender has somewhere to put a packet.
+/// No hub means this process is not on that path, so the caller should not wait.
+pub fn rtp_media_ready() -> bool {
+    let guard = RTP_HUB.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(hub) = guard.as_ref() else {
+        return true;
+    };
+    if hub.stop.load(Ordering::Relaxed) {
+        return true;
+    }
+    let ready = hub
+        .peer_picture
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .is_some();
+    ready
 }
 
 pub(super) fn hub_has_peer() -> bool {
@@ -473,27 +643,25 @@ pub(super) fn emit_packet(picture: bool, packet: &[u8]) {
 }
 
 /// Player side of the live UDP socket. The offer repeats every 20 ms on the
-/// input port until one config RTP packet arrives, or for 1 s. The key is the
-/// X25519 exchange from that offer, not the host public. Keys retry until
-/// `EAKU` or 200 ms. The pointer datagram is sent once.
+/// input port until one config RTP packet arrives, or for 5 s. The first
+/// config datagram can be lost. The key is the X25519 exchange from that
+/// offer, not the host public. Keys retry until `EAKU` or 200 ms. The
+/// pointer datagram is sent once.
 pub fn spawn_player_rtp(
     host_input: SocketAddr,
     picture: tokio::sync::mpsc::Sender<Vec<u8>>,
     audio: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     std::thread::spawn(move || {
-        let Ok(picture_sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        let Some(picture_sock) = bind_unspecified(host_input) else {
             return;
         };
-        let Ok(audio_sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        let Some(audio_sock) = bind_unspecified(host_input) else {
             return;
         };
-        let Ok(input_sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        let Some(input_sock) = bind_unspecified(host_input) else {
             return;
         };
-        widen_udp(&picture_sock);
-        widen_udp(&audio_sock);
-        widen_udp(&input_sock);
         let _ = picture_sock.set_nonblocking(true);
         let _ = audio_sock.set_nonblocking(true);
         let _ = input_sock.set_nonblocking(true);
@@ -517,12 +685,12 @@ pub fn spawn_player_rtp(
         let mut early_picture = Vec::new();
         let mut early_audio = Vec::new();
         let mut buf = [0u8; 2048];
-        while !ready && started.elapsed() < Duration::from_secs(1) {
+        while !ready && started.elapsed() < Duration::from_secs(5) {
             let due = last_offer
                 .map(|last| last.elapsed() >= Duration::from_millis(20))
                 .unwrap_or(true);
             if due {
-                let _ = input_sock.send_to(&offer, host_input);
+                let _ = udp_send(&input_sock, &offer, host_input);
                 last_offer = Some(Instant::now());
             }
             if let Ok((n, _)) = picture_sock.recv_from(&mut buf) {
@@ -595,10 +763,10 @@ pub fn spawn_player_rtp(
                 break;
             }
             if !eaku && Instant::now() < key_end {
-                let _ = input_sock.send_to(b"KEY\x04", host_input);
+                let _ = udp_send(&input_sock, b"KEY\x04", host_input);
             }
             if !pointed {
-                let _ = input_sock.send_to(b"PTR", host_input);
+                let _ = udp_send(&input_sock, b"PTR", host_input);
                 pointed = true;
             }
             if let Ok((n, _)) = input_sock.recv_from(&mut buf) {
@@ -798,10 +966,17 @@ impl GcmSession {
     }
 
     pub fn open(&mut self, ssrc: u32, roc: u32, seq: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
-        self.guard(ssrc, roc, seq)?;
+        if self.closed {
+            return Err("session closed".into());
+        }
+        // Authenticate before the replay window moves. A plaintext or
+        // corrupt packet used to occupy the sequence, so the real packet
+        // looked like a repeated nonce and closed the session.
         let cipher = Aes128Gcm::new_from_slice(&self.key).map_err(|e| e.to_string())?;
         let nonce = Nonce::from(srtp_nonce(ssrc, roc, seq));
-        cipher.decrypt(&nonce, payload).map_err(|e| e.to_string())
+        let plain = cipher.decrypt(&nonce, payload).map_err(|e| e.to_string())?;
+        self.guard(ssrc, roc, seq)?;
+        Ok(plain)
     }
 
     /// Seal with the roll-over counter this session keeps for `ssrc`. The
@@ -973,6 +1148,11 @@ pub struct RtpSession {
     frame: Duration,
     rtcp_loss: Option<f64>,
     last_rtcp: Option<Instant>,
+    /// Hub generation captured when this session was opened. Checked per
+    /// packet so an in-flight frame cannot follow a replaced hub.
+    epoch: u64,
+    pic_ssrc: u32,
+    aud_ssrc: u32,
 }
 
 impl RtpSession {
@@ -996,7 +1176,14 @@ impl RtpSession {
             frame: Duration::from_millis(16),
             rtcp_loss: None,
             last_rtcp: None,
+            epoch: media_epoch(),
+            pic_ssrc: fresh_ssrc(),
+            aud_ssrc: fresh_ssrc(),
         }
+    }
+
+    pub(super) fn bind_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
     }
 
     pub fn set_audio_rate(&mut self, rate: u32) {
@@ -1032,6 +1219,7 @@ impl RtpSession {
         for _ in 0..50 {
             ensure_rtp_listener(base);
             if rtp_owns(base) {
+                self.epoch = media_epoch();
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1135,7 +1323,7 @@ impl RtpSession {
         self.ensure_key();
         let slices = split_record(record_id, bytes, RTP_SLICE_BUDGET);
         let pt = if picture { PT_PICTURE } else { PT_AUDIO };
-        let ssrc = if picture { 11 } else { 22 };
+        let ssrc = if picture { self.pic_ssrc } else { self.aud_ssrc };
         let now = Instant::now();
         let mut got = None;
         for slice in &slices {
@@ -1177,7 +1365,9 @@ impl RtpSession {
                 ssrc,
             }
             .encode(&payload);
-            send_udp(picture, &packet);
+            if !emit_if_current(self.epoch, picture, &packet) {
+                return got;
+            }
             if picture {
                 self.picture.push(packet);
             } else {
@@ -1243,6 +1433,21 @@ mod tests {
         assert_eq!(b.open(7, 0, 1, &sealed).unwrap(), b"picture");
         assert!(a.seal(7, 0, 1, b"again").is_err());
         assert!(a.closed());
+    }
+
+    #[test]
+    fn gcm_ignores_a_corrupt_packet() {
+        let _globals = crate::carrier::test_globals();
+        let mut host = GcmSession::new([9u8; 16]);
+        let mut player = GcmSession::new([9u8; 16]);
+        let sealed = host.seal(11, 0, 1, b"frame").unwrap();
+        let mut garbage = sealed.clone();
+        garbage[0] ^= 0xff;
+        assert!(player.open(11, 0, 1, &garbage).is_err());
+        assert!(!player.closed(), "a failed open must not close the session");
+        assert_eq!(player.open(11, 0, 1, &sealed).unwrap(), b"frame");
+        assert!(player.open(11, 0, 1, &sealed).is_err());
+        assert!(player.closed());
     }
 
     #[test]

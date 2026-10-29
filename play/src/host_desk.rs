@@ -63,6 +63,9 @@ pub fn host_desktop(
     peers: Arc<AtomicUsize>,
     status: Status,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // L2/pcap is already open. Drop CAP_NET_* so Plasma's portal can
+    // Screenshot this process (otherwise /proc/self/root is blocked).
+    etherquic::release_net_capabilities_for_portals();
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(listen(net, host, stop, up, peers, status));
     rt.shutdown_timeout(Duration::from_secs(2));

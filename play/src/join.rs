@@ -57,7 +57,7 @@ pub async fn join_udp(
         }
         _ = until_stop(&stop) => return Err(Error::Closed),
     };
-    let session = play_session(conn, media, audio, input, None, Pipes::idle());
+    let session = play_session(conn, media, audio, input, None, Pipes::idle(), None);
     tokio::select! {
         result = session => result,
         _ = until_stop(&stop) => Err(Error::Closed),

@@ -23,6 +23,8 @@ pub mod fruc;
 #[cfg(windows)]
 pub mod hostinput;
 pub mod l2_endpoint;
+#[cfg(target_os = "linux")]
+mod linux_portal;
 pub mod look;
 #[cfg(target_os = "macos")]
 mod macos_link;
@@ -52,6 +54,14 @@ pub fn note_quic_bind() {
 
 pub fn quic_binds() -> u64 {
     QUIC_BINDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// After the L2/pcap FD is open, drop `CAP_NET_*` and restore dumpable so
+/// xdg-desktop-portal can open `/proc/self/root` and allow Screenshot.
+/// No-op outside Linux. Call once hosting begins; open sockets keep working.
+pub fn release_net_capabilities_for_portals() {
+    #[cfg(target_os = "linux")]
+    linux_portal::release_net_caps();
 }
 
 /// 6-byte Ethernet MAC address.

@@ -7,6 +7,7 @@
 
 mod assemble;
 mod avb;
+mod matrix;
 mod quic;
 mod rtp;
 mod session;
@@ -36,12 +37,16 @@ pub fn apply_agreed_carrier(conn: &quinn::Connection, mode: u8) {
     }
 }
 pub use rtp::{
-    derive_aes128, offered_carrier, release_rtp, rtp_sealed, spawn_player_rtp, srtp_nonce,
+    derive_aes128, offered_carrier, release_rtp, rtp_media_ready, rtp_sealed, spawn_player_rtp,
+    srtp_nonce,
     GcmSession, KeyInbox, KeyPump, KeyShare, RtpHeader, RtpSession, PROFILE_GCM, PROFILE_PLAIN,
 };
 pub use session::{
     complete_session, host_push, open_carrier_player, play_on_carrier, prepare_host,
     spawn_player_avb, spawn_player_st2110, SessionReport, StAudio,
+};
+pub use matrix::{
+    matrix_label, matrix_sessions, MatrixCell, MatrixLayer, MatrixProfile, MatrixSession,
 };
 pub use st2110::{
     packetize_jpeg_xs, packetize_rfc4175, XsAssembler, XsPacket, RFC4175_HEIGHT, RFC4175_WIDTH,
@@ -312,6 +317,11 @@ pub fn rtp_socket(ip: Option<IpAddr>, rtp_port: u16, quic_port: u16) -> Option<S
 /// The flag is true when the dial is not a QUIC address, so the scanned offer
 /// is the only RTP target. The socket is the host IP and [`crate::discover::Found::rtp_port`].
 /// A missing port stays `None` and does not fall through to the local `rtp=` line.
+///
+/// ST 2110 is the exception. Its essence is still that scanned UDP socket, but
+/// the desktop control session stays on the L2 QUIC dial, so the flag is false
+/// and the NIC is opened. UDP/RTP on L2 is not a desktop session: the Connect
+/// card greys that chip out instead of dialing it.
 pub fn l2_media_target(
     carrier: u8,
     udp: Option<SocketAddr>,
@@ -319,10 +329,26 @@ pub fn l2_media_target(
     rtp_port: u16,
     quic_port: u16,
 ) -> (bool, Option<SocketAddr>) {
+    if carrier == ST2110 && udp.is_none() {
+        return (false, rtp_socket(host_ip, rtp_port, quic_port));
+    }
     if carrier < UDP_RTP || udp.is_some() {
         return (false, None);
     }
     (true, rtp_socket(host_ip, rtp_port, quic_port))
+}
+
+/// Where picture and audio for carriers 3–5 are offered.
+///
+/// A QUIC path that Quinn minted from a MAC is not a routable IP, so discovery
+/// on that address cannot name the RTP input. The scanned host socket is the
+/// target. A real IPv4 or IPv6 dial still asks the host.
+pub fn media_input(remote: SocketAddr, scanned: Option<SocketAddr>) -> Option<SocketAddr> {
+    let scanned = scanned.filter(|addr| addr.port() != 0);
+    if crate::socket_addr_to_peer(remote).is_some() {
+        return scanned;
+    }
+    player_host(Some(remote)).or(scanned)
 }
 
 /// Where the player sends the carrier hello.
@@ -421,6 +447,23 @@ pub fn choose_st_gcm(on: bool) {
 pub fn choose_profile(udp_plain: bool, st_gcm: bool) {
     choose_udp_plain(udp_plain);
     choose_st_gcm(st_gcm);
+}
+
+/// An explicit Connect choice is a carrier this session will open.
+///
+/// AVB stays off until a session asks for it. ST 2110's 10 Gb/s and JPEG XS
+/// gates describe uncompressed essence. MJPEG, PyroWave, and H.264 are already
+/// packetized on that seam, including on a 1 Gb/s NIC, so an explicit ST 2110
+/// request opens the gate instead of failing `agree`.
+pub fn honor_explicit_carrier(requested: Option<u8>) {
+    match requested {
+        Some(AVB) => set_avb_enabled(true),
+        Some(ST2110) => {
+            let current = gates();
+            set_st2110_enabled(true, true, current.nic_mbps.max(1_000), true);
+        }
+        _ => {}
+    }
 }
 
 pub fn set_audio_opus(on: bool) {
@@ -885,6 +928,24 @@ pub struct Seam {
     picture_pacer: Pacer,
     audio_pacer: Pacer,
     frame_due: Option<Duration>,
+    /// Next RTP sequence for ST 2110 picture packets. A new frame used to
+    /// start again at 0. The player keeps one GCM session, and a repeated
+    /// sequence is a repeated nonce, which closes that session. The config
+    /// record is the first frame, so the picture that follows never opens.
+    st_pic_seq: u16,
+    st_pic_ts: u32,
+    st_frame: u8,
+    st_aud_seq: u16,
+    /// Picture and audio SSRCs for this seam. A leftover packet from the
+    /// previous seam must not advance this player's replay window.
+    st_pic_ssrc: u32,
+    st_aud_ssrc: u32,
+    /// One session for every ST 2110 packet this seam seals. The roll-over
+    /// counter has to survive from one frame to the next.
+    st_gcm: Option<rtp::GcmSession>,
+    /// [`rtp::media_epoch`] at [`Seam::open`]. A later hub belongs to the
+    /// next session.
+    epoch: u64,
 }
 
 impl Seam {
@@ -902,6 +963,8 @@ impl Seam {
                 rtp.listen(port);
             }
         }
+        let epoch = rtp::media_epoch();
+        rtp.bind_epoch(epoch);
         Self {
             id,
             rtp,
@@ -914,7 +977,19 @@ impl Seam {
             picture_pacer: Pacer::new(RATE_PICTURE),
             audio_pacer: Pacer::new(RATE_AUDIO),
             frame_due: None,
+            st_pic_seq: 0,
+            st_pic_ts: 0,
+            st_frame: 0,
+            st_aud_seq: 0,
+            st_pic_ssrc: rtp::fresh_ssrc(),
+            st_aud_ssrc: rtp::fresh_ssrc(),
+            st_gcm: None,
+            epoch,
         }
+    }
+
+    fn current(&self) -> bool {
+        self.epoch == rtp::media_epoch()
     }
 
     pub fn id(&self) -> u8 {
@@ -961,6 +1036,9 @@ impl Seam {
         drop_index: Option<u16>,
         capture: Duration,
     ) -> Option<Vec<u8>> {
+        if self.id >= UDP_RTP && !self.current() {
+            return None;
+        }
         match self.id {
             UDP_RTP => {
                 let id = self.bump(lane);
@@ -982,6 +1060,9 @@ impl Seam {
     /// Uncompressed picture. Real RFC 4175 RTP from the `st2110` crate.
     /// Rows wait for their `send_at` so the frame is not one burst.
     pub fn send_raster(&mut self, samples: &[u8], width: u32, height: u32) -> Vec<Vec<u8>> {
+        if !self.current() {
+            return Vec::new();
+        }
         let frame = st_frame();
         if self.late(Duration::ZERO, frame) {
             return Vec::new();
@@ -991,10 +1072,17 @@ impl Seam {
         let origin = std::time::Instant::now();
         let mut out = Vec::with_capacity(packets.len());
         for row in packets {
+            if !self.current() {
+                return out;
+            }
             pace_until(origin, row.send_at);
-            crate::capture::note_rtp(crate::capture::DIR_SEND, &row.rtp);
-            rtp::emit_packet(true, &row.rtp);
-            out.push(row.rtp);
+            let mut raw = row.rtp;
+            stamp_ssrc(&mut raw, self.st_pic_ssrc);
+            crate::capture::note_rtp(crate::capture::DIR_SEND, &raw);
+            if !rtp::emit_if_current(self.epoch, true, &raw) {
+                return out;
+            }
+            out.push(raw);
         }
         self.packets.extend(out.iter().cloned());
         out
@@ -1073,9 +1161,14 @@ impl Seam {
                 pacer.schedule(earliest, nbytes)
             };
             earliest = at;
+            if !self.current() {
+                return got;
+            }
             pace_until(origin, at);
             crate::capture::note_avtp(crate::capture::DIR_SEND, &raw);
-            rtp::emit_packet(lane != Lane::Audio, &raw);
+            if !rtp::emit_if_current(self.epoch, lane != Lane::Audio, &raw) {
+                return got;
+            }
             self.packets.push(raw);
             let Some(decoded) = AvtpFrame::decode(&received.payload) else {
                 continue;
@@ -1109,7 +1202,17 @@ impl Seam {
         if lane == Lane::Audio {
             return self.send_pcm(body);
         }
-        let packets = st2110::packetize_jpeg_xs(body, ST_FRAME_TICKS);
+        let packets = st2110::packetize_jpeg_xs_at(
+            body,
+            ST_FRAME_TICKS,
+            self.st_pic_seq,
+            self.st_pic_ts,
+            self.st_frame,
+        );
+        let count = u16::try_from(packets.len()).unwrap_or(u16::MAX);
+        self.st_pic_seq = self.st_pic_seq.wrapping_add(count);
+        self.st_pic_ts = self.st_pic_ts.wrapping_add(ST_FRAME_TICKS);
+        self.st_frame = self.st_frame.wrapping_add(1) & 0x1f;
         let mut asm = XsAssembler::new();
         let mut missing = false;
         let mut got = None;
@@ -1120,10 +1223,21 @@ impl Seam {
                 missing = true;
                 continue;
             }
+            if !self.current() {
+                return None;
+            }
             pace_until(origin, packet.send_at);
-            let rtp = seal_st(&packet.rtp);
+            let mut raw = packet.rtp.clone();
+            stamp_ssrc(&mut raw, self.st_pic_ssrc);
+            let rtp = seal_st(self, &raw);
+            if rtp.is_empty() {
+                missing = true;
+                continue;
+            }
             crate::capture::note_rtp(crate::capture::DIR_SEND, &rtp);
-            rtp::emit_packet(picture, &rtp);
+            if !rtp::emit_if_current(self.epoch, picture, &rtp) {
+                return None;
+            }
             self.packets.push(rtp);
             let media = packet.payload.as_slice();
             let first = index == 0 && drop_index != Some(0);
@@ -1158,16 +1272,32 @@ impl Seam {
             samples = resample_pcm(&samples, channels, rate, 48_000);
             rate = 48_000;
         }
-        let packets = ::st2110::packetize_pcm(&samples, channels, rate);
+        let mut packets = ::st2110::packetize_pcm(&samples, channels, rate);
         if packets.is_empty() {
             return None;
         }
+        for packet in &mut packets {
+            let seq = self.st_aud_seq;
+            self.st_aud_seq = self.st_aud_seq.wrapping_add(1);
+            if packet.rtp.len() >= 12 {
+                packet.rtp[2..4].copy_from_slice(&seq.to_be_bytes());
+                packet.rtp[8..12].copy_from_slice(&self.st_aud_ssrc.to_be_bytes());
+            }
+        }
         let origin = std::time::Instant::now();
         for packet in &packets {
+            if !self.current() {
+                return None;
+            }
             pace_until(origin, packet.send_at);
-            let rtp = seal_st(&packet.rtp);
+            let rtp = seal_st(self, &packet.rtp);
+            if rtp.is_empty() {
+                continue;
+            }
             crate::capture::note_rtp(crate::capture::DIR_SEND, &rtp);
-            rtp::emit_packet(false, &rtp);
+            if !rtp::emit_if_current(self.epoch, false, &rtp) {
+                return None;
+            }
             self.packets.push(rtp);
         }
         Some(body.to_vec())
@@ -1229,22 +1359,38 @@ fn pcm_samples(body: &[u8]) -> Vec<i16> {
         .collect()
 }
 
+fn stamp_ssrc(rtp: &mut [u8], ssrc: u32) {
+    if rtp.len() >= 12 {
+        rtp[8..12].copy_from_slice(&ssrc.to_be_bytes());
+    }
+}
+
 /// Seal the RTP payload when the operator chose ST 2110 `gcm`. The header stays clear.
-fn seal_st(rtp: &[u8]) -> Vec<u8> {
+///
+/// ST 2110 does not run the UDP `OFFER` exchange, so the key is the
+/// certificate session key on both sides. A key still stored on the RTP hub
+/// belongs to the previous UDP player. An empty return means the seal failed.
+/// Sending the clear payload would not open, and the player would keep the
+/// nonce and then reject the real packet.
+fn seal_st(seam: &mut Seam, rtp: &[u8]) -> Vec<u8> {
     if !gates().st_gcm || rtp.len() < 12 {
         return rtp.to_vec();
     }
-    let key = rtp::hub_exchanged_key().unwrap_or_else(rtp::session_key);
-    let mut gcm = rtp::GcmSession::new(key);
+    if seam.st_gcm.is_none() {
+        seam.st_gcm = Some(rtp::GcmSession::new(rtp::session_key()));
+    }
     let seq = u16::from_be_bytes([rtp[2], rtp[3]]);
     let ssrc = u32::from_be_bytes([rtp[8], rtp[9], rtp[10], rtp[11]]);
-    match gcm.seal(ssrc, 0, seq, &rtp[12..]) {
+    let Some(session) = seam.st_gcm.as_mut() else {
+        return Vec::new();
+    };
+    match session.seal_next(ssrc, seq, &rtp[12..]) {
         Ok(sealed) => {
             let mut out = rtp[..12].to_vec();
             out.extend(sealed);
             out
         }
-        Err(_) => rtp.to_vec(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -1632,6 +1778,108 @@ mod tests {
         choose_profile(false, false);
     }
 
+    /// The config record and the picture are separate sends. Both have to open
+    /// on the one session the player keeps.
+    #[test]
+    fn st2110_gcm_nonces_continue_across_frames() {
+        let _globals = crate::carrier::test_globals();
+        choose_profile(false, true);
+        let mut st = Seam::open(ST2110);
+        let first = b"frame-one-0123456789";
+        let second = b"frame-two-0123456789";
+        assert_eq!(
+            st.send(Lane::Picture, first, None, Duration::from_millis(1))
+                .as_deref(),
+            Some(first.as_slice())
+        );
+        // The second capture has to stay inside one frame of the first due
+        // time. A 40 ms gap is late on the 16 ms ST 2110 clock and sends nothing.
+        assert_eq!(
+            st.send(Lane::Picture, second, None, Duration::from_millis(10))
+                .as_deref(),
+            Some(second.as_slice())
+        );
+        let mut player = GcmSession::new(rtp::session_key());
+        let mut last_seq = None;
+        assert!(st.packets().len() >= 2, "each frame leaves at least one packet");
+        for packet in st.packets() {
+            let (header, sealed) = RtpHeader::decode(packet).unwrap();
+            if let Some(prev) = last_seq {
+                assert_ne!(header.sequence, prev, "a later frame reused sequence {prev}");
+            }
+            last_seq = Some(header.sequence);
+            let plain = player
+                .open_next(header.ssrc, header.sequence, sealed)
+                .expect("player session stays open");
+            assert!(::st2110::xs_fields(&plain).is_some());
+        }
+        assert!(!player.closed());
+        choose_profile(false, false);
+    }
+
+    /// A leftover packet shares the certificate key. Its SSRC has to be
+    /// different, or the high sequence makes the next seam's packets too old.
+    #[test]
+    fn st2110_gcm_ssrcs_stay_on_their_own_replay_window() {
+        let _globals = crate::carrier::test_globals();
+        choose_profile(false, true);
+        let mut older = Seam::open(ST2110);
+        let mut newer = Seam::open(ST2110);
+        let body = b"frame-one-0123456789";
+        assert!(older
+            .send(Lane::Picture, body, None, Duration::from_millis(1))
+            .is_some());
+        assert!(newer
+            .send(Lane::Picture, body, None, Duration::from_millis(1))
+            .is_some());
+        let (old_header, old_payload) = RtpHeader::decode(&older.packets()[0]).unwrap();
+        let (new_header, new_payload) = RtpHeader::decode(&newer.packets()[0]).unwrap();
+        assert_ne!(old_header.ssrc, new_header.ssrc);
+        assert_ne!(old_header.ssrc, 0);
+        assert_ne!(new_header.ssrc, 5, "picture ssrc is no longer the fixed value");
+        let mut player = GcmSession::new(rtp::session_key());
+        player
+            .open_next(old_header.ssrc, old_header.sequence, old_payload)
+            .expect("old seam opens");
+        player
+            .open_next(new_header.ssrc, new_header.sequence, new_payload)
+            .expect("new ssrc has its own window");
+        assert!(!player.closed());
+        choose_profile(false, false);
+    }
+
+    #[test]
+    fn a_replaced_hub_drops_a_st2110_gcm_packet() {
+        let _globals = crate::carrier::test_globals();
+        choose_profile(false, true);
+        let mut st = Seam::open(ST2110);
+        release_rtp();
+        assert!(st
+            .send(Lane::Picture, b"frame-one-0123456789", None, Duration::from_millis(1))
+            .is_none());
+        assert!(st.packets().is_empty());
+        choose_profile(false, false);
+    }
+
+    #[test]
+    fn udp_gcm_picture_ssrcs_differ_per_seam() {
+        let _globals = crate::carrier::test_globals();
+        let mut older = Seam::open(UDP_RTP);
+        let mut newer = Seam::open(UDP_RTP);
+        let body = b"jpeg-picture-body-0123456789";
+        assert!(older
+            .send(Lane::Picture, body, None, Duration::from_millis(1))
+            .is_some());
+        assert!(newer
+            .send(Lane::Picture, body, None, Duration::from_millis(1))
+            .is_some());
+        let (old_header, _) = RtpHeader::decode(&older.packets()[0]).unwrap();
+        let (new_header, _) = RtpHeader::decode(&newer.packets()[0]).unwrap();
+        assert_ne!(old_header.ssrc, new_header.ssrc);
+        assert_ne!(old_header.ssrc, 11);
+        assert_ne!(new_header.ssrc, 11);
+    }
+
     #[test]
     fn carrier_3_default_profile_seals_the_rtp_payload() {
         let _globals = crate::carrier::test_globals();
@@ -1778,6 +2026,16 @@ mod tests {
         let (offer, socket) = l2_media_target(UDP_RTP, Some(quic), Some(ip), 21_002, 4433);
         assert!(!offer);
         assert!(socket.is_none());
+        let (offer, socket) = l2_media_target(ST2110, None, Some(ip), 21_002, 4433);
+        assert!(!offer, "ST 2110 keeps the L2 QUIC dial");
+        assert_eq!(socket, Some(rtp));
+        let (offer, socket) = l2_media_target(ST2110, None, None, 21_002, 4433);
+        assert!(!offer);
+        assert!(socket.is_none());
+        let minted = crate::peer_to_socket_addr([0x02, 0, 0, 0, 0, 1], 4433);
+        assert!(crate::socket_addr_to_peer(minted).is_some());
+        assert_eq!(media_input(minted, Some(rtp)), Some(rtp));
+        assert_eq!(media_input(minted, None), None);
         assert!(connect_opens_ethernet(None, false));
         assert!(!connect_opens_ethernet(None, true));
         assert!(!connect_opens_ethernet(Some(quic), false));

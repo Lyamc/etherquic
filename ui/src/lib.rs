@@ -74,8 +74,8 @@ pub use prefs::{
     HARDWARE_FPS, SOFTWARE_FPS,
 };
 pub use session::{
-    active_layer, dial_target, format_mac, lanes, taskbar_for, DialTarget, HexMac, Lane, Layer,
-    Role, AUDIO_SERVICE_ID, CLIENT_MAC, HOST_MAC, INPUT_SERVICE_ID, PLAY_SERVICE_ID,
+    active_layer, carrier_enabled, dial_target, format_mac, lanes, taskbar_for, DialTarget, HexMac,
+    Lane, Layer, Role, AUDIO_SERVICE_ID, CLIENT_MAC, HOST_MAC, INPUT_SERVICE_ID, PLAY_SERVICE_ID,
 };
 #[cfg(feature = "ui")]
 pub use settings::{

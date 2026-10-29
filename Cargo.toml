@@ -43,7 +43,7 @@ blade-graphics = { path = "vendor/blade-graphics" }
 
 [package]
 name = "etherquic"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -63,6 +63,7 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_UI_Input",

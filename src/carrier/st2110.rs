@@ -49,7 +49,19 @@ pub struct XsPacket {
 /// ST 2110-22 from the `st2110` crate. `payload` is the media bytes. The RTP
 /// packet the crate builds carries the JPEG XS header and the marker.
 pub fn packetize_jpeg_xs(frame: &[u8], frame_ticks: u32) -> Vec<XsPacket> {
-    st2110::packetize_jpeg_xs(frame, frame_ticks)
+    packetize_jpeg_xs_at(frame, frame_ticks, 0, 0, 0)
+}
+
+/// Same packets as [`packetize_jpeg_xs`], continuing the RTP sequence, the
+/// 90 kHz timestamp, and the frame counter. GCM nonces include that sequence.
+pub fn packetize_jpeg_xs_at(
+    frame: &[u8],
+    frame_ticks: u32,
+    sequence: u16,
+    timestamp: u32,
+    frame_counter: u8,
+) -> Vec<XsPacket> {
+    st2110::packetize_jpeg_xs_at(frame, frame_ticks, sequence, timestamp, frame_counter)
         .into_iter()
         .map(|packet| XsPacket {
             payload: packet.payload.get(4..).unwrap_or_default().to_vec(),
